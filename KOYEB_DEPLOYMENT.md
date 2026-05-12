@@ -44,7 +44,7 @@ BOT_TOKEN=<your_bot_token>
 OWNER_ID=<your_user_id>
 LOG_GROUP_ID=<your_log_group_id>
 PORT=8000
-STORAGE_PATH=/tmp/modbot
+STORAGE_PATH=/data/modbot
 ```
 
 #### Get Your Values:
@@ -75,6 +75,14 @@ STORAGE_PATH=/tmp/modbot
   python start.py
   ```
 - **Port**: 8000
+
+### Step 4.1: Enable Persistent Volume (Important)
+To keep moderation data after restart/redeploy, attach a Koyeb volume and mount it to `/data`.
+
+- Volume mount path: `/data`
+- Keep `STORAGE_PATH=/data/modbot`
+
+If no persistent volume is attached, the app falls back to `/tmp/modbot` and data can be lost.
 
 ### Docker Deployment Option (Recommended)
 If you deploy as a Docker service on Koyeb, this repository now includes a `Dockerfile`.

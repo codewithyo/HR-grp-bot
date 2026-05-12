@@ -26,6 +26,7 @@ import asyncio
 import httpx
 import traceback
 import sys
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -54,7 +55,23 @@ BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
 LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))
 PORT         = int(os.environ.get("PORT", "8000"))
-STORAGE_PATH = os.environ.get("STORAGE_PATH", "/tmp/modbot")
+
+def resolve_storage_path() -> str:
+    """Prefer persistent disk and fallback to /tmp when unavailable."""
+    preferred = os.environ.get("STORAGE_PATH", "/data/modbot")
+    try:
+        Path(preferred).mkdir(parents=True, exist_ok=True)
+        test_file = Path(preferred) / ".write_test"
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink(missing_ok=True)
+        return preferred
+    except Exception:
+        fallback = "/tmp/modbot"
+        Path(fallback).mkdir(parents=True, exist_ok=True)
+        log_msg(f"Storage path '{preferred}' unavailable. Falling back to {fallback}", "WARNING")
+        return fallback
+
+STORAGE_PATH = resolve_storage_path()
 
 # =========================================================
 # VALIDATE CONFIGURATION
@@ -113,17 +130,38 @@ log_msg(f"Storage initialized at: {STORAGE_PATH}", "INFO")
 def load(file: str) -> dict:
     """Load JSON file"""
     try:
-        with open(file, "r") as f:
+        if not os.path.exists(file):
+            return {}
+        with open(file, "r", encoding="utf-8") as f:
             return json.load(f)
+    except json.JSONDecodeError:
+        backup_file = f"{file}.bak"
+        if os.path.exists(backup_file):
+            try:
+                with open(backup_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                log_msg(f"Recovered storage from backup: {backup_file}", "WARNING")
+                return data
+            except Exception as backup_error:
+                log_msg(f"ERROR loading backup {backup_file}: {backup_error}", "ERROR")
+        log_msg(f"ERROR loading {file}: invalid JSON and no valid backup", "ERROR")
+        return {}
     except Exception as e:
         log_msg(f"ERROR loading {file}: {e}", "ERROR")
         return {}
 
 def save(file: str, data: dict):
-    """Save JSON file"""
+    """Save JSON file atomically to reduce restart corruption risk."""
     try:
-        with open(file, "w") as f:
+        temp_file = f"{file}.tmp"
+        backup_file = f"{file}.bak"
+
+        if os.path.exists(file):
+            shutil.copy2(file, backup_file)
+
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
+        os.replace(temp_file, file)
     except Exception as e:
         log_msg(f"ERROR saving {file}: {e}", "ERROR")
 
