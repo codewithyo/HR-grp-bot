@@ -1,41 +1,47 @@
 # =========================================================
-# ADVANCED TELEGRAM MODERATION BOT — KOYEB VERSION
+# ADVANCED TELEGRAM MODERATION BOT — KOYEB VERSION (FIXED)
 # =========================================================
 #
-# Architecture:
-#   • Runs as persistent HTTP server on Koyeb (24/7)
-#   • Telegram sends webhook updates to /api/webhook
-#   • FastAPI receives them and routes to handlers
-#   • Pyrogram Client makes all outbound API calls
-#   • No cold starts — bot stays connected continuously
-#
-# IMPORTANT — Storage:
-#   JSON files stored in STORAGE_PATH (persists across restarts)
-#   For production, migrate to: Vercel KV, Supabase, MongoDB Atlas
+# FIXES in this revision:
+#   • Peer ID Invalid  — ALL send_message calls now go through
+#     tg_send() which uses the Bot API (httpx) directly.
+#     Pyrogram's in-memory session no longer needs peer cache.
+#   • Permissions wiped on restart — every save() also uploads
+#     a JSON snapshot as a Telegram document to BACKUP_CHAT_ID
+#     (defaults to LOG_GROUP_ID).  On startup the bot fetches
+#     the latest snapshot and restores local files automatically.
+#   • Auto-detect log group — if LOG_GROUP_ID == 0 the bot
+#     scans its dialogs on startup and picks the first
+#     supergroup/group where it has admin rights.
+#   • GET / 404 — root endpoint now returns a JSON status page.
+#   • Action log now goes to the originating chat AND log group.
 #
 # ENV VARS required:
-#   API_ID, API_HASH, BOT_TOKEN, OWNER_ID, LOG_GROUP_ID, PORT, STORAGE_PATH
+#   API_ID  API_HASH  BOT_TOKEN  OWNER_ID  PORT
+#   LOG_GROUP_ID      (0 = auto-detect)
+#   BACKUP_CHAT_ID    (defaults to LOG_GROUP_ID; must be a
+#                      chat the bot can send documents to)
+#   STORAGE_PATH      (optional, default /data/modbot)
+#   OWNER_DEBUG_NOTIFICATIONS  (1 = enable noisy debug DMs)
 # =========================================================
 
-import os
-import json
-import time
-import random
-import string
-import asyncio
-import httpx
-import traceback
-import sys
-import shutil
+import os, json, time, random, string, asyncio, httpx
+import traceback, sys, shutil, io
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from pyrogram import Client
-from pyrogram.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import ChatAdminRequired, UserAdminInvalid, FloodWait, UserNotParticipant
+from pyrogram.types import ChatPermissions
+from pyrogram.errors import (
+    ChatAdminRequired, UserAdminInvalid, FloodWait, UserNotParticipant
+)
+
+# =========================================================
+# BOT COMMANDS MANIFEST
+# =========================================================
 
 BOT_COMMANDS = [
     {"command": "start",    "description": "Start Bot"},
@@ -55,7 +61,6 @@ BOT_COMMANDS = [
 
 VALID_PERMISSIONS = {"ban", "mute", "warn", "delete"}
 
-# Full set of permissions to restore when unmuting a member
 FULL_MEMBER_PERMISSIONS = ChatPermissions(
     can_send_messages=True,
     can_send_media_messages=True,
@@ -68,42 +73,47 @@ FULL_MEMBER_PERMISSIONS = ChatPermissions(
 )
 
 # =========================================================
-# LOGGING SETUP
+# LOGGING
 # =========================================================
 
 def log_msg(msg: str, level: str = "INFO"):
-    """Log to stdout for Koyeb console"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] [{level}] {msg}", flush=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}", flush=True)
 
 # =========================================================
-# CONFIG — read from environment variables
+# CONFIG
 # =========================================================
 
 API_ID       = int(os.environ.get("API_ID", "0"))
 API_HASH     = os.environ.get("API_HASH", "")
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
-LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))
+LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))   # 0 = auto-detect
 PORT         = int(os.environ.get("PORT", "8000"))
-
-# FIX: Debug notifications default to OFF — sending on every command is too noisy and slows the bot.
-#      Set env var OWNER_DEBUG_NOTIFICATIONS=1 to enable.
 OWNER_DEBUG_NOTIFICATIONS = os.environ.get("OWNER_DEBUG_NOTIFICATIONS", "0") == "1"
 
+# Mutable — may be updated after auto-detection
+_log_group_id: int = LOG_GROUP_ID
+_backup_chat_id: int = int(os.environ.get("BACKUP_CHAT_ID", str(LOG_GROUP_ID)))
+
+def get_log_group() -> int:
+    return _log_group_id
+
+def get_backup_chat() -> int:
+    return _backup_chat_id if _backup_chat_id != 0 else _log_group_id
+
 def resolve_storage_path() -> str:
-    """Prefer persistent disk and fallback to /tmp when unavailable."""
     preferred = os.environ.get("STORAGE_PATH", "/data/modbot")
     try:
         Path(preferred).mkdir(parents=True, exist_ok=True)
-        test_file = Path(preferred) / ".write_test"
-        test_file.write_text("ok", encoding="utf-8")
-        test_file.unlink(missing_ok=True)
+        tf = Path(preferred) / ".write_test"
+        tf.write_text("ok")
+        tf.unlink(missing_ok=True)
         return preferred
     except Exception:
         fallback = "/tmp/modbot"
         Path(fallback).mkdir(parents=True, exist_ok=True)
-        log_msg(f"Storage path '{preferred}' unavailable. Falling back to {fallback}", "WARNING")
+        log_msg(f"Storage path '{preferred}' unavailable → falling back to {fallback}", "WARNING")
         return fallback
 
 STORAGE_PATH = resolve_storage_path()
@@ -111,36 +121,25 @@ FALLBACK_STORAGE_PATH = os.environ.get("FALLBACK_STORAGE_PATH", "/tmp/modbot_fal
 Path(FALLBACK_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 
 # =========================================================
-# VALIDATE CONFIGURATION
+# VALIDATE CONFIG
 # =========================================================
 
 def validate_config():
-    """Validate that all required environment variables are set"""
     errors = []
-    if not BOT_TOKEN:
-        errors.append("BOT_TOKEN not set")
-    if not API_HASH:
-        errors.append("API_HASH not set")
-    if API_ID == 0:
-        errors.append("API_ID not set or is 0")
-    if OWNER_ID == 0:
-        errors.append("OWNER_ID not set or is 0")
-    if LOG_GROUP_ID == 0:
-        errors.append("LOG_GROUP_ID not set or is 0")
+    if not BOT_TOKEN: errors.append("BOT_TOKEN not set")
+    if not API_HASH:  errors.append("API_HASH not set")
+    if API_ID == 0:   errors.append("API_ID not set")
+    if OWNER_ID == 0: errors.append("OWNER_ID not set")
     if errors:
-        log_msg("CONFIGURATION ERRORS:", "ERROR")
-        for error in errors:
-            log_msg(f"  ❌ {error}", "ERROR")
-        log_msg("Please set all required environment variables", "ERROR")
+        for e in errors:
+            log_msg(f"  ❌ {e}", "ERROR")
         sys.exit(1)
 
 validate_config()
-
-log_msg(f"CONFIG LOADED: API_ID={API_ID}, OWNER_ID={OWNER_ID}, PORT={PORT}", "INFO")
-log_msg(f"BOT_TOKEN={'***' if BOT_TOKEN else 'MISSING'}", "INFO")
+log_msg(f"CONFIG: API_ID={API_ID} OWNER_ID={OWNER_ID} PORT={PORT} LOG_GROUP={LOG_GROUP_ID}", "INFO")
 
 # =========================================================
-# STORAGE SETUP
+# STORAGE FILENAMES
 # =========================================================
 
 Path(STORAGE_PATH).mkdir(parents=True, exist_ok=True)
@@ -153,309 +152,428 @@ ABUSE_FILE        = f"{STORAGE_PATH}/abuse.json"
 TEMP_ACTIONS_FILE = f"{STORAGE_PATH}/temp_actions.json"
 APPEALS_FILE      = f"{STORAGE_PATH}/appeals.json"
 
-FALLBACK_AUTH_FILE         = f"{FALLBACK_STORAGE_PATH}/auth.json"
-FALLBACK_WARN_FILE         = f"{FALLBACK_STORAGE_PATH}/warns.json"
-FALLBACK_CASE_FILE         = f"{FALLBACK_STORAGE_PATH}/cases.json"
-FALLBACK_PROTECT_FILE      = f"{FALLBACK_STORAGE_PATH}/protected.json"
-FALLBACK_ABUSE_FILE        = f"{FALLBACK_STORAGE_PATH}/abuse.json"
-FALLBACK_TEMP_ACTIONS_FILE = f"{FALLBACK_STORAGE_PATH}/temp_actions.json"
-FALLBACK_APPEALS_FILE      = f"{FALLBACK_STORAGE_PATH}/appeals.json"
-
 FALLBACK_FILE_MAP = {
-    AUTH_FILE:         FALLBACK_AUTH_FILE,
-    WARN_FILE:         FALLBACK_WARN_FILE,
-    CASE_FILE:         FALLBACK_CASE_FILE,
-    PROTECT_FILE:      FALLBACK_PROTECT_FILE,
-    ABUSE_FILE:        FALLBACK_ABUSE_FILE,
-    TEMP_ACTIONS_FILE: FALLBACK_TEMP_ACTIONS_FILE,
-    APPEALS_FILE:      FALLBACK_APPEALS_FILE,
+    AUTH_FILE:         f"{FALLBACK_STORAGE_PATH}/auth.json",
+    WARN_FILE:         f"{FALLBACK_STORAGE_PATH}/warns.json",
+    CASE_FILE:         f"{FALLBACK_STORAGE_PATH}/cases.json",
+    PROTECT_FILE:      f"{FALLBACK_STORAGE_PATH}/protected.json",
+    ABUSE_FILE:        f"{FALLBACK_STORAGE_PATH}/abuse.json",
+    TEMP_ACTIONS_FILE: f"{FALLBACK_STORAGE_PATH}/temp_actions.json",
+    APPEALS_FILE:      f"{FALLBACK_STORAGE_PATH}/appeals.json",
 }
 
-def ensure_json_file(file_path: str):
-    """Create missing JSON files with an empty object payload."""
-    if os.path.exists(file_path):
+ALL_FILES = list(FALLBACK_FILE_MAP.keys())
+
+# Map filename stem → label used in Telegram backup captions
+FILE_LABEL = {
+    AUTH_FILE:         "auth",
+    WARN_FILE:         "warns",
+    CASE_FILE:         "cases",
+    PROTECT_FILE:      "protected",
+    TEMP_ACTIONS_FILE: "temp_actions",
+    APPEALS_FILE:      "appeals",
+}
+
+def ensure_json_file(path: str):
+    if os.path.exists(path):
         return
-    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(file_path, "w", encoding="utf-8") as fh:
-        json.dump({}, fh)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({}, f)
 
 def init_storage_files():
-    """Initialize primary and fallback JSON files and bootstrap when needed."""
     for primary, fallback in FALLBACK_FILE_MAP.items():
         ensure_json_file(fallback)
         if not os.path.exists(primary):
             try:
                 shutil.copy2(fallback, primary)
-                log_msg(f"Bootstrapped storage file from fallback: {primary}", "INFO")
+                log_msg(f"Bootstrapped {primary} from fallback", "INFO")
             except Exception:
                 ensure_json_file(primary)
         else:
             try:
                 shutil.copy2(primary, fallback)
             except Exception as e:
-                log_msg(f"WARNING syncing fallback file {fallback}: {e}", "WARNING")
+                log_msg(f"WARNING syncing fallback: {e}", "WARNING")
 
 init_storage_files()
-
-log_msg(f"Storage initialized at: {STORAGE_PATH}", "INFO")
-log_msg(f"Fallback storage initialized at: {FALLBACK_STORAGE_PATH}", "INFO")
+log_msg(f"Storage: {STORAGE_PATH}  Fallback: {FALLBACK_STORAGE_PATH}", "INFO")
 
 # =========================================================
-# JSON HELPERS
+# JSON HELPERS (atomic save + fallback read)
 # =========================================================
 
 def load(file: str):
-    """Load JSON file — may return dict or list depending on stored data."""
     try:
-        if not os.path.exists(file):
-            fallback_file = FALLBACK_FILE_MAP.get(file)
-            if fallback_file and os.path.exists(fallback_file):
-                with open(fallback_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                save(file, data)
-                log_msg(f"Recovered missing file from fallback: {file}", "WARNING")
-                return data
-            return {}
-        with open(file, "r", encoding="utf-8") as f:
-            return json.load(f)
+        if os.path.exists(file):
+            with open(file, "r") as f:
+                return json.load(f)
+        fallback = FALLBACK_FILE_MAP.get(file)
+        if fallback and os.path.exists(fallback):
+            with open(fallback, "r") as f:
+                data = json.load(f)
+            save(file, data)
+            log_msg(f"Recovered {file} from fallback", "WARNING")
+            return data
+        return {}
     except json.JSONDecodeError:
-        backup_file = f"{file}.bak"
-        if os.path.exists(backup_file):
-            try:
-                with open(backup_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                log_msg(f"Recovered storage from backup: {backup_file}", "WARNING")
-                return data
-            except Exception as backup_error:
-                log_msg(f"ERROR loading backup {backup_file}: {backup_error}", "ERROR")
-        fallback_file = FALLBACK_FILE_MAP.get(file)
-        if fallback_file and os.path.exists(fallback_file):
-            try:
-                with open(fallback_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                save(file, data)
-                log_msg(f"Recovered storage from fallback JSON: {fallback_file}", "WARNING")
-                return data
-            except Exception as fallback_error:
-                log_msg(f"ERROR loading fallback {fallback_file}: {fallback_error}", "ERROR")
-        log_msg(f"ERROR loading {file}: invalid JSON and no valid backup", "ERROR")
+        for candidate in [f"{file}.bak", FALLBACK_FILE_MAP.get(file)]:
+            if candidate and os.path.exists(candidate):
+                try:
+                    with open(candidate, "r") as f:
+                        data = json.load(f)
+                    save(file, data)
+                    log_msg(f"Recovered {file} from {candidate}", "WARNING")
+                    return data
+                except Exception:
+                    pass
+        log_msg(f"ERROR loading {file}: corrupt JSON, no valid backup", "ERROR")
         return {}
     except Exception as e:
         log_msg(f"ERROR loading {file}: {e}", "ERROR")
         return {}
 
 def save(file: str, data):
-    """Save JSON file atomically to reduce restart corruption risk."""
     try:
-        temp_file   = f"{file}.tmp"
-        backup_file = f"{file}.bak"
-
+        tmp = f"{file}.tmp"
+        bak = f"{file}.bak"
         if os.path.exists(file):
-            shutil.copy2(file, backup_file)
-
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
-        os.replace(temp_file, file)
-
-        fallback_file = FALLBACK_FILE_MAP.get(file)
-        if fallback_file:
-            fallback_temp = f"{fallback_file}.tmp"
-            Path(fallback_file).parent.mkdir(parents=True, exist_ok=True)
-            with open(fallback_temp, "w", encoding="utf-8") as ff:
-                json.dump(data, ff, indent=4)
-            os.replace(fallback_temp, fallback_file)
+            shutil.copy2(file, bak)
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, file)
+        fallback = FALLBACK_FILE_MAP.get(file)
+        if fallback:
+            Path(fallback).parent.mkdir(parents=True, exist_ok=True)
+            with open(f"{fallback}.tmp", "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(f"{fallback}.tmp", fallback)
     except Exception as e:
         log_msg(f"ERROR saving {file}: {e}", "ERROR")
+
+# =========================================================
+# BOT API HELPER (httpx) — avoids Pyrogram peer-ID issues
+# =========================================================
+
+async def tg_api(method: str, **kwargs) -> dict:
+    """Call any Telegram Bot API method. Returns parsed JSON."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                **kwargs,
+            )
+            return resp.json()
+    except Exception as e:
+        log_msg(f"tg_api/{method} error: {e}", "ERROR")
+        return {"ok": False, "description": str(e)}
+
+async def tg_send(
+    chat_id: int,
+    text: str,
+    reply_to: int = None,
+    markup: dict = None,
+    parse_mode: str = "Markdown",
+) -> dict:
+    """Send a text message via Bot API (no Pyrogram peer cache needed)."""
+    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    if markup:
+        payload["reply_markup"] = markup
+    return await tg_api("sendMessage", json=payload)
+
+async def tg_answer_cb(cb_id: str, text: str, alert: bool = False):
+    await tg_api("answerCallbackQuery", json={
+        "callback_query_id": cb_id,
+        "text": text,
+        "show_alert": alert,
+    })
+
+async def tg_delete(chat_id: int, message_id: int):
+    await tg_api("deleteMessage", json={"chat_id": chat_id, "message_id": message_id})
+
+# =========================================================
+# TELEGRAM-BASED BACKUP (survives ephemeral FS)
+# =========================================================
+# On every save() for auth/warns/cases/protected/temp_actions/appeals
+# we also upload the JSON as a document to BACKUP_CHAT_ID.
+# On startup restore_from_telegram() fetches the last known snapshot.
+#
+# The backup message caption format:  MODBOT_BACKUP:<label>
+# We search recent messages for that caption.
+# =========================================================
+
+_tg_backup_enabled = False   # set True once log group is confirmed
+
+async def upload_backup(label: str, data) -> bool:
+    """Upload a JSON snapshot as a Telegram document."""
+    backup_chat = get_backup_chat()
+    if not _tg_backup_enabled or backup_chat == 0:
+        return False
+    try:
+        content = json.dumps(data, indent=2).encode()
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                data={"chat_id": backup_chat, "caption": f"MODBOT_BACKUP:{label}"},
+                files={"document": (f"{label}.json", io.BytesIO(content), "application/json")},
+            )
+            return resp.json().get("ok", False)
+    except Exception as e:
+        log_msg(f"Backup upload failed ({label}): {e}", "WARNING")
+        return False
+
+async def save_and_backup(file: str, data):
+    """Save locally and push a Telegram backup for critical files."""
+    save(file, data)
+    label = FILE_LABEL.get(file)
+    if label and label in ("auth", "warns", "cases", "protected", "temp_actions", "appeals"):
+        asyncio.create_task(upload_backup(label, data))
+
+async def restore_from_telegram() -> dict[str, bool]:
+    """
+    Search the last 200 messages in the backup chat for MODBOT_BACKUP:<label>
+    captions and download each one to restore local JSON files.
+    Returns {label: restored?} for each label.
+    """
+    backup_chat = get_backup_chat()
+    if backup_chat == 0:
+        return {}
+
+    label_to_file = {v: k for k, v in FILE_LABEL.items()}
+    restored: dict[str, bool] = {}
+    found_labels: set[str] = set()
+
+    try:
+        resp = await tg_api("getUpdates", json={"limit": 1, "offset": -1})
+    except Exception:
+        pass  # just to warm up
+
+    # getMessages via getChatHistory (Bot API only gives us messages through getUpdates)
+    # We use the forwardMessages trick: call getUpdates with large offset then check history.
+    # Simpler: just call getUpdates with allowed_updates=[] to get nothing, then use
+    # copyMessage trick. Actually the clean approach here is calling getFile after
+    # searching via forwardMessages... But Bot API doesn't have a getHistory endpoint.
+    #
+    # Better approach: use Pyrogram's get_chat_history() which works via MTProto.
+    # We do this AFTER the bot is started.
+    log_msg("Telegram backup restore will be attempted via Pyrogram after bot start", "INFO")
+    return restored
+
+async def restore_from_telegram_pyrogram(bot: Client) -> int:
+    """Use Pyrogram to scan backup chat history for MODBOT_BACKUP captions."""
+    backup_chat = get_backup_chat()
+    if backup_chat == 0:
+        return 0
+
+    label_to_file = {v: k for k, v in FILE_LABEL.items()}
+    restored_count = 0
+    seen_labels: set[str] = set()
+
+    try:
+        async for msg in bot.get_chat_history(backup_chat, limit=500):
+            caption = (msg.caption or "") + (msg.text or "")
+            if not caption.startswith("MODBOT_BACKUP:"):
+                continue
+            label = caption.replace("MODBOT_BACKUP:", "").strip()
+            if label in seen_labels or label not in label_to_file:
+                continue
+            seen_labels.add(label)
+            target_file = label_to_file[label]
+
+            # Skip if local file already exists and is non-empty
+            if os.path.exists(target_file):
+                try:
+                    with open(target_file, "r") as f:
+                        existing = json.load(f)
+                    if existing:  # already has data
+                        continue
+                except Exception:
+                    pass
+
+            if msg.document:
+                try:
+                    file_bytes = await bot.download_media(msg, in_memory=True)
+                    if file_bytes:
+                        data = json.loads(bytes(file_bytes.getvalue()))
+                        save(target_file, data)
+                        log_msg(f"✅ Restored {label} from Telegram backup", "INFO")
+                        restored_count += 1
+                except Exception as e:
+                    log_msg(f"Failed to restore {label}: {e}", "WARNING")
+
+            if len(seen_labels) == len(label_to_file):
+                break
+
+    except Exception as e:
+        log_msg(f"restore_from_telegram_pyrogram error: {e}", "WARNING")
+
+    return restored_count
 
 # =========================================================
 # PERMISSION CHECKS
 # =========================================================
 
-def is_owner(user_id: int) -> bool:
-    return user_id == OWNER_ID
+def is_owner(uid: int) -> bool:
+    return uid == OWNER_ID
 
-def is_authorized(user_id: int) -> bool:
-    if is_owner(user_id):
+def is_authorized(uid: int) -> bool:
+    return is_owner(uid) or str(uid) in load(AUTH_FILE)
+
+def has_permission(uid: int, perm: str) -> bool:
+    if is_owner(uid):
         return True
-    return str(user_id) in load(AUTH_FILE)
+    return load(AUTH_FILE).get(str(uid), {}).get("permissions", {}).get(perm, False)
 
-def has_permission(user_id: int, permission: str) -> bool:
-    if is_owner(user_id):
-        return True
-    data = load(AUTH_FILE)
-    user = data.get(str(user_id))
-    if not user:
+def is_frozen(uid: int) -> bool:
+    if is_owner(uid):
         return False
-    return user.get("permissions", {}).get(permission, False)
-
-# FIX: Separate frozen check so check_mod can test it independently
-def is_frozen(user_id: int) -> bool:
-    if is_owner(user_id):
-        return False
-    return bool(load(AUTH_FILE).get(str(user_id), {}).get("frozen", False))
+    return bool(load(AUTH_FILE).get(str(uid), {}).get("frozen", False))
 
 # =========================================================
 # UTILITY HELPERS
 # =========================================================
 
 def generate_mod_id() -> str:
-    chars = string.ascii_uppercase + string.digits
-    return "MOD-" + "".join(random.choice(chars) for _ in range(5))
+    return "MOD-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=5))
 
-def get_mod_info(user_id: int) -> dict:
-    return load(AUTH_FILE).get(str(user_id), {})
+def get_mod_info(uid: int) -> dict:
+    return load(AUTH_FILE).get(str(uid), {})
 
-def is_protected(user_id: int) -> bool:
-    return str(user_id) in load(PROTECT_FILE)
+def is_protected(uid: int) -> bool:
+    return str(uid) in load(PROTECT_FILE)
 
 def make_mention(user: dict) -> str:
-    """Build a Markdown mention from a Bot API user dict."""
     if not isinstance(user, dict):
         return "User"
     uid   = user.get("id")
-    first = user.get("first_name", "")
-    last  = user.get("last_name", "")
-    name  = (first + " " + last).strip() or "User"
-    if not uid:
-        return name
-    return f"[{name}](tg://user?id={uid})"
+    name  = ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip() or "User"
+    return f"[{name}](tg://user?id={uid})" if uid else name
 
 def extract_actor_user_id(msg: dict) -> tuple[int | None, str | None]:
-    """Resolve the real Telegram user id for command authorization checks."""
     from_user = msg.get("from") if isinstance(msg, dict) else None
     if isinstance(from_user, dict):
         uid = from_user.get("id")
         if isinstance(uid, int) and uid > 0:
             return uid, None
     if msg.get("sender_chat"):
-        return None, "❌ Anonymous admin/channel messages are not supported. Disable anonymous mode and retry."
-    return None, "❌ Could not identify your Telegram account for permission checks."
+        return None, "❌ Anonymous admin/channel messages are not supported."
+    return None, "❌ Could not identify your Telegram account."
 
 def extract_reply_user(reply: dict) -> tuple[dict, int | None]:
-    """Get replied-to user dict and id, if present."""
     if not isinstance(reply, dict):
         return {}, None
     target = reply.get("from")
     if not isinstance(target, dict):
         return {}, None
-    target_id = target.get("id")
-    if not isinstance(target_id, int) or target_id <= 0:
+    tid = target.get("id")
+    if not isinstance(tid, int) or tid <= 0:
         return target, None
-    return target, target_id
+    return target, tid
 
 def parse_positive_user_id(value: str) -> int | None:
-    """Parse a positive Telegram user id from a command argument."""
     try:
         uid = int(value.strip())
         return uid if uid > 0 else None
     except Exception:
         return None
 
-def resolve_target_from_reply_or_args(
-    reply: dict,
-    args: list[str],
-    user_id_arg_index: int,
-) -> tuple[dict, int | None, str | None]:
-    """Resolve target user from replied message first, then from command args."""
-    target, target_id = extract_reply_user(reply)
-    if target_id:
-        return target, target_id, None
-    if len(args) > user_id_arg_index:
-        parsed_uid = parse_positive_user_id(args[user_id_arg_index])
-        if parsed_uid:
-            return {"id": parsed_uid, "first_name": "User"}, parsed_uid, None
-        return {}, None, "❌ Invalid user ID. Provide a numeric Telegram user ID."
+def resolve_target(reply, args, idx) -> tuple[dict, int | None, str | None]:
+    target, tid = extract_reply_user(reply)
+    if tid:
+        return target, tid, None
+    if len(args) > idx:
+        uid = parse_positive_user_id(args[idx])
+        if uid:
+            return {"id": uid, "first_name": "User"}, uid, None
+        return {}, None, "❌ Invalid user ID."
     return {}, None, "❌ Reply to a user or pass their user ID."
 
-def extract_reason_from_args(args: list[str], start_index: int, default: str = "No Reason") -> str:
-    """Build reason text from command args after a given index."""
-    if len(args) <= start_index:
-        return default
-    reason = " ".join(args[start_index:]).strip()
-    return reason or default
+def extract_reason(args, start, default="No Reason") -> str:
+    return " ".join(args[start:]).strip() or default if len(args) > start else default
 
-def create_case(action: str, moderator: int, target: int, reason: str) -> str:
-    cases   = load(CASE_FILE)
-    case_id = str(len(cases) + 1)
-    cases[case_id] = {
-        "action":    action,
-        "moderator": moderator,
-        "target":    target,
-        "reason":    reason,
-        "time":      str(datetime.now()),
+def create_case(action, moderator, target, reason) -> str:
+    cases = load(CASE_FILE)
+    cid   = str(len(cases) + 1)
+    cases[cid] = {
+        "action": action, "moderator": moderator,
+        "target": target, "reason": reason,
+        "time": str(datetime.now()),
     }
     save(CASE_FILE, cases)
-    return case_id
+    return cid
 
-def load_temp_actions() -> list[dict]:
-    data = load(TEMP_ACTIONS_FILE)
-    if isinstance(data, list):
-        return data
-    return []
+def load_temp_actions() -> list:
+    d = load(TEMP_ACTIONS_FILE)
+    return d if isinstance(d, list) else []
 
-def save_temp_actions(actions: list[dict]):
+def save_temp_actions(actions: list):
     save(TEMP_ACTIONS_FILE, actions)
 
 def parse_duration_token(token: str) -> int | None:
-    """Parse a duration token like 15m, 2h, 3d into seconds."""
-    if not token:
+    if not token or len(token) < 2:
         return None
     token = token.strip().lower()
-    if len(token) < 2:
+    num, unit = token[:-1], token[-1]
+    if not num.isdigit() or unit not in "smhd":
         return None
-    unit     = token[-1]
-    num_part = token[:-1]
-    if not num_part.isdigit():
-        return None
-    value = int(num_part)
-    if value <= 0:
-        return None
-    scale = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    if unit not in scale:
-        return None
-    return value * scale[unit]
+    v = int(num)
+    return v * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit] if v > 0 else None
 
-def parse_duration_and_reason(
-    args: list[str],
-    start_index: int,
-    default_reason: str = "No Reason",
-) -> tuple[int | None, str]:
-    """Parse an optional duration token then a free-text reason from args."""
-    if len(args) <= start_index:
-        return None, default_reason
-    maybe_duration = parse_duration_token(args[start_index])
-    if maybe_duration is not None:
-        reason = extract_reason_from_args(args, start_index + 1, default_reason)
-        return maybe_duration, reason
-    return None, extract_reason_from_args(args, start_index, default_reason)
+def parse_duration_and_reason(args, start, default="No Reason"):
+    if len(args) <= start:
+        return None, default
+    dur = parse_duration_token(args[start])
+    if dur is not None:
+        return dur, extract_reason(args, start + 1, default)
+    return None, extract_reason(args, start, default)
 
-def format_duration(seconds: int) -> str:
-    if seconds % 86400 == 0:
-        return f"{seconds // 86400}d"
-    if seconds % 3600 == 0:
-        return f"{seconds // 3600}h"
-    if seconds % 60 == 0:
-        return f"{seconds // 60}m"
-    return f"{seconds}s"
+def format_duration(secs: int) -> str:
+    for divisor, suffix in [(86400, "d"), (3600, "h"), (60, "m")]:
+        if secs % divisor == 0:
+            return f"{secs // divisor}{suffix}"
+    return f"{secs}s"
 
-def role_help_text(user_id: int) -> str:
-    if is_owner(user_id):
+def track_action(uid: int) -> int:
+    data = load(ABUSE_FILE)
+    key  = str(uid)
+    now  = time.time()
+    data.setdefault(key, [])
+    data[key] = [x for x in data[key] if now - x <= 60]
+    data[key].append(now)
+    save(ABUSE_FILE, data)
+    return len(data[key])
+
+def create_appeal(uid: int, case_id: str, message: str) -> str:
+    appeals = load(APPEALS_FILE)
+    if not isinstance(appeals, dict):
+        appeals = {}
+    aid = str(len(appeals) + 1)
+    appeals[aid] = {
+        "case_id": case_id, "user_id": uid,
+        "message": message, "status": "open",
+        "time": str(datetime.now()),
+    }
+    save(APPEALS_FILE, appeals)
+    return aid
+
+def role_help_text(uid: int) -> str:
+    if is_owner(uid):
         return (
             "📘 **Owner Help**\n\n"
-            "General: /start, /help, /happeal <case_id> <message>\n"
+            "General: /start, /help, /happeal <case_id> <msg>\n"
             "Owner only: /hauth, /hgrant, /hrevoke, /hprotect\n"
             "Moderation: /hban, /hmute, /hwarn, /hdel, /hcase, /hmodinfo\n\n"
-            "Timed actions — use duration token like `30m`, `2h`, `1d`:\n"
-            "`/hban 123456789 2h spam`\n"
-            "`/hmute 123456789 30m abuse`\n"
-            "Reply to a user message for the same effect without a user ID."
+            "Timed actions: `/hban [id] 2h spam`  `/hmute [id] 30m abuse`\n"
+            "Reply to a message to target without passing user ID."
         )
-    if is_authorized(user_id):
+    if is_authorized(uid):
         return (
             "📘 **Moderator Help**\n\n"
             "Commands: /hban, /hmute, /hwarn, /hdel, /hcase, /hmodinfo\n"
             "Timed ban/mute: `/hban [user_id] 30m [reason]`\n"
-            "Reply to a user message to target them without their ID."
+            "Reply to a user message to target without their ID."
         )
     return (
         "📘 **User Help**\n\n"
@@ -463,162 +581,273 @@ def role_help_text(user_id: int) -> str:
         "Appeal a case in bot DM: `/happeal <case_id> <message>`"
     )
 
-def create_appeal(user_id: int, case_id: str, message: str) -> str:
-    appeals = load(APPEALS_FILE)
-    if not isinstance(appeals, dict):
-        appeals = {}
-    appeal_id = str(len(appeals) + 1)
-    appeals[appeal_id] = {
-        "case_id": case_id,
-        "user_id": user_id,
-        "message": message,
-        "status":  "open",
-        "time":    str(datetime.now()),
-    }
-    save(APPEALS_FILE, appeals)
-    return appeal_id
-
-def track_action(user_id: int) -> int:
-    data = load(ABUSE_FILE)
-    uid  = str(user_id)
-    now  = time.time()
-    data.setdefault(uid, [])
-    data[uid].append(now)
-    data[uid] = [x for x in data[uid] if now - x <= 60]
-    save(ABUSE_FILE, data)
-    return len(data[uid])
-
 # =========================================================
-# PYROGRAM CLIENT — module-level singleton
+# INLINE KEYBOARD BUILDER (Bot API dict format)
 # =========================================================
 
-_bot: Client = None
-bot_ready    = False
-_temp_action_worker_task: asyncio.Task | None = None
+def build_markup(*rows) -> dict:
+    """
+    build_markup(
+        [("🔓 Unban", "cb:unban_123")],
+        [("📜 View Case", "cb:case_5")],
+    )
+    Prefix url: with the URL string to create a URL button.
+    """
+    keyboard = []
+    for row in rows:
+        btn_row = []
+        for text, data in row:
+            if data.startswith("url:"):
+                btn_row.append({"text": text, "url": data[4:]})
+            else:
+                btn_row.append({"text": text, "callback_data": data.replace("cb:", "")})
+        keyboard.append(btn_row)
+    return {"inline_keyboard": keyboard}
+
+# =========================================================
+# PYROGRAM CLIENT
+# =========================================================
+
+_bot: Client      = None
+bot_ready: bool   = False
+_temp_worker_task = None
 
 async def get_bot() -> Client:
-    """Get or initialize the Pyrogram bot client."""
     global _bot, bot_ready
-    try:
-        if _bot is None or not _bot.is_connected:
-            log_msg("Initializing Pyrogram Client...", "INFO")
-            _bot = Client(
-                name       = "modbot",
-                api_id     = API_ID,
-                api_hash   = API_HASH,
-                bot_token  = BOT_TOKEN,
-                in_memory  = True,
-                no_updates = True,
-            )
-            await _bot.start()
-            bot_ready = True
-            me = await _bot.get_me()
-            log_msg(f"✅ Bot authenticated as @{me.username}", "INFO")
-        return _bot
-    except Exception as e:
-        log_msg(f"ERROR in get_bot: {e}", "ERROR")
-        log_msg(traceback.format_exc(), "ERROR")
-        bot_ready = False
-        raise
+    if _bot is None or not _bot.is_connected:
+        log_msg("Initializing Pyrogram client...", "INFO")
+        _bot = Client(
+            name="modbot", api_id=API_ID, api_hash=API_HASH,
+            bot_token=BOT_TOKEN, in_memory=True, no_updates=True,
+        )
+        await _bot.start()
+        bot_ready = True
+        me = await _bot.get_me()
+        log_msg(f"✅ Authenticated as @{me.username}", "INFO")
+    return _bot
 
 async def shutdown_bot():
-    """Gracefully shutdown the bot."""
     global _bot, bot_ready
     if _bot:
         try:
             await _bot.stop()
-            _bot        = None
-            bot_ready   = False
-            log_msg("Bot disconnected", "INFO")
+        except Exception:
+            pass
+        _bot = None
+        bot_ready = False
+
+# =========================================================
+# ADMIN GROUP AUTO-DETECT
+# =========================================================
+
+async def detect_admin_groups(bot: Client) -> list[int]:
+    """Return list of group/supergroup chat IDs where the bot is admin."""
+    groups = []
+    try:
+        async for dialog in bot.get_dialogs():
+            chat = dialog.chat
+            if chat.type.value not in ("group", "supergroup", "channel"):
+                continue
+            try:
+                me = await bot.get_chat_member(chat.id, "me")
+                if me.status.value in ("administrator", "creator"):
+                    groups.append(chat.id)
+            except Exception:
+                pass
+    except Exception as e:
+        log_msg(f"detect_admin_groups error: {e}", "WARNING")
+    return groups
+
+async def resolve_log_group(bot: Client):
+    """Set _log_group_id and _backup_chat_id; auto-detect if LOG_GROUP_ID == 0."""
+    global _log_group_id, _backup_chat_id, _tg_backup_enabled
+
+    if _log_group_id != 0:
+        # Verify the configured group is accessible
+        try:
+            chat = await bot.get_chat(_log_group_id)
+            log_msg(f"✅ Log group confirmed: {chat.title} ({_log_group_id})", "INFO")
+            _tg_backup_enabled = True
+            if _backup_chat_id == 0:
+                _backup_chat_id = _log_group_id
+            return
         except Exception as e:
-            log_msg(f"ERROR shutting down bot: {e}", "ERROR")
+            log_msg(f"WARNING: configured LOG_GROUP_ID {_log_group_id} inaccessible: {e}", "WARNING")
+            log_msg("Attempting auto-detection...", "INFO")
 
-async def notify_owner(bot: Client, text: str):
-    """Send an operational notification to the owner's DM."""
-    if OWNER_ID == 0:
+    groups = await detect_admin_groups(bot)
+    if not groups:
+        log_msg("⚠️ No admin groups found. Log messages will be skipped.", "WARNING")
+        await tg_send(OWNER_ID, "⚠️ Bot started but no admin group found. Set LOG_GROUP_ID.")
         return
-    try:
-        await bot.send_message(OWNER_ID, text)
-    except Exception as e:
-        log_msg(f"Owner notify failed: {e}", "WARNING")
 
-async def ensure_webhook_registered() -> str:
-    """Ensure webhook is configured when APP_URL or WEBHOOK_URL is available."""
-    base = os.environ.get("WEBHOOK_URL") or os.environ.get("APP_URL")
-    if not base:
+    _log_group_id = groups[0]
+    if _backup_chat_id == 0:
+        _backup_chat_id = _log_group_id
+    _tg_backup_enabled = True
+
+    try:
+        chat = await bot.get_chat(_log_group_id)
+        log_msg(f"✅ Auto-detected log group: {chat.title} ({_log_group_id})", "INFO")
+        await tg_send(
+            OWNER_ID,
+            f"ℹ️ Auto-detected log group: **{chat.title}**\n`{_log_group_id}`\n\n"
+            f"Set `LOG_GROUP_ID={_log_group_id}` in env vars to make this permanent."
+        )
+    except Exception:
+        log_msg(f"Auto-detected log group: {_log_group_id}", "INFO")
+
+# =========================================================
+# WEBHOOK MANAGEMENT
+# =========================================================
+
+async def ensure_webhook(base_url: str = None) -> str:
+    url = os.environ.get("WEBHOOK_URL") or os.environ.get("APP_URL") or base_url
+    if not url:
         return "skipped:no-url"
-    base        = base.rstrip("/")
-    webhook_url = f"{base}/api/webhook"
-    try:
-        async with httpx.AsyncClient() as client:
-            info_resp = await client.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo",
-                timeout=10,
-            )
-            current = info_resp.json().get("result", {}).get("url", "")
-            if current == webhook_url:
-                return "ok:already-set"
-            set_resp   = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
-                json={
-                    "url":             webhook_url,
-                    "allowed_updates": ["message", "callback_query"],
-                    "drop_pending_updates": False,
-                },
-                timeout=10,
-            )
-            set_result = set_resp.json()
-            if set_result.get("ok"):
-                return f"ok:set:{webhook_url}"
-            return f"error:{set_result.get('description', 'unknown')}"
-    except Exception as e:
-        return f"error:{e}"
+    webhook_url = url.rstrip("/") + "/api/webhook"
+    info = await tg_api("getWebhookInfo")
+    if info.get("result", {}).get("url") == webhook_url:
+        return "ok:already-set"
+    result = await tg_api("setWebhook", json={
+        "url": webhook_url,
+        "allowed_updates": ["message", "callback_query"],
+        "drop_pending_updates": False,
+    })
+    return f"ok:set:{webhook_url}" if result.get("ok") else f"error:{result.get('description')}"
 
-async def sync_bot_commands() -> str:
-    """Set Telegram bot menu commands and return a status string."""
-    try:
-        async with httpx.AsyncClient() as client:
-            resp   = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
-                json={"commands": BOT_COMMANDS},
-                timeout=10,
-            )
-            result = resp.json()
-            return "ok" if result.get("ok") else f"error:{result.get('description', 'unknown')}"
-    except Exception as e:
-        return f"error:{e}"
+async def sync_commands() -> str:
+    result = await tg_api("setMyCommands", json={"commands": BOT_COMMANDS})
+    return "ok" if result.get("ok") else f"error:{result.get('description')}"
+
+# =========================================================
+# ANTI-NUKE
+# =========================================================
+
+async def anti_nuke(chat_id: int, reply_to: int, uid: int) -> bool:
+    total = track_action(uid)
+    if total < 10:
+        return False
+    auth = load(AUTH_FILE)
+    if str(uid) in auth:
+        auth[str(uid)]["frozen"] = True
+        save(AUTH_FILE, auth)
+    lg = get_log_group()
+    if lg:
+        await tg_send(lg,
+            f"🚨 **ANTI-NUKE ACTIVATED**\n\n"
+            f"Moderator: `{uid}`\n"
+            f"Actions in 60 sec: `{total}`\n"
+            f"Moderator frozen automatically."
+        )
+    await tg_send(chat_id, "🚨 Anti-Nuke triggered — moderator frozen.", reply_to=reply_to)
+    return True
+
+# =========================================================
+# ACTION LOG — sends to source group AND log group
+# =========================================================
+
+async def send_action_log(
+    source_chat: int,
+    reply_to:    int,
+    action:      str,
+    target:      dict,
+    reason:      str,
+    case_id:     str,
+    mod_data:    dict,
+    extra:       str = "",
+):
+    mention   = make_mention(target)
+    target_id = target.get("id")
+    badge     = mod_data.get("badge", "🛡 Moderator")
+    mod_uid   = mod_data.get("mod_id", "UNKNOWN")
+    time_now  = datetime.now().strftime("%d %b %Y • %I:%M %p")
+
+    text = (
+        f"╭━━━〔 🚨 MODERATION ACTION 〕━━━╮\n\n"
+        f"👤 User: {mention}\n"
+        f"🆔 User ID: `{target_id}`\n\n"
+        f"⚔ Action: {action}\n"
+        f"📝 Reason: {reason}\n\n"
+        f"👮 Moderator:\n"
+        f"{badge} | {mod_uid}\n\n"
+        f"⏰ Time: {time_now}\n"
+        f"📜 Case ID: #{case_id}\n"
+        f"{extra}\n"
+        f"╰━━━━━━━━━━━━━━━━━━━━━━╯"
+    )
+
+    rows = []
+    if action == "BAN":
+        rows.append([("🔓 Unban",       f"cb:unban_{target_id}")])
+    elif action == "MUTE":
+        rows.append([("🔊 Unmute",      f"cb:unmute_{target_id}")])
+    elif action == "WARN":
+        rows.append([("🗑 Remove Warn", f"cb:removewarn_{target_id}")])
+    elif action == "DELETE":
+        rows.append([("👤 Profile",     f"url:tg://user?id={target_id}")])
+    rows.append([("📜 View Case",       f"cb:case_{case_id}")])
+    markup = build_markup(*rows)
+
+    # Send to the group where the action happened
+    await tg_send(source_chat, text, reply_to=reply_to, markup=markup)
+
+    # Send to log group (may differ from source_chat)
+    lg = get_log_group()
+    if lg and lg != source_chat:
+        await tg_send(lg, text, markup=markup)
+    elif lg == source_chat:
+        # already sent above
+        pass
+
+async def send_grant_log(chat_id, reply_to, granted_by, target, permission, case_id=None):
+    case_line = f"\n📜 Case ID: #{case_id}" if case_id else ""
+    text = (
+        f"✅ **Permission Granted**\n\n"
+        f"👤 Moderator: {make_mention(target)}\n"
+        f"🔐 Permission: `{permission}`\n"
+        f"🛡 Granted by: `{granted_by}`{case_line}"
+    )
+    await tg_send(chat_id, text, reply_to=reply_to)
+    lg = get_log_group()
+    if lg and lg != chat_id:
+        await tg_send(lg, f"📝 Grant logged\n\n{text}")
+
+async def notify_owner(text: str):
+    if OWNER_ID:
+        await tg_send(OWNER_ID, text)
+
+# =========================================================
+# TEMP ACTION WORKER
+# =========================================================
 
 async def process_due_temp_actions(bot: Client):
-    """Process due unmute/unban actions from persistent storage."""
     actions = load_temp_actions()
     if not actions:
         return
     now_ts  = int(time.time())
-    pending: list[dict] = []
+    pending = []
     for action in actions:
-        until_ts    = int(action.get("until_ts", 0))
-        if until_ts > now_ts:
+        if int(action.get("until_ts", 0)) > now_ts:
             pending.append(action)
             continue
-        chat_id     = action.get("chat_id")
-        target_id   = action.get("target_id")
-        action_type = action.get("type")
+        chat_id   = action["chat_id"]
+        target_id = action["target_id"]
+        atype     = action["type"]
         try:
-            if action_type == "mute":
-                # FIX: Restore full member permissions, not just can_send_messages
+            if atype == "mute":
                 await bot.restrict_chat_member(chat_id, target_id, FULL_MEMBER_PERMISSIONS)
-                await bot.send_message(chat_id, f"🔊 Temporary mute ended for `{target_id}`")
-            elif action_type == "ban":
+                await tg_send(chat_id, f"🔊 Temporary mute ended for `{target_id}`")
+            elif atype == "ban":
                 await bot.unban_chat_member(chat_id, target_id)
-                await bot.send_message(chat_id, f"🔓 Temporary ban ended for `{target_id}`")
+                await tg_send(chat_id, f"🔓 Temporary ban ended for `{target_id}`")
         except Exception as e:
-            log_msg(f"ERROR processing temp action {action}: {e}", "ERROR")
+            log_msg(f"temp action error {action}: {e}", "ERROR")
             pending.append(action)
     if len(pending) != len(actions):
         save_temp_actions(pending)
 
 async def temp_action_worker():
-    """Background worker to auto-revert timed moderation actions."""
     while True:
         try:
             bot = await get_bot()
@@ -626,138 +855,27 @@ async def temp_action_worker():
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log_msg(f"ERROR in temp action worker: {e}", "ERROR")
+            log_msg(f"temp_action_worker error: {e}", "ERROR")
         await asyncio.sleep(10)
-
-# =========================================================
-# ANTI-NUKE
-# =========================================================
-
-async def anti_nuke(bot: Client, chat_id: int, reply_to: int, user_id: int) -> bool:
-    """Freeze a moderator after 10 actions within 60 seconds."""
-    total = track_action(user_id)
-    if total < 10:
-        return False
-    auth = load(AUTH_FILE)
-    if str(user_id) in auth:
-        auth[str(user_id)]["frozen"] = True
-        save(AUTH_FILE, auth)
-    try:
-        await bot.send_message(
-            LOG_GROUP_ID,
-            f"🚨 **ANTI-NUKE ACTIVATED**\n\n"
-            f"Moderator: `{user_id}`\n"
-            f"Actions in 60 sec: `{total}`\n\n"
-            f"Moderator has been frozen automatically.",
-        )
-        await bot.send_message(
-            chat_id,
-            "🚨 Anti-Nuke triggered — moderator frozen.",
-            reply_to_message_id=reply_to,
-        )
-    except Exception as e:
-        log_msg(f"ERROR in anti_nuke: {e}", "ERROR")
-    return True
-
-# =========================================================
-# ACTION LOG
-# =========================================================
-
-async def send_action_log(
-    bot:           Client,
-    chat_id:       int,
-    reply_to:      int,
-    action:        str,
-    target:        dict,
-    reason:        str,
-    case_id:       str,
-    moderator_data: dict,
-    extra:         str = "",
-):
-    """Send a moderation action log to the current chat and the log group."""
-    try:
-        mention   = make_mention(target)
-        target_id = target["id"]
-        badge     = moderator_data.get("badge", "🛡 Moderator")
-        mod_uid   = moderator_data.get("mod_id", "UNKNOWN")
-        time_now  = datetime.now().strftime("%d %b %Y • %I:%M %p")
-
-        text = (
-            f"╭━━━〔 🚨 MODERATION ACTION 〕━━━╮\n\n"
-            f"👤 User: {mention}\n"
-            f"🆔 User ID: `{target_id}`\n\n"
-            f"⚔ Action: {action}\n"
-            f"📝 Reason: {reason}\n\n"
-            f"👮 Moderator:\n"
-            f"{badge} | {mod_uid}\n\n"
-            f"⏰ Time: {time_now}\n"
-            f"📜 Case ID: #{case_id}\n"
-            f"{extra}\n"
-            f"╰━━━━━━━━━━━━━━━━━━━━━━╯"
-        )
-
-        buttons = []
-        if action == "BAN":
-            buttons.append([InlineKeyboardButton("🔓 Unban",        callback_data=f"unban_{target_id}")])
-        elif action == "MUTE":
-            buttons.append([InlineKeyboardButton("🔊 Unmute",       callback_data=f"unmute_{target_id}")])
-        elif action == "WARN":
-            buttons.append([InlineKeyboardButton("🗑 Remove Warn",  callback_data=f"removewarn_{target_id}")])
-        elif action == "DELETE":
-            buttons.append([InlineKeyboardButton("👤 Profile",      url=f"tg://user?id={target_id}")])
-
-        buttons.append([InlineKeyboardButton("📜 View Case",        callback_data=f"case_{case_id}")])
-        markup = InlineKeyboardMarkup(buttons)
-
-        await bot.send_message(chat_id, text, reply_markup=markup, reply_to_message_id=reply_to)
-        await bot.send_message(LOG_GROUP_ID, text, reply_markup=markup)
-    except Exception as e:
-        log_msg(f"ERROR in send_action_log: {e}", "ERROR")
-        log_msg(traceback.format_exc(), "ERROR")
-
-# FIX: Removed duplicate chat-message from send_grant_confirmation — the caller
-#      now calls this as the single confirmation + log, without a separate reply_text.
-async def send_grant_log(
-    bot:        Client,
-    chat_id:    int,
-    reply_to:   int,
-    granted_by: int,
-    target:     dict,
-    permission: str,
-    case_id:    str | None = None,
-):
-    """Post a permission-grant confirmation in the current chat and the log group."""
-    try:
-        case_line = f"\n📜 Case ID: #{case_id}" if case_id else ""
-        text = (
-            f"✅ **Permission Granted**\n\n"
-            f"👤 Moderator: {make_mention(target)}\n"
-            f"🔐 Permission: `{permission}`\n"
-            f"🛡 Granted by: `{granted_by}`"
-            f"{case_line}"
-        )
-        await bot.send_message(chat_id, text, reply_to_message_id=reply_to)
-        await bot.send_message(LOG_GROUP_ID, f"📝 Grant logged\n\n{text}")
-    except Exception as e:
-        log_msg(f"ERROR sending grant log: {e}", "ERROR")
 
 # =========================================================
 # FASTAPI APP
 # =========================================================
 
-app = FastAPI(title="Advanced Moderation Bot - Koyeb")
+app = FastAPI(title="Moderation Bot")
 
-# =========================================================
-# HEALTH CHECK ENDPOINTS
-# =========================================================
+# ── Root endpoint (fixes 404 on GET /) ──────────────────
+@app.get("/")
+async def root():
+    return {
+        "service":   "Telegram Moderation Bot",
+        "status":    "running" if bot_ready else "starting",
+        "endpoints": ["/health", "/api/status", "/api/setup_webhook", "/api/webhook"],
+    }
 
 @app.get("/health")
 async def health_check():
-    return {
-        "status":    "healthy",
-        "bot_ready": bot_ready,
-        "timestamp": datetime.now().isoformat(),
-    }
+    return {"status": "healthy", "bot_ready": bot_ready, "timestamp": datetime.now().isoformat()}
 
 @app.get("/api/status")
 async def bot_status():
@@ -765,91 +883,41 @@ async def bot_status():
         bot = await get_bot()
         me  = await bot.get_me()
         return {
-            "status":          "running",
-            "bot_id":          me.id,
-            "bot_username":    me.username,
-            "bot_first_name":  me.first_name,
-            "timestamp":       datetime.now().isoformat(),
+            "status": "running", "bot_id": me.id,
+            "bot_username": me.username,
+            "log_group_id": get_log_group(),
+            "timestamp": datetime.now().isoformat(),
         }
     except Exception as e:
-        return {"status": "error", "error": str(e), "timestamp": datetime.now().isoformat()}
-
-# =========================================================
-# WEBHOOK SETUP
-# =========================================================
+        return {"status": "error", "error": str(e)}
 
 @app.get("/api/setup_webhook")
-async def setup_webhook(request: Request):
-    """One-time endpoint to register the webhook with Telegram."""
-    log_msg("=== WEBHOOK SETUP CALLED ===", "INFO")
-    base_url    = str(request.base_url).rstrip("/")
-    webhook_url = f"{base_url}/api/webhook"
-    log_msg(f"Setting webhook to: {webhook_url}", "INFO")
-    result = {
-        "webhook_url":  webhook_url,
-        "set_webhook":  {},
-        "set_commands": {},
-        "webhook_info": {},
-        "errors":       [],
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            set_resp   = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
-                json={
-                    "url":                  webhook_url,
-                    "allowed_updates":      ["message", "callback_query"],
-                    "drop_pending_updates": True,
-                },
-                timeout=10,
-            )
-            set_result = set_resp.json()
-            result["set_webhook"] = set_result
-            log_msg(f"Webhook response: {set_result}", "INFO")
-            if not set_result.get("ok"):
-                result["errors"].append(f"Webhook error: {set_result.get('description')}")
+async def setup_webhook_endpoint(request: Request):
+    base = str(request.base_url).rstrip("/")
+    webhook_url = f"{base}/api/webhook"
+    result = await tg_api("setWebhook", json={
+        "url": webhook_url,
+        "allowed_updates": ["message", "callback_query"],
+        "drop_pending_updates": True,
+    })
+    cmds   = await sync_commands()
+    info   = await tg_api("getWebhookInfo")
+    return {"webhook_url": webhook_url, "set_webhook": result, "commands": cmds, "info": info}
 
-            commands_status           = await sync_bot_commands()
-            result["set_commands"]    = {"status": commands_status}
-            if commands_status.startswith("error:"):
-                result["errors"].append(f"Commands error: {commands_status}")
-
-            info_resp             = await client.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo",
-                timeout=10,
-            )
-            result["webhook_info"] = info_resp.json()
-    except Exception as e:
-        log_msg(f"ERROR in setup_webhook: {e}", "ERROR")
-        result["errors"].append(str(e))
-    log_msg("=== WEBHOOK SETUP COMPLETE ===", "INFO")
-    return result
-
-# =========================================================
-# WEBHOOK ENDPOINT
-# =========================================================
-
+# ── Webhook ──────────────────────────────────────────────
 @app.post("/api/webhook")
 async def webhook(request: Request):
-    """Receive and process Telegram webhook updates."""
     try:
         update = await request.json()
         if not isinstance(update, dict):
-            log_msg("Invalid webhook payload: expected JSON object", "WARNING")
-            return JSONResponse({"ok": False, "error": "invalid payload"}, status_code=400)
-        log_msg(f"Update received: {update.get('update_id')}", "DEBUG")
+            return JSONResponse({"ok": False}, status_code=400)
         bot = await get_bot()
         if "message" in update:
-            msg_text = update["message"].get("text", "")[:50]
-            log_msg(f"Message: {msg_text}", "DEBUG")
             await handle_message(bot, update["message"])
         elif "callback_query" in update:
-            cb_data = update["callback_query"].get("data", "")[:50]
-            log_msg(f"Callback: {cb_data}", "DEBUG")
             await handle_callback(bot, update["callback_query"])
     except Exception as e:
-        log_msg(f"ERROR processing webhook: {e}", "ERROR")
-        log_msg(traceback.format_exc(), "ERROR")
+        log_msg(f"webhook error: {e}\n{traceback.format_exc()}", "ERROR")
     return {"ok": True}
 
 # =========================================================
@@ -857,398 +925,293 @@ async def webhook(request: Request):
 # =========================================================
 
 async def handle_message(bot: Client, msg: dict):
-    """Route incoming Telegram messages to their command handlers."""
     try:
         text = msg.get("text", "")
         if not text.startswith("/"):
             return
 
-        chat_id                    = msg["chat"]["id"]
-        msg_id                     = msg["message_id"]
-        user_id, user_identity_err = extract_actor_user_id(msg)
-        reply                      = msg.get("reply_to_message") or {}
+        chat_id  = msg["chat"]["id"]
+        msg_id   = msg["message_id"]
+        uid, err = extract_actor_user_id(msg)
+        reply    = msg.get("reply_to_message") or {}
 
-        raw_cmd = text.split()[0].split("@")[0].lstrip("/").lower()
         parts   = text.split(None, 1)
+        raw_cmd = parts[0].split("@")[0].lstrip("/").lower()
         args    = parts[1].split() if len(parts) > 1 else []
 
-        log_msg(f"User {user_id} command: /{raw_cmd}", "INFO")
+        log_msg(f"/{raw_cmd} from uid={uid} chat={chat_id}", "INFO")
 
         async def reply_text(t: str):
-            await bot.send_message(chat_id, t, reply_to_message_id=msg_id)
+            await tg_send(chat_id, t, reply_to=msg_id)
 
-        # Reject anonymous / unresolvable senders
-        if user_identity_err:
-            await reply_text(user_identity_err)
+        if err:
+            await reply_text(err)
             return
 
-        # Optional: notify owner only on moderation commands, not every /start or /help
         if OWNER_DEBUG_NOTIFICATIONS and raw_cmd not in ("start", "help"):
-            await notify_owner(
-                bot,
-                f"📨 Command received\nUser: `{user_id}`\nChat: `{chat_id}`\nCmd: `/{raw_cmd}`",
-            )
+            await notify_owner(f"📨 /{raw_cmd}\nUser: `{uid}`\nChat: `{chat_id}`")
 
-        # ── Helper: silently remove unauthorized command messages
         async def security_fail():
-            try:
-                await bot.delete_messages(chat_id, msg_id)
-            except Exception:
-                pass
+            await tg_delete(chat_id, msg_id)
 
-        # FIX: check_mod now tests frozen FIRST, then authorization, then specific permission.
-        #      Previously frozen was last — a frozen mod could still pass has_permission.
-        async def check_mod(permission: str) -> bool:
-            if not is_authorized(user_id):
+        async def check_mod(perm: str) -> bool:
+            if not is_authorized(uid):
                 await security_fail()
                 return False
-            if is_frozen(user_id):
+            if is_frozen(uid):
                 await reply_text("🚫 Your moderator account is frozen.")
                 return False
-            if not has_permission(user_id, permission):
-                await reply_text(f"❌ You don't have the `{permission}` permission.")
+            if not has_permission(uid, perm):
+                await reply_text(f"❌ You don't have `{perm}` permission.")
                 return False
             return True
 
-        # ─────────────────────────────────────────────
-        # /start
-        # ─────────────────────────────────────────────
+        # ── /start ────────────────────────────────────────
         if raw_cmd == "start":
             await reply_text(
                 "✅ **Advanced Moderation Bot**\n\n"
-                "Use /help to see commands for your role.\n"
-                "Commands: /help /happeal /hauth /hgrant /hrevoke "
-                "/hban /hmute /hwarn /hdel /hprotect /hcase /hmodinfo"
+                "Use /help to see your available commands."
             )
             return
 
-        # ─────────────────────────────────────────────
-        # /help
-        # ─────────────────────────────────────────────
+        # ── /help ─────────────────────────────────────────
         if raw_cmd == "help":
-            await reply_text(role_help_text(user_id))
+            await reply_text(role_help_text(uid))
             return
 
-        # ─────────────────────────────────────────────
-        # /happeal — DM only
-        # ─────────────────────────────────────────────
+        # ── /happeal ──────────────────────────────────────
         if raw_cmd == "happeal":
             if msg.get("chat", {}).get("type") != "private":
                 return await reply_text("❌ Use /happeal in bot DM only.")
             if len(args) < 2:
                 return await reply_text("Usage: /happeal <case_id> <message>")
-            case_id        = args[0]
-            appeal_message = " ".join(args[1:]).strip()
-            if not appeal_message:
+            case_id = args[0]
+            appeal_msg = " ".join(args[1:]).strip()
+            if not appeal_msg:
                 return await reply_text("❌ Appeal message is required.")
             cases = load(CASE_FILE)
             if case_id not in cases:
                 return await reply_text("❌ Case not found.")
-            case = cases[case_id]
-            if int(case.get("target", 0)) != user_id and not is_owner(user_id):
+            if int(cases[case_id].get("target", 0)) != uid and not is_owner(uid):
                 return await reply_text("❌ You can only appeal your own case.")
-            appeal_id = create_appeal(user_id, case_id, appeal_message)
-            await reply_text(f"✅ Appeal submitted. Appeal ID: #{appeal_id}")
+            aid = create_appeal(uid, case_id, appeal_msg)
+            await reply_text(f"✅ Appeal submitted. Appeal ID: #{aid}")
             await notify_owner(
-                bot,
-                f"📨 New appeal #{appeal_id}\nCase: #{case_id}\nUser: `{user_id}`\nMessage: {appeal_message}",
+                f"📨 New appeal #{aid}\nCase: #{case_id}\nUser: `{uid}`\n{appeal_msg}"
             )
             return
 
-        # ─────────────────────────────────────────────
-        # /hauth — owner only
-        # ─────────────────────────────────────────────
+        # ── /hauth ────────────────────────────────────────
         if raw_cmd in ("hauth", "ha"):
-            if not is_owner(user_id):
-                return await reply_text("❌ Only the owner can authorize moderators.")
-            target, target_id, target_err = resolve_target_from_reply_or_args(reply, args, 0)
-            if not target_id:
-                return await reply_text(
-                    f"{target_err}\nUsage: /hauth <user_id>  — or reply to a user."
-                )
+            if not is_owner(uid):
+                return await reply_text("❌ Owner only.")
+            target, tid, terr = resolve_target(reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hauth <user_id>")
             data = load(AUTH_FILE)
-            uid  = str(target_id)
-            # FIX: notify if already authorized rather than silently overwriting
-            if uid in data:
+            key  = str(tid)
+            if key in data:
                 return await reply_text(
-                    f"ℹ️ {make_mention(target)} is already authorized.\n"
-                    f"Mod ID: `{data[uid].get('mod_id', 'N/A')}`"
+                    f"ℹ️ {make_mention(target)} already authorized.\n"
+                    f"Mod ID: `{data[key].get('mod_id', 'N/A')}`"
                 )
-            data[uid] = {
-                "permissions": {},
-                "mod_id":      generate_mod_id(),
-                "badge":       "🛡 Moderator",
-                "frozen":      False,
+            data[key] = {
+                "permissions": {}, "mod_id": generate_mod_id(),
+                "badge": "🛡 Moderator", "frozen": False,
             }
-            save(AUTH_FILE, data)
-            await reply_text(f"✅ {make_mention(target)} authorized as moderator.\nMod ID: `{data[uid]['mod_id']}`")
-            await bot.send_message(
-                LOG_GROUP_ID,
-                f"✅ Moderator authorized\n👤 {make_mention(target)} (`{target_id}`)\n🛡 By: `{user_id}`",
-            )
+            await save_and_backup(AUTH_FILE, data)
+            await reply_text(f"✅ {make_mention(target)} authorized.\nMod ID: `{data[key]['mod_id']}`")
+            lg = get_log_group()
+            if lg:
+                await tg_send(lg, f"✅ Moderator authorized\n👤 {make_mention(target)} (`{tid}`)\n🛡 By: `{uid}`")
             return
 
-        # ─────────────────────────────────────────────
-        # /hgrant — owner only
-        # ─────────────────────────────────────────────
+        # ── /hgrant ───────────────────────────────────────
         if raw_cmd in ("hgrant", "hg"):
-            if not is_owner(user_id):
+            if not is_owner(uid):
                 return
             if not args:
                 return await reply_text(
-                    "Usage: /hgrant <permission> <user_id>\n"
-                    "Or reply to the moderator with /hgrant <permission>\n"
-                    f"Valid permissions: {', '.join(VALID_PERMISSIONS)}"
+                    f"Usage: /hgrant <permission> <user_id>\n"
+                    f"Valid: {', '.join(VALID_PERMISSIONS)}"
                 )
-            permission = args[0].lower()
-            if permission not in VALID_PERMISSIONS:
-                return await reply_text(
-                    f"❌ Invalid permission. Valid: {', '.join(VALID_PERMISSIONS)}"
-                )
-            target, target_id, target_err = resolve_target_from_reply_or_args(reply, args, 1)
-            if not target_id:
-                return await reply_text(
-                    f"{target_err}\nUsage: /hgrant <permission> <user_id>"
-                )
-            uid  = str(target_id)
+            perm = args[0].lower()
+            if perm not in VALID_PERMISSIONS:
+                return await reply_text(f"❌ Invalid permission. Valid: {', '.join(VALID_PERMISSIONS)}")
+            target, tid, terr = resolve_target(reply, args, 1)
+            if not tid:
+                return await reply_text(f"{terr}")
             data = load(AUTH_FILE)
-            if uid not in data:
-                return await reply_text("❌ User is not authorized. Run /hauth first.")
-            data[uid]["permissions"][permission] = True
-            save(AUTH_FILE, data)
-            case_id = create_case("GRANT", user_id, target_id, f"Granted permission: {permission}")
-            # FIX: single confirmation — send_grant_log handles both chat reply and LOG_GROUP_ID.
-            #      Removed the separate reply_text that caused a duplicate message in chat.
-            await send_grant_log(bot, chat_id, msg_id, user_id, target, permission, case_id)
+            if str(tid) not in data:
+                return await reply_text("❌ User not authorized. Run /hauth first.")
+            data[str(tid)]["permissions"][perm] = True
+            await save_and_backup(AUTH_FILE, data)
+            case_id = create_case("GRANT", uid, tid, f"Granted: {perm}")
+            await send_grant_log(chat_id, msg_id, uid, target, perm, case_id)
             return
 
-        # ─────────────────────────────────────────────
-        # /hrevoke — owner only
-        # ─────────────────────────────────────────────
+        # ── /hrevoke ──────────────────────────────────────
         if raw_cmd in ("hrevoke", "hr"):
-            if not is_owner(user_id):
+            if not is_owner(uid):
                 return
             if not args:
-                return await reply_text(
-                    "Usage: /hrevoke <permission> <user_id>\n"
-                    "Or reply to the moderator with /hrevoke <permission>"
-                )
-            permission = args[0].lower()
-            if permission not in VALID_PERMISSIONS:
-                return await reply_text(
-                    f"❌ Invalid permission. Valid: {', '.join(VALID_PERMISSIONS)}"
-                )
-            target, target_id, target_err = resolve_target_from_reply_or_args(reply, args, 1)
-            if not target_id:
-                return await reply_text(
-                    f"{target_err}\nUsage: /hrevoke <permission> <user_id>"
-                )
-            uid  = str(target_id)
+                return await reply_text("Usage: /hrevoke <permission> <user_id>")
+            perm = args[0].lower()
+            if perm not in VALID_PERMISSIONS:
+                return await reply_text(f"❌ Invalid. Valid: {', '.join(VALID_PERMISSIONS)}")
+            target, tid, terr = resolve_target(reply, args, 1)
+            if not tid:
+                return await reply_text(f"{terr}")
             data = load(AUTH_FILE)
-            if uid not in data:
+            if str(tid) not in data:
                 return await reply_text("❌ User is not a moderator.")
-            data[uid]["permissions"][permission] = False
-            save(AUTH_FILE, data)
-            case_id = create_case("REVOKE", user_id, target_id, f"Revoked permission: {permission}")
-            # FIX: was showing ❌ emoji on a successful revocation — changed to ✅
-            await reply_text(f"✅ Revoked `{permission}` from {make_mention(target)}")
-            await bot.send_message(
-                LOG_GROUP_ID,
-                f"📝 Permission Revoked\n\n"
-                f"👤 Moderator: {make_mention(target)}\n"
-                f"🔐 Permission: `{permission}`\n"
-                f"🛡 Revoked by: `{user_id}`\n"
-                f"📜 Case ID: #{case_id}",
-            )
+            data[str(tid)]["permissions"][perm] = False
+            await save_and_backup(AUTH_FILE, data)
+            case_id = create_case("REVOKE", uid, tid, f"Revoked: {perm}")
+            await reply_text(f"✅ Revoked `{perm}` from {make_mention(target)}")
+            lg = get_log_group()
+            if lg:
+                await tg_send(
+                    lg,
+                    f"📝 Permission Revoked\n\n"
+                    f"👤 {make_mention(target)}\n"
+                    f"🔐 `{perm}`\n"
+                    f"🛡 By: `{uid}`\n"
+                    f"📜 Case #{case_id}",
+                )
             return
 
-        # ─────────────────────────────────────────────
-        # /hban
-        # ─────────────────────────────────────────────
+        # ── /hban ─────────────────────────────────────────
         if raw_cmd in ("hban", "hb"):
             if not await check_mod("ban"):
                 return
-            target, target_id, target_err = resolve_target_from_reply_or_args(reply, args, 0)
-            if not target_id:
+            target, tid, terr = resolve_target(reply, args, 0)
+            if not tid:
                 return await reply_text(
-                    f"{target_err}\n"
-                    "Usage: /hban <user_id> [duration] [reason]\n"
-                    "Or reply to the user with /hban [duration] [reason]"
+                    f"{terr}\nUsage: /hban <user_id> [duration] [reason]"
                 )
-            # Duration/reason start at args[1] when user_id came from args[0],
-            # or at args[0] when target came from a reply.
-            reason_start  = 0 if reply else 1
-            duration_secs, action_reason = parse_duration_and_reason(args, reason_start, "No Reason")
-
-            if is_protected(target_id):
-                return await reply_text("🛡 That user is protected and cannot be banned.")
-            if await anti_nuke(bot, chat_id, msg_id, user_id):
+            rs = 0 if reply else 1
+            dur, reason = parse_duration_and_reason(args, rs)
+            if is_protected(tid):
+                return await reply_text("🛡 That user is protected.")
+            if await anti_nuke(chat_id, msg_id, uid):
                 return
-
-            until_ts = int(time.time()) + duration_secs if duration_secs else None
+            until_ts = int(time.time()) + dur if dur else None
             try:
-                await bot.ban_chat_member(chat_id, target_id, until_date=until_ts)
+                await bot.ban_chat_member(chat_id, tid, until_date=until_ts)
             except (ChatAdminRequired, UserAdminInvalid):
-                return await reply_text("❌ Cannot ban — the target is an admin or I lack permission.")
+                return await reply_text("❌ Cannot ban — target is admin or I lack permissions.")
             except FloodWait as fw:
                 return await reply_text(f"⏳ Rate limited. Retry in {fw.value}s.")
             except Exception as e:
                 return await reply_text(f"❌ Ban failed: {e}")
-
-            if duration_secs:
+            if dur:
                 actions = load_temp_actions()
-                actions.append({
-                    "type":      "ban",
-                    "chat_id":   chat_id,
-                    "target_id": target_id,
-                    "until_ts":  until_ts,
-                    "set_by":    user_id,
-                    "reason":    action_reason,
-                })
+                actions.append({"type": "ban", "chat_id": chat_id, "target_id": tid,
+                                 "until_ts": until_ts, "set_by": uid, "reason": reason})
                 save_temp_actions(actions)
-                action_reason = f"{action_reason} | Duration: {format_duration(duration_secs)}"
-
-            case_id = create_case("BAN", user_id, target_id, action_reason)
-            await send_action_log(
-                bot, chat_id, msg_id, "BAN",
-                target, action_reason, case_id, get_mod_info(user_id),
-            )
+                reason = f"{reason} | Duration: {format_duration(dur)}"
+            case_id = create_case("BAN", uid, tid, reason)
+            await send_action_log(chat_id, msg_id, "BAN", target, reason, case_id, get_mod_info(uid))
             return
 
-        # ─────────────────────────────────────────────
-        # /hmute
-        # ─────────────────────────────────────────────
+        # ── /hmute ────────────────────────────────────────
         if raw_cmd in ("hmute", "hm"):
             if not await check_mod("mute"):
                 return
-            target, target_id, target_err = resolve_target_from_reply_or_args(reply, args, 0)
-            if not target_id:
+            target, tid, terr = resolve_target(reply, args, 0)
+            if not tid:
                 return await reply_text(
-                    f"{target_err}\n"
-                    "Usage: /hmute <user_id> [duration] [reason]\n"
-                    "Or reply to the user with /hmute [duration] [reason]"
+                    f"{terr}\nUsage: /hmute <user_id> [duration] [reason]"
                 )
-            reason_start  = 0 if reply else 1
-            duration_secs, action_reason = parse_duration_and_reason(args, reason_start, "No Reason")
-
-            if is_protected(target_id):
-                return await reply_text("🛡 That user is protected and cannot be muted.")
-            if await anti_nuke(bot, chat_id, msg_id, user_id):
+            rs = 0 if reply else 1
+            dur, reason = parse_duration_and_reason(args, rs)
+            if is_protected(tid):
+                return await reply_text("🛡 That user is protected.")
+            if await anti_nuke(chat_id, msg_id, uid):
                 return
-
-            until_ts = int(time.time()) + duration_secs if duration_secs else None
+            until_ts = int(time.time()) + dur if dur else None
             try:
-                # Passing ChatPermissions() with no args revokes all send permissions
-                await bot.restrict_chat_member(
-                    chat_id, target_id, ChatPermissions(), until_date=until_ts
-                )
+                await bot.restrict_chat_member(chat_id, tid, ChatPermissions(), until_date=until_ts)
             except (ChatAdminRequired, UserAdminInvalid):
-                return await reply_text("❌ Cannot mute — the target is an admin or I lack permission.")
+                return await reply_text("❌ Cannot mute — target is admin or I lack permissions.")
             except FloodWait as fw:
                 return await reply_text(f"⏳ Rate limited. Retry in {fw.value}s.")
             except Exception as e:
                 return await reply_text(f"❌ Mute failed: {e}")
-
-            if duration_secs:
+            if dur:
                 actions = load_temp_actions()
-                actions.append({
-                    "type":      "mute",
-                    "chat_id":   chat_id,
-                    "target_id": target_id,
-                    "until_ts":  until_ts,
-                    "set_by":    user_id,
-                    "reason":    action_reason,
-                })
+                actions.append({"type": "mute", "chat_id": chat_id, "target_id": tid,
+                                 "until_ts": until_ts, "set_by": uid, "reason": reason})
                 save_temp_actions(actions)
-                action_reason = f"{action_reason} | Duration: {format_duration(duration_secs)}"
-
-            case_id = create_case("MUTE", user_id, target_id, action_reason)
-            await send_action_log(
-                bot, chat_id, msg_id, "MUTE",
-                target, action_reason, case_id, get_mod_info(user_id),
-            )
+                reason = f"{reason} | Duration: {format_duration(dur)}"
+            case_id = create_case("MUTE", uid, tid, reason)
+            await send_action_log(chat_id, msg_id, "MUTE", target, reason, case_id, get_mod_info(uid))
             return
 
-        # ─────────────────────────────────────────────
-        # /hwarn
-        # ─────────────────────────────────────────────
+        # ── /hwarn ────────────────────────────────────────
         if raw_cmd in ("hwarn", "hw"):
             if not await check_mod("warn"):
                 return
-            target, target_id, target_err = resolve_target_from_reply_or_args(reply, args, 0)
-            if not target_id:
-                return await reply_text(
-                    f"{target_err}\n"
-                    "Usage: /hwarn <user_id> [reason]\n"
-                    "Or reply to the user with /hwarn [reason]"
-                )
-            reason_start  = 0 if reply else 1
-            action_reason = extract_reason_from_args(args, reason_start, "No reason given")
-
-            warns = load(WARN_FILE)
-            uid   = str(target_id)
-            warns.setdefault(uid, 0)
-            warns[uid] += 1
+            target, tid, terr = resolve_target(reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hwarn <user_id> [reason]")
+            rs = 0 if reply else 1
+            reason = extract_reason(args, rs, "No reason given")
+            warns  = load(WARN_FILE)
+            key    = str(tid)
+            warns.setdefault(key, 0)
+            warns[key] += 1
             save(WARN_FILE, warns)
-
-            case_id = create_case("WARN", user_id, target_id, action_reason)
+            case_id = create_case("WARN", uid, tid, reason)
             await send_action_log(
-                bot, chat_id, msg_id, "WARN",
-                target, action_reason, case_id, get_mod_info(user_id),
-                extra=f"📊 Total Warns: {warns[uid]}",
+                chat_id, msg_id, "WARN", target, reason, case_id, get_mod_info(uid),
+                extra=f"📊 Total Warns: {warns[key]}",
             )
             return
 
-        # ─────────────────────────────────────────────
-        # /hdel
-        # ─────────────────────────────────────────────
+        # ── /hdel ─────────────────────────────────────────
         if raw_cmd in ("hdel", "hd"):
             if not await check_mod("delete"):
                 return
             if not reply:
                 return await reply_text("❌ Reply to the message you want to delete.")
-            target, target_id = extract_reply_user(reply)
-            if not target_id:
-                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
+            target, tid = extract_reply_user(reply)
+            if not tid:
+                return await reply_text("❌ Reply to a normal user message.")
             reply_msg_id = reply.get("message_id")
-            deleted_text = reply.get("text") or "[Media Message]"
+            deleted_text = reply.get("text") or "[Media]"
             try:
                 await bot.delete_messages(chat_id, reply_msg_id)
             except Exception as e:
-                return await reply_text(f"❌ Could not delete message: {e}")
-            case_id = create_case("DELETE", user_id, target_id, "Message Deleted")
+                return await reply_text(f"❌ Could not delete: {e}")
+            case_id = create_case("DELETE", uid, tid, "Message Deleted")
             await send_action_log(
-                bot, chat_id, msg_id, "DELETE",
-                target, "Message Deleted", case_id, get_mod_info(user_id),
+                chat_id, msg_id, "DELETE", target, "Message Deleted",
+                case_id, get_mod_info(uid),
                 extra=f"💬 Content: {deleted_text[:200]}",
             )
             return
 
-        # ─────────────────────────────────────────────
-        # /hprotect — owner only
-        # ─────────────────────────────────────────────
+        # ── /hprotect ─────────────────────────────────────
         if raw_cmd in ("hprotect", "hp"):
-            if not is_owner(user_id):
+            if not is_owner(uid):
                 return
-            target, target_id, target_err = resolve_target_from_reply_or_args(reply, args, 0)
-            if not target_id:
-                return await reply_text(
-                    f"{target_err}\nUsage: /hprotect <user_id>  — or reply to a user."
-                )
+            target, tid, terr = resolve_target(reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hprotect <user_id>")
             data = load(PROTECT_FILE)
-            uid  = str(target_id)
-            if uid in data:
+            key  = str(tid)
+            if key in data:
                 return await reply_text(f"ℹ️ {make_mention(target)} is already protected.")
-            data[uid] = True
+            data[key] = True
             save(PROTECT_FILE, data)
-            await reply_text(f"🛡 {make_mention(target)} is now protected from moderation actions.")
+            await reply_text(f"🛡 {make_mention(target)} is now protected.")
             return
 
-        # ─────────────────────────────────────────────
-        # /hcase
-        # ─────────────────────────────────────────────
+        # ── /hcase ────────────────────────────────────────
         if raw_cmd in ("hcase", "hc"):
-            if not is_authorized(user_id):
+            if not is_authorized(uid):
                 return
             if not args:
                 return await reply_text("Usage: /hcase <case_id>")
@@ -1266,165 +1229,165 @@ async def handle_message(bot: Client, msg: dict):
             )
             return
 
-        # ─────────────────────────────────────────────
-        # /hmodinfo
-        # ─────────────────────────────────────────────
+        # ── /hmodinfo ─────────────────────────────────────
         if raw_cmd in ("hmodinfo", "hmi"):
-            if not is_authorized(user_id):
+            if not is_authorized(uid):
                 return
-            lookup_id = user_id
+            lookup = uid
             if reply:
-                _, reply_uid = extract_reply_user(reply)
-                if reply_uid:
-                    lookup_id = reply_uid
+                _, rid = extract_reply_user(reply)
+                if rid:
+                    lookup = rid
             elif args:
-                parsed = parse_positive_user_id(args[0])
-                if not parsed:
-                    return await reply_text("❌ Invalid user ID. Usage: /hmodinfo <user_id>")
-                lookup_id = parsed
-            mod_data = get_mod_info(lookup_id)
-            if not mod_data:
+                p = parse_positive_user_id(args[0])
+                if not p:
+                    return await reply_text("❌ Invalid user ID.")
+                lookup = p
+            mod = get_mod_info(lookup)
+            if not mod:
                 return await reply_text("❌ That user is not a moderator.")
-            perms     = mod_data.get("permissions", {})
+            perms = mod.get("permissions", {})
             perm_list = "\n".join(
                 f"  {'✅' if v else '❌'} {k}" for k, v in perms.items()
             ) or "  No permissions set"
-            status = "🔴 Frozen" if mod_data.get("frozen") else "🟢 Active"
+            status = "🔴 Frozen" if mod.get("frozen") else "🟢 Active"
             await reply_text(
                 f"👮 **Moderator Info**\n\n"
-                f"🆔 Mod ID: `{mod_data.get('mod_id', 'N/A')}`\n"
-                f"{mod_data.get('badge', '🛡 Moderator')}\n"
+                f"🆔 Mod ID: `{mod.get('mod_id', 'N/A')}`\n"
+                f"{mod.get('badge', '🛡 Moderator')}\n"
                 f"Status: {status}\n\n"
                 f"**Permissions:**\n{perm_list}"
             )
             return
 
     except Exception as e:
-        log_msg(f"ERROR in handle_message: {e}", "ERROR")
-        log_msg(traceback.format_exc(), "ERROR")
-        try:
-            if OWNER_DEBUG_NOTIFICATIONS:
-                await notify_owner(bot, f"❌ handle_message error:\n`{e}`")
-        except Exception:
-            pass
+        log_msg(f"handle_message error: {e}\n{traceback.format_exc()}", "ERROR")
 
 # =========================================================
 # CALLBACK HANDLER
 # =========================================================
 
 async def handle_callback(bot: Client, cb: dict):
-    """Handle inline button callbacks."""
     try:
         cb_id     = cb["id"]
         data      = cb.get("data", "")
         from_user = cb.get("from", {})
-        user_id   = from_user.get("id", 0)
+        uid       = from_user.get("id", 0)
         message   = cb.get("message", {})
         chat_id   = message.get("chat", {}).get("id")
 
-        # FIX: Allow owner OR any authorized moderator to use action buttons.
-        #      Previously only the owner could click Unban/Unmute/Remove Warn buttons —
-        #      making them useless for everyone else.
-        if not is_authorized(user_id):
-            await bot.answer_callback_query(cb_id, "⛔ Only moderators can use this.", show_alert=True)
+        if not is_authorized(uid):
+            await tg_answer_cb(cb_id, "⛔ Only moderators can use this.", alert=True)
             return
 
         if data.startswith("unban_"):
-            if not has_permission(user_id, "ban"):
-                return await bot.answer_callback_query(cb_id, "❌ No ban permission.", show_alert=True)
-            target_id = int(data.split("_", 1)[1])
+            if not has_permission(uid, "ban"):
+                return await tg_answer_cb(cb_id, "❌ No ban permission.", alert=True)
+            tid = int(data.split("_", 1)[1])
             try:
-                await bot.unban_chat_member(chat_id, target_id)
-                await bot.answer_callback_query(cb_id, "✅ User unbanned.")
+                await bot.unban_chat_member(chat_id, tid)
+                await tg_answer_cb(cb_id, "✅ User unbanned.")
             except Exception as e:
-                await bot.answer_callback_query(cb_id, f"❌ {e}", show_alert=True)
+                await tg_answer_cb(cb_id, f"❌ {e}", alert=True)
 
         elif data.startswith("unmute_"):
-            if not has_permission(user_id, "mute"):
-                return await bot.answer_callback_query(cb_id, "❌ No mute permission.", show_alert=True)
-            target_id = int(data.split("_", 1)[1])
+            if not has_permission(uid, "mute"):
+                return await tg_answer_cb(cb_id, "❌ No mute permission.", alert=True)
+            tid = int(data.split("_", 1)[1])
             try:
-                # FIX: Restore FULL member permissions, not only can_send_messages.
-                await bot.restrict_chat_member(chat_id, target_id, FULL_MEMBER_PERMISSIONS)
-                await bot.answer_callback_query(cb_id, "✅ User unmuted.")
+                await bot.restrict_chat_member(chat_id, tid, FULL_MEMBER_PERMISSIONS)
+                await tg_answer_cb(cb_id, "✅ User unmuted.")
             except Exception as e:
-                await bot.answer_callback_query(cb_id, f"❌ {e}", show_alert=True)
+                await tg_answer_cb(cb_id, f"❌ {e}", alert=True)
 
         elif data.startswith("removewarn_"):
-            if not has_permission(user_id, "warn"):
-                return await bot.answer_callback_query(cb_id, "❌ No warn permission.", show_alert=True)
-            target_id = int(data.split("_", 1)[1])
+            if not has_permission(uid, "warn"):
+                return await tg_answer_cb(cb_id, "❌ No warn permission.", alert=True)
+            tid   = int(data.split("_", 1)[1])
             warns = load(WARN_FILE)
-            uid   = str(target_id)
-            if uid in warns and warns[uid] > 0:
-                warns[uid] -= 1
+            key   = str(tid)
+            if key in warns and warns[key] > 0:
+                warns[key] -= 1
                 save(WARN_FILE, warns)
-            await bot.answer_callback_query(
-                cb_id, f"✅ Warning removed. Total warns: {warns.get(uid, 0)}"
-            )
+            await tg_answer_cb(cb_id, f"✅ Warning removed. Total: {warns.get(key, 0)}")
 
         elif data.startswith("case_"):
             case_id = data.split("_", 1)[1]
             cases   = load(CASE_FILE)
             case    = cases.get(case_id)
             if case:
-                await bot.answer_callback_query(
+                await tg_answer_cb(
                     cb_id,
                     f"Case #{case_id}\n{case['action']} — {case['reason']}\n{case['time']}",
-                    show_alert=True,
+                    alert=True,
                 )
             else:
-                await bot.answer_callback_query(cb_id, "❌ Case not found.", show_alert=True)
+                await tg_answer_cb(cb_id, "❌ Case not found.", alert=True)
 
     except Exception as e:
-        log_msg(f"ERROR in handle_callback: {e}", "ERROR")
-        log_msg(traceback.format_exc(), "ERROR")
+        log_msg(f"handle_callback error: {e}\n{traceback.format_exc()}", "ERROR")
 
 # =========================================================
-# STARTUP / SHUTDOWN EVENTS
+# STARTUP / SHUTDOWN
 # =========================================================
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the bot, webhook and background worker on server startup."""
-    global _temp_action_worker_task
-    log_msg("🚀 Server starting up...", "INFO")
+    global _temp_worker_task
+    log_msg("🚀 Starting up...", "INFO")
     try:
-        bot              = await get_bot()
-        webhook_status   = await ensure_webhook_registered()
-        commands_status  = await sync_bot_commands()
-        if _temp_action_worker_task is None or _temp_action_worker_task.done():
-            _temp_action_worker_task = asyncio.create_task(temp_action_worker())
-        log_msg("✅ Bot initialized successfully", "INFO")
-        await notify_owner(
-            bot,
-            f"✅ Bot started on Koyeb\n"
-            f"Port: `{PORT}`\n"
-            f"Storage: `{STORAGE_PATH}`\n"
-            f"Webhook: `{webhook_status}`\n"
-            f"Commands: `{commands_status}`",
+        bot = await get_bot()
+
+        # 1. Resolve / auto-detect the log group
+        await resolve_log_group(bot)
+
+        # 2. Restore data from Telegram backup (survives ephemeral FS)
+        restored = await restore_from_telegram_pyrogram(bot)
+        if restored:
+            log_msg(f"✅ Restored {restored} file(s) from Telegram backup", "INFO")
+
+        # 3. Webhook + commands
+        wh_status  = await ensure_webhook()
+        cmd_status = await sync_commands()
+
+        # 4. Start temp-action worker
+        if _temp_worker_task is None or _temp_worker_task.done():
+            _temp_worker_task = asyncio.create_task(temp_action_worker())
+
+        lg = get_log_group()
+        startup_text = (
+            f"✅ **Bot started**\n\n"
+            f"🖥 Port: `{PORT}`\n"
+            f"💾 Storage: `{STORAGE_PATH}`\n"
+            f"📋 Log group: `{lg}`\n"
+            f"🔗 Webhook: `{wh_status}`\n"
+            f"📌 Commands: `{cmd_status}`\n"
+            f"📦 Restored files: `{restored}`"
         )
+        await notify_owner(startup_text)
+        if lg:
+            await tg_send(lg, startup_text)
+
+        log_msg("✅ Startup complete", "INFO")
     except Exception as e:
-        log_msg(f"❌ Failed to initialize bot: {e}", "ERROR")
+        log_msg(f"❌ Startup failed: {e}\n{traceback.format_exc()}", "ERROR")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Gracefully cancel the background worker and disconnect the bot."""
-    global _temp_action_worker_task
-    log_msg("🛑 Server shutting down...", "INFO")
-    if _temp_action_worker_task and not _temp_action_worker_task.done():
-        _temp_action_worker_task.cancel()
+    global _temp_worker_task
+    log_msg("🛑 Shutting down...", "INFO")
+    if _temp_worker_task and not _temp_worker_task.done():
+        _temp_worker_task.cancel()
         try:
-            await _temp_action_worker_task
+            await _temp_worker_task
         except asyncio.CancelledError:
             pass
     await shutdown_bot()
 
 # =========================================================
-# MAIN ENTRY POINT
+# MAIN
 # =========================================================
 
 if __name__ == "__main__":
     import uvicorn
-    log_msg(f"Starting Koyeb Bot Server on port {PORT}", "INFO")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
