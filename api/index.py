@@ -34,10 +34,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from pyrogram import Client
-from pyrogram.types import ChatPermissions
-from pyrogram.errors import (
-    ChatAdminRequired, UserAdminInvalid, FloodWait, UserNotParticipant
-)
+# Pyrogram is used only for: get_me(), get_chat(), get_dialogs(),
+# get_chat_member(), get_chat_history(), download_media().
+# All moderation actions (ban/mute/restrict/delete) go through
+# the Bot API wrappers (httpx) defined below.
 
 # =========================================================
 # BOT COMMANDS MANIFEST
@@ -60,17 +60,6 @@ BOT_COMMANDS = [
 ]
 
 VALID_PERMISSIONS = {"ban", "mute", "warn", "delete"}
-
-FULL_MEMBER_PERMISSIONS = ChatPermissions(
-    can_send_messages=True,
-    can_send_media_messages=True,
-    can_send_polls=True,
-    can_send_other_messages=True,
-    can_add_web_page_previews=True,
-    can_invite_users=True,
-    can_change_info=False,
-    can_pin_messages=False,
-)
 
 # =========================================================
 # LOGGING
@@ -292,6 +281,71 @@ async def tg_answer_cb(cb_id: str, text: str, alert: bool = False):
 
 async def tg_delete(chat_id: int, message_id: int):
     await tg_api("deleteMessage", json={"chat_id": chat_id, "message_id": message_id})
+
+# =========================================================
+# BOT API MODERATION ACTION WRAPPERS
+# =========================================================
+# All moderation calls go through Bot API (httpx) so they work
+# regardless of Pyrogram's in-memory peer cache state.
+# Each returns (success: bool, error_text: str).
+# =========================================================
+
+_MUTE_PERMISSIONS = {
+    "can_send_messages":       False,
+    "can_send_audios":         False,
+    "can_send_documents":      False,
+    "can_send_photos":         False,
+    "can_send_videos":         False,
+    "can_send_video_notes":    False,
+    "can_send_voice_notes":    False,
+    "can_send_polls":          False,
+    "can_send_other_messages": False,
+    "can_add_web_page_previews": False,
+}
+
+_FULL_PERMISSIONS = {
+    "can_send_messages":       True,
+    "can_send_audios":         True,
+    "can_send_documents":      True,
+    "can_send_photos":         True,
+    "can_send_videos":         True,
+    "can_send_video_notes":    True,
+    "can_send_voice_notes":    True,
+    "can_send_polls":          True,
+    "can_send_other_messages": True,
+    "can_add_web_page_previews": True,
+    "can_invite_users":        True,
+}
+
+async def api_ban(chat_id: int, user_id: int, until_date: int = None) -> tuple[bool, str]:
+    payload = {"chat_id": chat_id, "user_id": user_id}
+    if until_date:
+        payload["until_date"] = until_date
+    r = await tg_api("banChatMember", json=payload)
+    return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
+
+async def api_unban(chat_id: int, user_id: int) -> tuple[bool, str]:
+    r = await tg_api("unbanChatMember", json={
+        "chat_id": chat_id, "user_id": user_id, "only_if_banned": True
+    })
+    return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
+
+async def api_mute(chat_id: int, user_id: int, until_date: int = None) -> tuple[bool, str]:
+    payload = {"chat_id": chat_id, "user_id": user_id, "permissions": _MUTE_PERMISSIONS}
+    if until_date:
+        payload["until_date"] = until_date
+    r = await tg_api("restrictChatMember", json=payload)
+    return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
+
+async def api_unmute(chat_id: int, user_id: int) -> tuple[bool, str]:
+    r = await tg_api("restrictChatMember", json={
+        "chat_id": chat_id, "user_id": user_id, "permissions": _FULL_PERMISSIONS
+    })
+    return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
+
+async def api_delete_msg(chat_id: int, message_id: int) -> tuple[bool, str]:
+    r = await tg_api("deleteMessage", json={"chat_id": chat_id, "message_id": message_id})
+    return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
 
 # =========================================================
 # TELEGRAM-BASED BACKUP (survives ephemeral FS)
@@ -836,11 +890,13 @@ async def process_due_temp_actions(bot: Client):
         atype     = action["type"]
         try:
             if atype == "mute":
-                await bot.restrict_chat_member(chat_id, target_id, FULL_MEMBER_PERMISSIONS)
-                await tg_send(chat_id, f"🔊 Temporary mute ended for `{target_id}`")
+                ok, err = await api_unmute(chat_id, target_id)
+                msg_text = f"🔊 Temporary mute ended for `{target_id}`" if ok else f"⚠️ Auto-unmute failed for `{target_id}`: {err}"
+                await tg_send(chat_id, msg_text)
             elif atype == "ban":
-                await bot.unban_chat_member(chat_id, target_id)
-                await tg_send(chat_id, f"🔓 Temporary ban ended for `{target_id}`")
+                ok, err = await api_unban(chat_id, target_id)
+                msg_text = f"🔓 Temporary ban ended for `{target_id}`" if ok else f"⚠️ Auto-unban failed for `{target_id}`: {err}"
+                await tg_send(chat_id, msg_text)
         except Exception as e:
             log_msg(f"temp action error {action}: {e}", "ERROR")
             pending.append(action)
@@ -1097,14 +1153,9 @@ async def handle_message(bot: Client, msg: dict):
             if await anti_nuke(chat_id, msg_id, uid):
                 return
             until_ts = int(time.time()) + dur if dur else None
-            try:
-                await bot.ban_chat_member(chat_id, tid, until_date=until_ts)
-            except (ChatAdminRequired, UserAdminInvalid):
-                return await reply_text("❌ Cannot ban — target is admin or I lack permissions.")
-            except FloodWait as fw:
-                return await reply_text(f"⏳ Rate limited. Retry in {fw.value}s.")
-            except Exception as e:
-                return await reply_text(f"❌ Ban failed: {e}")
+            ok, err = await api_ban(chat_id, tid, until_date=until_ts)
+            if not ok:
+                return await reply_text(f"❌ Ban failed: {err}")
             if dur:
                 actions = load_temp_actions()
                 actions.append({"type": "ban", "chat_id": chat_id, "target_id": tid,
@@ -1131,14 +1182,9 @@ async def handle_message(bot: Client, msg: dict):
             if await anti_nuke(chat_id, msg_id, uid):
                 return
             until_ts = int(time.time()) + dur if dur else None
-            try:
-                await bot.restrict_chat_member(chat_id, tid, ChatPermissions(), until_date=until_ts)
-            except (ChatAdminRequired, UserAdminInvalid):
-                return await reply_text("❌ Cannot mute — target is admin or I lack permissions.")
-            except FloodWait as fw:
-                return await reply_text(f"⏳ Rate limited. Retry in {fw.value}s.")
-            except Exception as e:
-                return await reply_text(f"❌ Mute failed: {e}")
+            ok, err = await api_mute(chat_id, tid, until_date=until_ts)
+            if not ok:
+                return await reply_text(f"❌ Mute failed: {err}")
             if dur:
                 actions = load_temp_actions()
                 actions.append({"type": "mute", "chat_id": chat_id, "target_id": tid,
@@ -1181,10 +1227,9 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("❌ Reply to a normal user message.")
             reply_msg_id = reply.get("message_id")
             deleted_text = reply.get("text") or "[Media]"
-            try:
-                await bot.delete_messages(chat_id, reply_msg_id)
-            except Exception as e:
-                return await reply_text(f"❌ Could not delete: {e}")
+            ok, err = await api_delete_msg(chat_id, reply_msg_id)
+            if not ok:
+                return await reply_text(f"❌ Could not delete: {err}")
             case_id = create_case("DELETE", uid, tid, "Message Deleted")
             await send_action_log(
                 chat_id, msg_id, "DELETE", target, "Message Deleted",
@@ -1284,21 +1329,21 @@ async def handle_callback(bot: Client, cb: dict):
             if not has_permission(uid, "ban"):
                 return await tg_answer_cb(cb_id, "❌ No ban permission.", alert=True)
             tid = int(data.split("_", 1)[1])
-            try:
-                await bot.unban_chat_member(chat_id, tid)
+            ok, err = await api_unban(chat_id, tid)
+            if ok:
                 await tg_answer_cb(cb_id, "✅ User unbanned.")
-            except Exception as e:
-                await tg_answer_cb(cb_id, f"❌ {e}", alert=True)
+            else:
+                await tg_answer_cb(cb_id, f"❌ {err}", alert=True)
 
         elif data.startswith("unmute_"):
             if not has_permission(uid, "mute"):
                 return await tg_answer_cb(cb_id, "❌ No mute permission.", alert=True)
             tid = int(data.split("_", 1)[1])
-            try:
-                await bot.restrict_chat_member(chat_id, tid, FULL_MEMBER_PERMISSIONS)
+            ok, err = await api_unmute(chat_id, tid)
+            if ok:
                 await tg_answer_cb(cb_id, "✅ User unmuted.")
-            except Exception as e:
-                await tg_answer_cb(cb_id, f"❌ {e}", alert=True)
+            else:
+                await tg_answer_cb(cb_id, f"❌ {err}", alert=True)
 
         elif data.startswith("removewarn_"):
             if not has_permission(uid, "warn"):
