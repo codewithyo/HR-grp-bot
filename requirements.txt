@@ -1,2 +1,17 @@
-pyrogram
+# Telegram MTProto client (used for API calls — ban, mute, send_message, etc.)
+pyrogram==2.0.106
+
+# Required for Pyrogram's crypto operations
 tgcrypto
+
+# Web framework — receives webhook updates from Telegram
+fastapi
+
+# Mangum — adapts FastAPI (ASGI) to Vercel's serverless (AWS Lambda) runtime
+mangum
+
+# HTTP client — used in /api/set_webhook to call Telegram Bot API
+httpx
+
+# ASGI server (used only for local dev: uvicorn api/index:web --reload)
+uvicorn[standard]
