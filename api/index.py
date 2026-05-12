@@ -49,11 +49,11 @@ def log_msg(msg: str, level: str = "INFO"):
 # CONFIG — read from environment variables
 # =========================================================
 
-API_ID       = int(os.environ.get("API_ID", "0"))
-API_HASH     = os.environ.get("API_HASH", "")
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
-OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
-LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))
+API_ID       = int(os.environ.get("API_ID", "9605646"))
+API_HASH     = os.environ.get("API_HASH", "822d45aa548a53682a458efa1933e4c9")
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "8707026358:AAF-DAP96HYUZe6d4aQ7g_d3lyE97q8KOBo")
+OWNER_ID     = int(os.environ.get("OWNER_ID", "8457503781"))
+LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "-1003834934514"))
 PORT         = int(os.environ.get("PORT", "8000"))
 
 def resolve_storage_path() -> str:
