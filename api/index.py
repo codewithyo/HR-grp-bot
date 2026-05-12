@@ -248,7 +248,7 @@ async def send_action_log(
 # FASTAPI APP
 # =========================================================
 
-web = FastAPI(title="Advanced Moderation Bot")
+app = FastAPI(title="Advanced Moderation Bot")
 
 # =========================================================
 # ROUTE — /api/set_webhook
@@ -256,7 +256,7 @@ web = FastAPI(title="Advanced Moderation Bot")
 # Opens in browser: https://<project>.vercel.app/api/set_webhook
 # =========================================================
 
-@web.get("/api/set_webhook")
+@app.get("/api/set_webhook")
 async def set_webhook(request: Request):
     base_url    = str(request.base_url).rstrip("/")
     webhook_url = f"{base_url}/api/webhook"
@@ -311,7 +311,7 @@ async def set_webhook(request: Request):
 # ROUTE — /api/webhook  (receives every Telegram update)
 # =========================================================
 
-@web.post("/api/webhook")
+@app.post("/api/webhook")
 async def webhook(request: Request):
     update = await request.json()
 
@@ -602,4 +602,4 @@ async def handle_callback(bot: Client, cb: dict):
 # VERCEL HANDLER — Mangum wraps FastAPI as an ASGI handler
 # =========================================================
 
-handler = Mangum(web, lifespan="off")
+handler = Mangum(app, lifespan="off")
