@@ -1,934 +1,605 @@
 # =========================================================
-# ADVANCED TELEGRAM MODERATION BOT
-# FINAL SECURE VERSION
+# ADVANCED TELEGRAM MODERATION BOT — VERCEL WEBHOOK VERSION
+# =========================================================
+#
+# Architecture:
+#   • Telegram sends POST updates (Bot API JSON) to /api/webhook
+#   • FastAPI receives them and routes to handler functions
+#   • Pyrogram Client (no_updates=True, in_memory=True) makes
+#     all outbound API calls (ban, mute, send_message, etc.)
+#   • /api/set_webhook auto-registers the webhook URL with Telegram
+#
+# IMPORTANT — Ephemeral storage warning:
+#   /tmp is NOT shared between Vercel function instances and resets
+#   on cold starts. For production, replace JSON files with:
+#   Vercel KV (Redis), Supabase, PlanetScale, or MongoDB Atlas.
+#
+# ENV VARS required in Vercel dashboard:
+#   API_ID, API_HASH, BOT_TOKEN, OWNER_ID, LOG_GROUP_ID
 # =========================================================
 
-# INSTALL:
-# pip install pyrogram tgcrypto
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-API_ID = 9605646
-API_HASH = "822d45aa548a53682a458efa1933e4c9"
-BOT_TOKEN = "8707026358:AAF-DAP96HYUZe6d4aQ7g_d3lyE97q8KOBo"
-
-OWNER_ID = 8457503781
-LOG_GROUP_ID = -1003834934514
-
-# =========================================================
-# IMPORTS
-# =========================================================
-
-from pyrogram import Client, filters, idle
-from pyrogram.types import (
-    ChatPermissions,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    BotCommand
-)
-
-from datetime import datetime
-import json
 import os
+import json
 import time
 import random
 import string
+import asyncio
+import httpx
+from datetime import datetime
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from mangum import Mangum
+
+from pyrogram import Client
+from pyrogram.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
 
 # =========================================================
-# BOT START
+# CONFIG — read from environment variables
 # =========================================================
 
-app = Client(
-    "advanced_mod_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+API_ID       = int(os.environ.get("API_ID", "9605646"))
+API_HASH     = os.environ.get("API_HASH", "822d45aa548a53682a458efa1933e4c9")
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "822d45aa548a53682a458efa1933e4c9")
+OWNER_ID     = int(os.environ.get("OWNER_ID", "8457503781"))
+LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "-1003834934514"))
 
 # =========================================================
-# FILES
+# STORAGE — /tmp (ephemeral; swap for a DB in production)
 # =========================================================
 
-AUTH_FILE = "auth.json"
-WARN_FILE = "warns.json"
-CASE_FILE = "cases.json"
-PROTECT_FILE = "protected.json"
-ABUSE_FILE = "abuse.json"
+TMP_DIR = "/tmp/modbot"
+os.makedirs(TMP_DIR, exist_ok=True)
 
-FILES = [
-    AUTH_FILE,
-    WARN_FILE,
-    CASE_FILE,
-    PROTECT_FILE,
-    ABUSE_FILE
-]
+AUTH_FILE    = f"{TMP_DIR}/auth.json"
+WARN_FILE    = f"{TMP_DIR}/warns.json"
+CASE_FILE    = f"{TMP_DIR}/cases.json"
+PROTECT_FILE = f"{TMP_DIR}/protected.json"
+ABUSE_FILE   = f"{TMP_DIR}/abuse.json"
 
-for file in FILES:
-    if not os.path.exists(file):
-        with open(file, "w") as f:
-            json.dump({}, f)
+for _f in [AUTH_FILE, WARN_FILE, CASE_FILE, PROTECT_FILE, ABUSE_FILE]:
+    if not os.path.exists(_f):
+        with open(_f, "w") as _fh:
+            json.dump({}, _fh)
 
 # =========================================================
 # JSON HELPERS
 # =========================================================
 
-def load(file):
-    with open(file, "r") as f:
-        return json.load(f)
+def load(file: str) -> dict:
+    try:
+        with open(file, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-def save(file, data):
+def save(file: str, data: dict):
     with open(file, "w") as f:
         json.dump(data, f, indent=4)
 
 # =========================================================
-# CHECKS
+# PERMISSION CHECKS
 # =========================================================
 
-def is_owner(user_id):
+def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
-def is_authorized(user_id):
-
-    if user_id == OWNER_ID:
-        return True
-
-    data = load(AUTH_FILE)
-
-    return str(user_id) in data
-
-def has_permission(user_id, permission):
-
+def is_authorized(user_id: int) -> bool:
     if is_owner(user_id):
         return True
+    return str(user_id) in load(AUTH_FILE)
 
+def has_permission(user_id: int, permission: str) -> bool:
+    if is_owner(user_id):
+        return True
     data = load(AUTH_FILE)
-
     user = data.get(str(user_id))
-
     if not user:
         return False
-
-    return user.get(
-        "permissions",
-        {}
-    ).get(permission, False)
+    return user.get("permissions", {}).get(permission, False)
 
 # =========================================================
-# GENERATE MOD ID
+# UTILITY HELPERS
 # =========================================================
 
-def generate_mod_id():
+def generate_mod_id() -> str:
+    chars = string.ascii_uppercase + string.digits
+    return "MOD-" + "".join(random.choice(chars) for _ in range(5))
 
-    chars = (
-        string.ascii_uppercase +
-        string.digits
-    )
+def get_mod_info(user_id: int) -> dict:
+    return load(AUTH_FILE).get(str(user_id), {})
 
-    return "MOD-" + ''.join(
-        random.choice(chars)
-        for _ in range(5)
-    )
+def is_protected(user_id: int) -> bool:
+    return str(user_id) in load(PROTECT_FILE)
 
-# =========================================================
-# GET MOD INFO
-# =========================================================
+def make_mention(user: dict) -> str:
+    """Build a Markdown mention from a Bot API user dict."""
+    first = user.get("first_name", "")
+    last  = user.get("last_name", "")
+    name  = (first + " " + last).strip() or "User"
+    return f"[{name}](tg://user?id={user['id']})"
 
-def get_mod_info(user_id):
-
-    data = load(AUTH_FILE)
-
-    return data.get(str(user_id), {})
-
-# =========================================================
-# PROTECTED USER
-# =========================================================
-
-def is_protected(user_id):
-
-    data = load(PROTECT_FILE)
-
-    return str(user_id) in data
-
-# =========================================================
-# CREATE CASE
-# =========================================================
-
-def create_case(
-    action,
-    moderator,
-    target,
-    reason
-):
-
-    cases = load(CASE_FILE)
-
+def create_case(action: str, moderator: int, target: int, reason: str) -> str:
+    cases   = load(CASE_FILE)
     case_id = str(len(cases) + 1)
-
     cases[case_id] = {
         "action": action,
         "moderator": moderator,
         "target": target,
         "reason": reason,
-        "time": str(datetime.now())
+        "time": str(datetime.now()),
     }
-
     save(CASE_FILE, cases)
-
     return case_id
 
-# =========================================================
-# TRACK ACTIONS
-# =========================================================
-
-def track_action(user_id):
-
+def track_action(user_id: int) -> int:
     data = load(ABUSE_FILE)
-
-    uid = str(user_id)
-
-    now = time.time()
-
-    if uid not in data:
-        data[uid] = []
-
+    uid  = str(user_id)
+    now  = time.time()
+    data.setdefault(uid, [])
     data[uid].append(now)
-
-    data[uid] = [
-        x for x in data[uid]
-        if now - x <= 60
-    ]
-
+    data[uid] = [x for x in data[uid] if now - x <= 60]
     save(ABUSE_FILE, data)
-
     return len(data[uid])
 
 # =========================================================
-# ANTI NUKE
+# PYROGRAM CLIENT — module-level singleton
+# Reused across warm Lambda/Vercel invocations.
+# Uses in_memory session (no session file needed) and
+# no_updates=True (we feed updates via webhook, not polling).
 # =========================================================
 
-async def anti_nuke(
-    message,
-    user_id
-):
+_bot: Client = None
 
+async def get_bot() -> Client:
+    global _bot
+    if _bot is None or not _bot.is_connected:
+        _bot = Client(
+            name         = "modbot",
+            api_id       = API_ID,
+            api_hash     = API_HASH,
+            bot_token    = BOT_TOKEN,
+            in_memory    = True,
+            no_updates   = True,   # webhook mode — no MTProto polling
+        )
+        await _bot.start()
+    return _bot
+
+# =========================================================
+# ANTI-NUKE
+# =========================================================
+
+async def anti_nuke(bot: Client, chat_id: int, reply_to: int, user_id: int) -> bool:
     total = track_action(user_id)
+    if total < 10:
+        return False
 
-    if total >= 10:
+    auth = load(AUTH_FILE)
+    if str(user_id) in auth:
+        auth[str(user_id)]["frozen"] = True
+        save(AUTH_FILE, auth)
 
-        auth = load(AUTH_FILE)
-
-        if str(user_id) in auth:
-
-            auth[str(user_id)][
-                "frozen"
-            ] = True
-
-            save(AUTH_FILE, auth)
-
-        await app.send_message(
-            LOG_GROUP_ID,
-            f"""
-🚨 ANTI-NUKE ACTIVATED
-
-Moderator: `{user_id}`
-Actions in 60 sec: `{total}`
-
-Moderator Frozen Automatically.
-"""
-        )
-
-        await message.reply(
-            "🚨 Anti-Nuke Triggered.\n"
-            "Moderator Frozen."
-        )
-
-        return True
-
-    return False
+    await bot.send_message(
+        LOG_GROUP_ID,
+        f"🚨 **ANTI-NUKE ACTIVATED**\n\n"
+        f"Moderator: `{user_id}`\n"
+        f"Actions in 60 sec: `{total}`\n\n"
+        f"Moderator Frozen Automatically."
+    )
+    await bot.send_message(
+        chat_id,
+        "🚨 Anti-Nuke Triggered.\nModerator Frozen.",
+        reply_to_message_id=reply_to
+    )
+    return True
 
 # =========================================================
 # ACTION LOG
 # =========================================================
 
 async def send_action_log(
-    message,
-    action,
-    target,
-    reason,
-    case_id,
-    moderator_data,
-    extra=""
+    bot: Client,
+    chat_id: int,
+    reply_to: int,
+    action: str,
+    target: dict,
+    reason: str,
+    case_id: str,
+    moderator_data: dict,
+    extra: str = "",
 ):
+    mention   = make_mention(target)
+    target_id = target["id"]
+    badge     = moderator_data.get("badge", "🛡 Moderator")
+    mod_uid   = moderator_data.get("mod_id", "UNKNOWN")
+    time_now  = datetime.now().strftime("%d %b %Y • %I:%M %p")
 
-    badge = moderator_data.get(
-        "badge",
-        "🛡 Moderator"
+    text = (
+        f"╭━━━〔 🚨 MODERATION ACTION 〕━━━╮\n\n"
+        f"👤 User: {mention}\n"
+        f"🆔 User ID: `{target_id}`\n\n"
+        f"⚔ Action: {action}\n"
+        f"📝 Reason: {reason}\n\n"
+        f"👮 Moderator:\n"
+        f"{badge} | {mod_uid}\n\n"
+        f"⏰ Time: {time_now}\n"
+        f"📜 Case ID: #{case_id}\n"
+        f"{extra}\n"
+        f"╰━━━━━━━━━━━━━━━━━━━━━━╯"
     )
-
-    mod_unique = moderator_data.get(
-        "mod_id",
-        "UNKNOWN"
-    )
-
-    time_now = datetime.now().strftime(
-        "%d %b %Y • %I:%M %p"
-    )
-
-    text = f"""
-╭━━━〔 🚨 MODERATION ACTION 〕━━━╮
-
-👤 User: {target.mention}
-🆔 User ID: `{target.id}`
-
-⚔ Action: {action}
-📝 Reason: {reason}
-
-👮 Moderator:
-{badge} | {mod_unique}
-
-⏰ Time: {time_now}
-📜 Case ID: #{case_id}
-
-{extra}
-
-╰━━━━━━━━━━━━━━━━━━━━━━╯
-"""
 
     buttons = []
-
     if action == "BAN":
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    "🔓 Unban",
-                    callback_data=f"unban_{target.id}"
-                )
-            ]
-        )
-
+        buttons.append([InlineKeyboardButton("🔓 Unban",       callback_data=f"unban_{target_id}")])
     elif action == "MUTE":
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    "🔊 Unmute",
-                    callback_data=f"unmute_{target.id}"
-                )
-            ]
-        )
-
+        buttons.append([InlineKeyboardButton("🔊 Unmute",      callback_data=f"unmute_{target_id}")])
     elif action == "WARN":
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    "🗑 Remove Warn",
-                    callback_data=f"removewarn_{target.id}"
-                )
-            ]
-        )
-
+        buttons.append([InlineKeyboardButton("🗑 Remove Warn", callback_data=f"removewarn_{target_id}")])
     elif action == "DELETE":
+        buttons.append([InlineKeyboardButton("👤 Profile",     url=f"tg://user?id={target_id}")])
 
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    "👤 Profile",
-                    url=f"tg://user?id={target.id}"
-                )
-            ]
+    buttons.append([InlineKeyboardButton("📜 View Case", callback_data=f"case_{case_id}")])
+    markup = InlineKeyboardMarkup(buttons)
+
+    await bot.send_message(chat_id,    text, reply_markup=markup, reply_to_message_id=reply_to)
+    await bot.send_message(LOG_GROUP_ID, text, reply_markup=markup)
+
+# =========================================================
+# FASTAPI APP
+# =========================================================
+
+web = FastAPI(title="Advanced Moderation Bot")
+
+# =========================================================
+# ROUTE — /api/set_webhook
+# Call this once after deploying to register the webhook URL.
+# Opens in browser: https://<project>.vercel.app/api/set_webhook
+# =========================================================
+
+@web.get("/api/set_webhook")
+async def set_webhook(request: Request):
+    base_url    = str(request.base_url).rstrip("/")
+    webhook_url = f"{base_url}/api/webhook"
+
+    async with httpx.AsyncClient() as client:
+        # Set the webhook
+        set_resp = await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+            json={
+                "url": webhook_url,
+                "allowed_updates": ["message", "callback_query"],
+                "drop_pending_updates": True,
+            },
+            timeout=10,
+        )
+        set_result = set_resp.json()
+
+        # Set bot commands
+        await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
+            json={
+                "commands": [
+                    {"command": "hauth",    "description": "Authorize Moderator"},
+                    {"command": "hgrant",   "description": "Grant Permission"},
+                    {"command": "hrevoke",  "description": "Revoke Permission"},
+                    {"command": "hban",     "description": "Ban User"},
+                    {"command": "hmute",    "description": "Mute User"},
+                    {"command": "hwarn",    "description": "Warn User"},
+                    {"command": "hdel",     "description": "Delete Message"},
+                    {"command": "hprotect", "description": "Protect User"},
+                    {"command": "hcase",    "description": "View Case"},
+                    {"command": "hmodinfo", "description": "Moderator Info"},
+                ]
+            },
+            timeout=10,
         )
 
-    buttons.append(
-        [
-            InlineKeyboardButton(
-                "📜 View Case",
-                callback_data=f"case_{case_id}"
-            )
-        ]
-    )
-
-    reply_markup = InlineKeyboardMarkup(
-        buttons
-    )
-
-    await message.reply(
-        text,
-        reply_markup=reply_markup
-    )
-
-    await app.send_message(
-        LOG_GROUP_ID,
-        text,
-        reply_markup=reply_markup
-    )
-
-# =========================================================
-# STARTUP
-# =========================================================
-
-async def startup():
-
-    commands = [
-
-        BotCommand("hauth", "Authorize Moderator"),
-        BotCommand("hgrant", "Grant Permission"),
-        BotCommand("hrevoke", "Revoke Permission"),
-
-        BotCommand("hban", "Ban User"),
-        BotCommand("hmute", "Mute User"),
-        BotCommand("hwarn", "Warn User"),
-        BotCommand("hdel", "Delete Message"),
-
-        BotCommand("hprotect", "Protect User"),
-        BotCommand("hcase", "View Case"),
-        BotCommand("hmodinfo", "Moderator Info")
-    ]
-
-    await app.set_bot_commands(
-        commands
-    )
-
-    await app.send_message(
-        OWNER_ID,
-        """
-🚀 Advanced Moderation Bot Started
-
-✅ Commands Loaded
-✅ Anti-Nuke Active
-✅ Action Logs Active
-✅ Buttons Active
-✅ Moderation System Online
-"""
-    )
-
-# =========================================================
-# AUTH
-# =========================================================
-
-@app.on_message(
-    filters.command(["hauth", "ha"])
-)
-async def auth(client, message):
-
-    if not is_owner(
-        message.from_user.id
-    ):
-        return
-
-    if not message.reply_to_message:
-        return await message.reply(
-            "Reply to user."
+        # Verify webhook info
+        info_resp = await client.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo",
+            timeout=10,
         )
+        info_result = info_resp.json()
 
-    target = (
-        message.reply_to_message
-        .from_user
-    )
-
-    data = load(AUTH_FILE)
-
-    if str(target.id) not in data:
-
-        data[str(target.id)] = {
-            "permissions": {},
-            "mod_id": generate_mod_id(),
-            "badge": "🛡 Moderator",
-            "frozen": False
-        }
-
-    save(AUTH_FILE, data)
-
-    await message.reply(
-        f"✅ Authorized "
-        f"{target.mention}"
-    )
+    return {
+        "webhook_registered": webhook_url,
+        "set_webhook":        set_result,
+        "webhook_info":       info_result,
+    }
 
 # =========================================================
-# GRANT
+# ROUTE — /api/webhook  (receives every Telegram update)
 # =========================================================
 
-@app.on_message(
-    filters.command(["hgrant", "hg"])
-)
-async def grant(client, message):
+@web.post("/api/webhook")
+async def webhook(request: Request):
+    update = await request.json()
 
-    if not is_owner(
-        message.from_user.id
-    ):
-        return
+    try:
+        bot = await get_bot()
 
-    if not message.reply_to_message:
-        return
+        if "message" in update:
+            await handle_message(bot, update["message"])
 
-    args = message.text.split()
+        elif "callback_query" in update:
+            await handle_callback(bot, update["callback_query"])
 
-    if len(args) < 2:
-        return
+    except Exception as e:
+        # Log silently — always return 200 so Telegram doesn't retry
+        print(f"[ERROR] {type(e).__name__}: {e}")
 
-    permission = args[1].lower()
-
-    target = (
-        message.reply_to_message
-        .from_user
-    )
-
-    data = load(AUTH_FILE)
-
-    data[str(target.id)][
-        "permissions"
-    ][permission] = True
-
-    save(AUTH_FILE, data)
-
-    await message.reply(
-        f"✅ Granted {permission}"
-    )
+    return {"ok": True}
 
 # =========================================================
-# REVOKE
+# MESSAGE ROUTER
 # =========================================================
 
-@app.on_message(
-    filters.command(["hrevoke", "hr"])
-)
-async def revoke(client, message):
-
-    if not is_owner(
-        message.from_user.id
-    ):
+async def handle_message(bot: Client, msg: dict):
+    text = msg.get("text", "")
+    if not text.startswith("/"):
         return
 
-    if not message.reply_to_message:
-        return
+    chat_id   = msg["chat"]["id"]
+    msg_id    = msg["message_id"]
+    from_user = msg.get("from", {})
+    user_id   = from_user.get("id", 0)
+    reply     = msg.get("reply_to_message")
 
-    args = message.text.split()
+    # Parse /cmd@botusername → cmd, strip leading slash
+    raw_cmd = text.split()[0].split("@")[0].lstrip("/").lower()
+    parts   = text.split(None, 1)
+    args    = parts[1].split() if len(parts) > 1 else []
+    reason  = " ".join(args) if args else "No Reason"
 
-    if len(args) < 2:
-        return
+    # ── Shortcuts ──────────────────────────────────────────
 
-    permission = args[1].lower()
+    async def reply_text(t: str):
+        await bot.send_message(chat_id, t, reply_to_message_id=msg_id)
 
-    target = (
-        message.reply_to_message
-        .from_user
-    )
-
-    data = load(AUTH_FILE)
-
-    data[str(target.id)][
-        "permissions"
-    ][permission] = False
-
-    save(AUTH_FILE, data)
-
-    await message.reply(
-        f"❌ Revoked {permission}"
-    )
-
-# =========================================================
-# COMMON SECURITY
-# =========================================================
-
-async def security_check(message):
-
-    if not is_authorized(
-        message.from_user.id
-    ):
-
+    async def security_fail():
         try:
-            await message.delete()
-        except:
+            await bot.delete_messages(chat_id, msg_id)
+        except Exception:
             pass
 
-        return False
+    async def check_mod(permission: str) -> bool:
+        """Returns True if the command should proceed."""
+        if not is_authorized(user_id):
+            await security_fail()
+            return False
+        if not has_permission(user_id, permission):
+            await reply_text("❌ No Permission")
+            return False
+        if get_mod_info(user_id).get("frozen"):
+            await reply_text("🚫 Moderator Frozen")
+            return False
+        return True
 
-    return True
+    # ── /hauth ─────────────────────────────────────────────
+    if raw_cmd in ("hauth", "ha"):
+        if not is_owner(user_id):
+            return
+        if not reply:
+            return await reply_text("Reply to a user.")
+        target    = reply.get("from", {})
+        target_id = target.get("id")
+        data      = load(AUTH_FILE)
+        if str(target_id) not in data:
+            data[str(target_id)] = {
+                "permissions": {},
+                "mod_id": generate_mod_id(),
+                "badge": "🛡 Moderator",
+                "frozen": False,
+            }
+        save(AUTH_FILE, data)
+        await reply_text(f"✅ Authorized {make_mention(target)}")
 
-# =========================================================
-# BAN
-# =========================================================
+    # ── /hgrant ────────────────────────────────────────────
+    elif raw_cmd in ("hgrant", "hg"):
+        if not is_owner(user_id) or not reply or not args:
+            return
+        permission = args[0].lower()
+        target     = reply.get("from", {})
+        target_id  = str(target.get("id"))
+        data       = load(AUTH_FILE)
+        if target_id not in data:
+            return await reply_text("❌ Authorize the user first (/hauth).")
+        data[target_id]["permissions"][permission] = True
+        save(AUTH_FILE, data)
+        await reply_text(f"✅ Granted `{permission}` to {make_mention(target)}")
 
-@app.on_message(
-    filters.command(["hban", "hb"])
-)
-async def ban(client, message):
+    # ── /hrevoke ───────────────────────────────────────────
+    elif raw_cmd in ("hrevoke", "hr"):
+        if not is_owner(user_id) or not reply or not args:
+            return
+        permission = args[0].lower()
+        target     = reply.get("from", {})
+        target_id  = str(target.get("id"))
+        data       = load(AUTH_FILE)
+        if target_id in data:
+            data[target_id]["permissions"][permission] = False
+            save(AUTH_FILE, data)
+        await reply_text(f"❌ Revoked `{permission}` from {make_mention(target)}")
 
-    if not await security_check(message):
-        return
+    # ── /hban ──────────────────────────────────────────────
+    elif raw_cmd in ("hban", "hb"):
+        if not await check_mod("ban"):
+            return
+        if not reply:
+            return
+        target    = reply.get("from", {})
+        target_id = target.get("id")
+        if is_protected(target_id):
+            return await reply_text("🛡 Protected User")
+        if await anti_nuke(bot, chat_id, msg_id, user_id):
+            return
+        await bot.ban_chat_member(chat_id, target_id)
+        case_id = create_case("BAN", user_id, target_id, reason)
+        await send_action_log(bot, chat_id, msg_id, "BAN", target, reason, case_id, get_mod_info(user_id))
 
-    mod_id = message.from_user.id
+    # ── /hmute ─────────────────────────────────────────────
+    elif raw_cmd in ("hmute", "hm"):
+        if not await check_mod("mute"):
+            return
+        if not reply:
+            return
+        target    = reply.get("from", {})
+        target_id = target.get("id")
+        if is_protected(target_id):
+            return await reply_text("🛡 Protected User")
+        if await anti_nuke(bot, chat_id, msg_id, user_id):
+            return
+        await bot.restrict_chat_member(chat_id, target_id, ChatPermissions())
+        case_id = create_case("MUTE", user_id, target_id, reason)
+        await send_action_log(bot, chat_id, msg_id, "MUTE", target, reason, case_id, get_mod_info(user_id))
 
-    if not has_permission(
-        mod_id,
-        "ban"
-    ):
-        return await message.reply(
-            "❌ No Permission"
+    # ── /hwarn ─────────────────────────────────────────────
+    elif raw_cmd in ("hwarn", "hw"):
+        if not await check_mod("warn"):
+            return
+        if not reply:
+            return
+        target    = reply.get("from", {})
+        target_id = target.get("id")
+        warns     = load(WARN_FILE)
+        uid       = str(target_id)
+        warns.setdefault(uid, 0)
+        warns[uid] += 1
+        save(WARN_FILE, warns)
+        case_id = create_case("WARN", user_id, target_id, "Warning")
+        await send_action_log(
+            bot, chat_id, msg_id, "WARN", target,
+            f"Warning #{warns[uid]}", case_id, get_mod_info(user_id),
+            extra=f"📊 Total Warns: {warns[uid]}"
         )
 
-    data = get_mod_info(mod_id)
-
-    if data.get("frozen"):
-        return await message.reply(
-            "🚫 Moderator Frozen"
+    # ── /hdel ──────────────────────────────────────────────
+    elif raw_cmd in ("hdel", "hd"):
+        if not await check_mod("delete"):
+            return
+        if not reply:
+            return
+        target        = reply.get("from", {})
+        target_id     = target.get("id")
+        reply_msg_id  = reply.get("message_id")
+        deleted_text  = reply.get("text") or "Media Message"
+        await bot.delete_messages(chat_id, reply_msg_id)
+        case_id = create_case("DELETE", user_id, target_id, "Message Deleted")
+        await send_action_log(
+            bot, chat_id, msg_id, "DELETE", target,
+            "Message Deleted", case_id, get_mod_info(user_id),
+            extra=f"💬 Deleted: {deleted_text[:200]}"
         )
 
-    if not message.reply_to_message:
-        return
+    # ── /hprotect ──────────────────────────────────────────
+    elif raw_cmd in ("hprotect", "hp"):
+        if not is_owner(user_id) or not reply:
+            return
+        target    = reply.get("from", {})
+        target_id = target.get("id")
+        data      = load(PROTECT_FILE)
+        data[str(target_id)] = True
+        save(PROTECT_FILE, data)
+        await reply_text(f"🛡 {make_mention(target)} is now protected.")
 
-    target = (
-        message.reply_to_message
-        .from_user
-    )
-
-    if is_protected(target.id):
-        return await message.reply(
-            "🛡 Protected User"
+    # ── /hcase ─────────────────────────────────────────────
+    elif raw_cmd in ("hcase", "hc"):
+        if not is_authorized(user_id):
+            return
+        if not args:
+            return await reply_text("Usage: /hcase <case_id>")
+        cases   = load(CASE_FILE)
+        case    = cases.get(args[0])
+        if not case:
+            return await reply_text("❌ Case not found.")
+        await reply_text(
+            f"📜 **Case #{args[0]}**\n\n"
+            f"⚔ Action: {case['action']}\n"
+            f"👤 Target: `{case['target']}`\n"
+            f"👮 Moderator: `{case['moderator']}`\n"
+            f"📝 Reason: {case['reason']}\n"
+            f"⏰ Time: {case['time']}"
         )
 
-    args = message.text.split(
-        None,
-        1
-    )
+    # ── /hmodinfo ──────────────────────────────────────────
+    elif raw_cmd in ("hmodinfo", "hmi"):
+        if not is_authorized(user_id):
+            return
+        lookup_id = reply.get("from", {}).get("id", user_id) if reply else user_id
+        mod_data  = get_mod_info(lookup_id)
+        if not mod_data:
+            return await reply_text("❌ Not a moderator.")
+        perms     = mod_data.get("permissions", {})
+        perm_list = "\n".join(
+            f"  {'✅' if v else '❌'} {k}" for k, v in perms.items()
+        ) or "  No permissions set"
+        status = "🔴 Frozen" if mod_data.get("frozen") else "🟢 Active"
+        await reply_text(
+            f"👮 **Moderator Info**\n\n"
+            f"🆔 Mod ID: `{mod_data.get('mod_id', 'N/A')}`\n"
+            f"{mod_data.get('badge', '🛡 Moderator')}\n"
+            f"Status: {status}\n\n"
+            f"**Permissions:**\n{perm_list}"
+        )
 
-    reason = (
-        args[1]
-        if len(args) > 1
-        else "No Reason"
-    )
-
-    triggered = await anti_nuke(
-        message,
-        mod_id
-    )
-
-    if triggered:
-        return
-
-    await client.ban_chat_member(
-        message.chat.id,
-        target.id
-    )
-
-    case_id = create_case(
-        "BAN",
-        mod_id,
-        target.id,
-        reason
-    )
-
-    await send_action_log(
-        message,
-        "BAN",
-        target,
-        reason,
-        case_id,
-        data
-    )
+    # ── /start ─────────────────────────────────────────────
+    elif raw_cmd == "start":
+        if not is_authorized(user_id):
+            return
+        await reply_text("✅ Advanced Moderation Bot Running")
 
 # =========================================================
-# MUTE
+# CALLBACK ROUTER
 # =========================================================
 
-@app.on_message(
-    filters.command(["hmute", "hm"])
-)
-async def mute(client, message):
+async def handle_callback(bot: Client, cb: dict):
+    cb_id     = cb["id"]
+    data      = cb.get("data", "")
+    user_id   = cb.get("from", {}).get("id", 0)
+    message   = cb.get("message", {})
+    chat_id   = message.get("chat", {}).get("id")
 
-    if not await security_check(message):
+    if user_id != OWNER_ID:
+        await bot.answer_callback_query(cb_id, "Only Owner Can Use This", show_alert=True)
         return
-
-    mod_id = message.from_user.id
-
-    if not has_permission(
-        mod_id,
-        "mute"
-    ):
-        return await message.reply(
-            "❌ No Permission"
-        )
-
-    data = get_mod_info(mod_id)
-
-    if data.get("frozen"):
-        return await message.reply(
-            "🚫 Moderator Frozen"
-        )
-
-    if not message.reply_to_message:
-        return
-
-    target = (
-        message.reply_to_message
-        .from_user
-    )
-
-    if is_protected(target.id):
-        return await message.reply(
-            "🛡 Protected User"
-        )
-
-    args = message.text.split(
-        None,
-        1
-    )
-
-    reason = (
-        args[1]
-        if len(args) > 1
-        else "No Reason"
-    )
-
-    triggered = await anti_nuke(
-        message,
-        mod_id
-    )
-
-    if triggered:
-        return
-
-    await client.restrict_chat_member(
-        message.chat.id,
-        target.id,
-        ChatPermissions()
-    )
-
-    case_id = create_case(
-        "MUTE",
-        mod_id,
-        target.id,
-        reason
-    )
-
-    await send_action_log(
-        message,
-        "MUTE",
-        target,
-        reason,
-        case_id,
-        data
-    )
-
-# =========================================================
-# WARN
-# =========================================================
-
-@app.on_message(
-    filters.command(["hwarn", "hw"])
-)
-async def warn(client, message):
-
-    if not await security_check(message):
-        return
-
-    mod_id = message.from_user.id
-
-    if not has_permission(
-        mod_id,
-        "warn"
-    ):
-        return await message.reply(
-            "❌ No Permission"
-        )
-
-    data = get_mod_info(mod_id)
-
-    if data.get("frozen"):
-        return await message.reply(
-            "🚫 Moderator Frozen"
-        )
-
-    if not message.reply_to_message:
-        return
-
-    target = (
-        message.reply_to_message
-        .from_user
-    )
-
-    warns = load(WARN_FILE)
-
-    uid = str(target.id)
-
-    if uid not in warns:
-        warns[uid] = 0
-
-    warns[uid] += 1
-
-    save(WARN_FILE, warns)
-
-    case_id = create_case(
-        "WARN",
-        mod_id,
-        target.id,
-        "Warning"
-    )
-
-    await send_action_log(
-        message,
-        "WARN",
-        target,
-        f"Warning #{warns[uid]}",
-        case_id,
-        data,
-        extra=f"📊 Total Warns: {warns[uid]}"
-    )
-
-# =========================================================
-# DELETE
-# =========================================================
-
-@app.on_message(
-    filters.command(["hdel", "hd"])
-)
-async def delete_msg(client, message):
-
-    if not await security_check(message):
-        return
-
-    mod_id = message.from_user.id
-
-    if not has_permission(
-        mod_id,
-        "delete"
-    ):
-        return await message.reply(
-            "❌ No Permission"
-        )
-
-    data = get_mod_info(mod_id)
-
-    if not message.reply_to_message:
-        return
-
-    target = (
-        message.reply_to_message
-        .from_user
-    )
-
-    deleted_text = (
-        message.reply_to_message.text
-        or "Media Message"
-    )
-
-    await (
-        message.reply_to_message
-        .delete()
-    )
-
-    case_id = create_case(
-        "DELETE",
-        mod_id,
-        target.id,
-        "Message Deleted"
-    )
-
-    await send_action_log(
-        message,
-        "DELETE",
-        target,
-        "Message Deleted",
-        case_id,
-        data,
-        extra=f"💬 Deleted Text: {deleted_text}"
-    )
-
-# =========================================================
-# CALLBACKS
-# =========================================================
-
-@app.on_callback_query()
-async def callbacks(
-    client,
-    callback_query
-):
-
-    data = callback_query.data
-
-    if (
-        callback_query
-        .from_user.id
-        != OWNER_ID
-    ):
-
-        return await (
-            callback_query.answer(
-                "Only Owner Can Use This",
-                show_alert=True
-            )
-        )
 
     if data.startswith("unban_"):
-
-        user_id = int(
-            data.split("_")[1]
-        )
-
-        await client.unban_chat_member(
-            callback_query.message.chat.id,
-            user_id
-        )
-
-        await callback_query.answer(
-            "User Unbanned"
-        )
+        target_id = int(data.split("_")[1])
+        await bot.unban_chat_member(chat_id, target_id)
+        await bot.answer_callback_query(cb_id, "✅ User Unbanned")
 
     elif data.startswith("unmute_"):
-
-        user_id = int(
-            data.split("_")[1]
+        target_id = int(data.split("_")[1])
+        await bot.restrict_chat_member(
+            chat_id, target_id,
+            ChatPermissions(can_send_messages=True)
         )
+        await bot.answer_callback_query(cb_id, "✅ User Unmuted")
 
-        await client.restrict_chat_member(
-            callback_query.message.chat.id,
-            user_id,
-            ChatPermissions(
-                can_send_messages=True
+    elif data.startswith("removewarn_"):
+        target_id = int(data.split("_")[1])
+        warns     = load(WARN_FILE)
+        uid       = str(target_id)
+        if uid in warns and warns[uid] > 0:
+            warns[uid] -= 1
+            save(WARN_FILE, warns)
+        await bot.answer_callback_query(cb_id, f"✅ Warn removed. Total: {warns.get(uid, 0)}")
+
+    elif data.startswith("case_"):
+        case_id = data.split("_")[1]
+        cases   = load(CASE_FILE)
+        case    = cases.get(case_id)
+        if case:
+            await bot.answer_callback_query(
+                cb_id,
+                f"Case #{case_id}\n{case['action']} | {case['reason']}",
+                show_alert=True
             )
-        )
-
-        await callback_query.answer(
-            "User Unmuted"
-        )
+        else:
+            await bot.answer_callback_query(cb_id, "Case not found", show_alert=True)
 
 # =========================================================
-# START
+# VERCEL HANDLER — Mangum wraps FastAPI as an ASGI handler
 # =========================================================
 
-@app.on_message(
-    filters.command("start")
-)
-async def start(client, message):
-
-    if not is_authorized(
-        message.from_user.id
-    ):
-        return
-
-    await message.reply(
-        "✅ Advanced Moderation Bot Running"
-    )
-
-# =========================================================
-# MAIN
-# =========================================================
-
-async def main():
-
-    await app.start()
-
-    print("BOT STARTED")
-
-    await startup()
-
-    await idle()
-
-# =========================================================
-# RUN
-# =========================================================
-
-app.run(main())
+handler = Mangum(web, lifespan="off")
