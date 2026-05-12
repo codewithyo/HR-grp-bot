@@ -202,10 +202,40 @@ def is_protected(user_id: int) -> bool:
 
 def make_mention(user: dict) -> str:
     """Build a Markdown mention from a Bot API user dict"""
+    if not isinstance(user, dict):
+        return "User"
+    uid = user.get("id")
     first = user.get("first_name", "")
     last  = user.get("last_name", "")
     name  = (first + " " + last).strip() or "User"
-    return f"[{name}](tg://user?id={user['id']})"
+    if not uid:
+        return name
+    return f"[{name}](tg://user?id={uid})"
+
+def extract_actor_user_id(msg: dict) -> tuple[int | None, str | None]:
+    """Resolve the real Telegram user id for command authorization checks."""
+    from_user = msg.get("from") if isinstance(msg, dict) else None
+    if isinstance(from_user, dict):
+        uid = from_user.get("id")
+        if isinstance(uid, int) and uid > 0:
+            return uid, None
+
+    if msg.get("sender_chat"):
+        return None, "❌ Anonymous admin/channel messages are not supported for admin commands. Disable anonymous mode and retry."
+
+    return None, "❌ Could not identify your Telegram account for permission checks."
+
+def extract_reply_user(reply: dict) -> tuple[dict, int | None]:
+    """Get replied user dict and id, if present."""
+    if not isinstance(reply, dict):
+        return {}, None
+    target = reply.get("from")
+    if not isinstance(target, dict):
+        return {}, None
+    target_id = target.get("id")
+    if not isinstance(target_id, int) or target_id <= 0:
+        return target, None
+    return target, target_id
 
 def create_case(action: str, moderator: int, target: int, reason: str) -> str:
     cases   = load(CASE_FILE)
@@ -530,8 +560,7 @@ async def handle_message(bot: Client, msg: dict):
 
         chat_id   = msg["chat"]["id"]
         msg_id    = msg["message_id"]
-        from_user = msg.get("from", {})
-        user_id   = from_user.get("id", 0)
+        user_id, user_identity_error = extract_actor_user_id(msg)
         reply     = msg.get("reply_to_message")
 
         raw_cmd = text.split()[0].split("@")[0].lstrip("/").lower()
@@ -543,6 +572,10 @@ async def handle_message(bot: Client, msg: dict):
 
         async def reply_text(t: str):
             await bot.send_message(chat_id, t, reply_to_message_id=msg_id)
+
+        if user_identity_error:
+            await reply_text(user_identity_error)
+            return
 
         async def security_fail():
             try:
@@ -573,8 +606,9 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("❌ Only owner can authorize")
             if not reply:
                 return await reply_text("Reply to a user.")
-            target    = reply.get("from", {})
-            target_id = target.get("id")
+            target, target_id = extract_reply_user(reply)
+            if not target_id:
+                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
             data      = load(AUTH_FILE)
             if str(target_id) not in data:
                 data[str(target_id)] = {
@@ -593,8 +627,10 @@ async def handle_message(bot: Client, msg: dict):
             if not reply or not args:
                 return await reply_text("Usage: /hgrant <permission>\nReply to moderator")
             permission = args[0].lower()
-            target     = reply.get("from", {})
-            target_id  = str(target.get("id"))
+            target, target_id = extract_reply_user(reply)
+            if not target_id:
+                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
+            target_id  = str(target_id)
             data       = load(AUTH_FILE)
             if target_id not in data:
                 return await reply_text("❌ Authorize first with /hauth")
@@ -609,8 +645,10 @@ async def handle_message(bot: Client, msg: dict):
             if not reply or not args:
                 return await reply_text("Usage: /hrevoke <permission>\nReply to moderator")
             permission = args[0].lower()
-            target     = reply.get("from", {})
-            target_id  = str(target.get("id"))
+            target, target_id = extract_reply_user(reply)
+            if not target_id:
+                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
+            target_id  = str(target_id)
             data       = load(AUTH_FILE)
             if target_id in data:
                 data[target_id]["permissions"][permission] = False
@@ -623,8 +661,9 @@ async def handle_message(bot: Client, msg: dict):
                 return
             if not reply:
                 return await reply_text("Reply to user to ban")
-            target    = reply.get("from", {})
-            target_id = target.get("id")
+            target, target_id = extract_reply_user(reply)
+            if not target_id:
+                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
             if is_protected(target_id):
                 return await reply_text("🛡 Protected User")
             if await anti_nuke(bot, chat_id, msg_id, user_id):
@@ -639,8 +678,9 @@ async def handle_message(bot: Client, msg: dict):
                 return
             if not reply:
                 return await reply_text("Reply to user to mute")
-            target    = reply.get("from", {})
-            target_id = target.get("id")
+            target, target_id = extract_reply_user(reply)
+            if not target_id:
+                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
             if is_protected(target_id):
                 return await reply_text("🛡 Protected User")
             if await anti_nuke(bot, chat_id, msg_id, user_id):
@@ -655,8 +695,9 @@ async def handle_message(bot: Client, msg: dict):
                 return
             if not reply:
                 return await reply_text("Reply to user to warn")
-            target    = reply.get("from", {})
-            target_id = target.get("id")
+            target, target_id = extract_reply_user(reply)
+            if not target_id:
+                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
             warns     = load(WARN_FILE)
             uid       = str(target_id)
             warns.setdefault(uid, 0)
@@ -675,8 +716,9 @@ async def handle_message(bot: Client, msg: dict):
                 return
             if not reply:
                 return await reply_text("Reply to message to delete")
-            target        = reply.get("from", {})
-            target_id     = target.get("id")
+            target, target_id = extract_reply_user(reply)
+            if not target_id:
+                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
             reply_msg_id  = reply.get("message_id")
             deleted_text  = reply.get("text") or "Media Message"
             await bot.delete_messages(chat_id, reply_msg_id)
@@ -693,8 +735,9 @@ async def handle_message(bot: Client, msg: dict):
                 return
             if not reply:
                 return await reply_text("Reply to user to protect")
-            target    = reply.get("from", {})
-            target_id = target.get("id")
+            target, target_id = extract_reply_user(reply)
+            if not target_id:
+                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
             data      = load(PROTECT_FILE)
             data[str(target_id)] = True
             save(PROTECT_FILE, data)
