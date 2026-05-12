@@ -36,6 +36,20 @@ from fastapi.responses import JSONResponse
 from pyrogram import Client
 from pyrogram.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
 
+BOT_COMMANDS = [
+    {"command": "start", "description": "Start Bot"},
+    {"command": "hauth", "description": "Authorize Moderator"},
+    {"command": "hgrant", "description": "Grant Permission"},
+    {"command": "hrevoke", "description": "Revoke Permission"},
+    {"command": "hban", "description": "Ban User"},
+    {"command": "hmute", "description": "Mute User"},
+    {"command": "hwarn", "description": "Warn User"},
+    {"command": "hdel", "description": "Delete Message"},
+    {"command": "hprotect", "description": "Protect User"},
+    {"command": "hcase", "description": "View Case"},
+    {"command": "hmodinfo", "description": "Moderator Info"},
+]
+
 # =========================================================
 # LOGGING SETUP
 # =========================================================
@@ -73,6 +87,8 @@ def resolve_storage_path() -> str:
         return fallback
 
 STORAGE_PATH = resolve_storage_path()
+FALLBACK_STORAGE_PATH = os.environ.get("FALLBACK_STORAGE_PATH", "/tmp/modbot_fallback")
+Path(FALLBACK_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 
 # =========================================================
 # VALIDATE CONFIGURATION
@@ -117,12 +133,50 @@ CASE_FILE    = f"{STORAGE_PATH}/cases.json"
 PROTECT_FILE = f"{STORAGE_PATH}/protected.json"
 ABUSE_FILE   = f"{STORAGE_PATH}/abuse.json"
 
-for _f in [AUTH_FILE, WARN_FILE, CASE_FILE, PROTECT_FILE, ABUSE_FILE]:
-    if not os.path.exists(_f):
-        with open(_f, "w") as _fh:
-            json.dump({}, _fh)
+FALLBACK_AUTH_FILE    = f"{FALLBACK_STORAGE_PATH}/auth.json"
+FALLBACK_WARN_FILE    = f"{FALLBACK_STORAGE_PATH}/warns.json"
+FALLBACK_CASE_FILE    = f"{FALLBACK_STORAGE_PATH}/cases.json"
+FALLBACK_PROTECT_FILE = f"{FALLBACK_STORAGE_PATH}/protected.json"
+FALLBACK_ABUSE_FILE   = f"{FALLBACK_STORAGE_PATH}/abuse.json"
+
+FALLBACK_FILE_MAP = {
+    AUTH_FILE: FALLBACK_AUTH_FILE,
+    WARN_FILE: FALLBACK_WARN_FILE,
+    CASE_FILE: FALLBACK_CASE_FILE,
+    PROTECT_FILE: FALLBACK_PROTECT_FILE,
+    ABUSE_FILE: FALLBACK_ABUSE_FILE,
+}
+
+def ensure_json_file(file_path: str):
+    """Create missing JSON files with an empty object payload."""
+    if os.path.exists(file_path):
+        return
+    Path(file_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(file_path, "w", encoding="utf-8") as fh:
+        json.dump({}, fh)
+
+def init_storage_files():
+    """Initialize primary and fallback JSON files and bootstrap when needed."""
+    for primary, fallback in FALLBACK_FILE_MAP.items():
+        ensure_json_file(fallback)
+
+        if not os.path.exists(primary):
+            try:
+                shutil.copy2(fallback, primary)
+                log_msg(f"Bootstrapped storage file from fallback: {primary}", "INFO")
+            except Exception:
+                ensure_json_file(primary)
+        else:
+            # Keep fallback warm with latest primary content.
+            try:
+                shutil.copy2(primary, fallback)
+            except Exception as e:
+                log_msg(f"WARNING syncing fallback file {fallback}: {e}", "WARNING")
+
+init_storage_files()
 
 log_msg(f"Storage initialized at: {STORAGE_PATH}", "INFO")
+log_msg(f"Fallback storage initialized at: {FALLBACK_STORAGE_PATH}", "INFO")
 
 # =========================================================
 # JSON HELPERS
@@ -132,6 +186,13 @@ def load(file: str) -> dict:
     """Load JSON file"""
     try:
         if not os.path.exists(file):
+            fallback_file = FALLBACK_FILE_MAP.get(file)
+            if fallback_file and os.path.exists(fallback_file):
+                with open(fallback_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                save(file, data)
+                log_msg(f"Recovered missing file from fallback: {file}", "WARNING")
+                return data
             return {}
         with open(file, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -145,6 +206,16 @@ def load(file: str) -> dict:
                 return data
             except Exception as backup_error:
                 log_msg(f"ERROR loading backup {backup_file}: {backup_error}", "ERROR")
+        fallback_file = FALLBACK_FILE_MAP.get(file)
+        if fallback_file and os.path.exists(fallback_file):
+            try:
+                with open(fallback_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                save(file, data)
+                log_msg(f"Recovered storage from fallback JSON: {fallback_file}", "WARNING")
+                return data
+            except Exception as fallback_error:
+                log_msg(f"ERROR loading fallback {fallback_file}: {fallback_error}", "ERROR")
         log_msg(f"ERROR loading {file}: invalid JSON and no valid backup", "ERROR")
         return {}
     except Exception as e:
@@ -163,6 +234,14 @@ def save(file: str, data: dict):
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
         os.replace(temp_file, file)
+
+        fallback_file = FALLBACK_FILE_MAP.get(file)
+        if fallback_file:
+            fallback_temp_file = f"{fallback_file}.tmp"
+            Path(fallback_file).parent.mkdir(parents=True, exist_ok=True)
+            with open(fallback_temp_file, "w", encoding="utf-8") as ff:
+                json.dump(data, ff, indent=4)
+            os.replace(fallback_temp_file, fallback_file)
     except Exception as e:
         log_msg(f"ERROR saving {file}: {e}", "ERROR")
 
@@ -237,6 +316,41 @@ def extract_reply_user(reply: dict) -> tuple[dict, int | None]:
     if not isinstance(target_id, int) or target_id <= 0:
         return target, None
     return target, target_id
+
+def parse_positive_user_id(value: str) -> int | None:
+    """Parse a positive Telegram user id from command argument."""
+    try:
+        uid = int(value.strip())
+        if uid > 0:
+            return uid
+    except Exception:
+        return None
+    return None
+
+def resolve_target_from_reply_or_args(
+    reply: dict,
+    args: list[str],
+    user_id_arg_index: int,
+) -> tuple[dict, int | None, str | None]:
+    """Resolve target user from replied message first, then from command args."""
+    target, target_id = extract_reply_user(reply)
+    if target_id:
+        return target, target_id, None
+
+    if len(args) > user_id_arg_index:
+        parsed_uid = parse_positive_user_id(args[user_id_arg_index])
+        if parsed_uid:
+            return {"id": parsed_uid, "first_name": "User"}, parsed_uid, None
+        return {}, None, "❌ Invalid user ID. Send a numeric Telegram user ID."
+
+    return {}, None, "❌ Reply to a user or pass their user ID."
+
+def extract_reason_from_args(args: list[str], start_index: int, default: str = "No Reason") -> str:
+    """Build reason text from command args after a given index."""
+    if len(args) <= start_index:
+        return default
+    reason = " ".join(args[start_index:]).strip()
+    return reason or default
 
 def create_case(action: str, moderator: int, target: int, reason: str) -> str:
     cases   = load(CASE_FILE)
@@ -350,6 +464,22 @@ async def ensure_webhook_registered() -> str:
     except Exception as e:
         return f"error:{e}"
 
+async def sync_bot_commands() -> str:
+    """Set Telegram bot menu commands and return status string."""
+    try:
+        async with httpx.AsyncClient() as client:
+            cmd_resp = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
+                json={"commands": BOT_COMMANDS},
+                timeout=10,
+            )
+            result = cmd_resp.json()
+            if result.get("ok"):
+                return "ok"
+            return f"error:{result.get('description', 'unknown')}"
+    except Exception as e:
+        return f"error:{e}"
+
 # =========================================================
 # ANTI-NUKE
 # =========================================================
@@ -438,6 +568,26 @@ async def send_action_log(
         log_msg(f"ERROR in send_action_log: {e}", "ERROR")
         log_msg(traceback.format_exc(), "ERROR")
 
+async def send_grant_confirmation(
+    bot: Client,
+    chat_id: int,
+    reply_to: int,
+    granted_by: int,
+    target: dict,
+    permission: str,
+):
+    """Post permission grant confirmation in the current group/chat."""
+    try:
+        text = (
+            "✅ Permission Granted\n\n"
+            f"👤 Moderator: {make_mention(target)}\n"
+            f"🔐 Permission: `{permission}`\n"
+            f"🛡 Granted by: `{granted_by}`"
+        )
+        await bot.send_message(chat_id, text, reply_to_message_id=reply_to)
+    except Exception as e:
+        log_msg(f"ERROR sending grant confirmation: {e}", "ERROR")
+
 # =========================================================
 # FASTAPI APP
 # =========================================================
@@ -497,6 +647,7 @@ async def setup_webhook(request: Request):
     result = {
         "webhook_url": webhook_url,
         "set_webhook": {},
+        "set_commands": {},
         "webhook_info": {},
         "errors": []
     }
@@ -522,29 +673,13 @@ async def setup_webhook(request: Request):
                 result["errors"].append(f"Webhook error: {set_result.get('description')}")
                 log_msg(f"ERROR: {set_result.get('description')}", "ERROR")
 
-            # Set bot commands
+            # Set bot menu commands
             log_msg("Setting bot commands...", "INFO")
-            cmd_resp = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
-                json={
-                    "commands": [
-                        {"command": "start",    "description": "Start Bot"},
-                        {"command": "hauth",    "description": "Authorize Moderator"},
-                        {"command": "hgrant",   "description": "Grant Permission"},
-                        {"command": "hrevoke",  "description": "Revoke Permission"},
-                        {"command": "hban",     "description": "Ban User"},
-                        {"command": "hmute",    "description": "Mute User"},
-                        {"command": "hwarn",    "description": "Warn User"},
-                        {"command": "hdel",     "description": "Delete Message"},
-                        {"command": "hprotect", "description": "Protect User"},
-                        {"command": "hcase",    "description": "View Case"},
-                        {"command": "hmodinfo", "description": "Moderator Info"},
-                    ]
-                },
-                timeout=10,
-            )
-            cmd_result = cmd_resp.json()
-            log_msg(f"Commands set: {cmd_result.get('ok')}", "INFO")
+            commands_status = await sync_bot_commands()
+            result["set_commands"] = {"status": commands_status}
+            if commands_status.startswith("error:"):
+                result["errors"].append(f"Commands error: {commands_status}")
+            log_msg(f"Commands status: {commands_status}", "INFO")
 
             # Verify webhook
             log_msg("Verifying webhook...", "INFO")
@@ -573,6 +708,9 @@ async def webhook(request: Request):
     """Receive and process Telegram webhook updates"""
     try:
         update = await request.json()
+        if not isinstance(update, dict):
+            log_msg("Invalid webhook payload: expected JSON object", "WARNING")
+            return JSONResponse({"ok": False, "error": "invalid payload"}, status_code=400)
         log_msg(f"Update received: {update.get('update_id')}", "DEBUG")
 
         bot = await get_bot()
@@ -654,18 +792,23 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /start
         if raw_cmd == "start":
-            await reply_text("✅ Advanced Moderation Bot Running\n\nUse /hauth to authorize moderators.")
+            await reply_text(
+                "✅ Advanced Moderation Bot Running\n\n"
+                "📋 Command menu is auto-synced on startup.\n"
+                "Use menu button or these commands:\n"
+                "/hauth, /hgrant, /hrevoke, /hban, /hmute, /hwarn, /hdel, /hprotect, /hcase, /hmodinfo"
+            )
             return
 
         # ── /hauth
         if raw_cmd in ("hauth", "ha"):
             if not is_owner(user_id):
                 return await reply_text("❌ Only owner can authorize")
-            if not reply:
-                return await reply_text("Reply to a user.")
-            target, target_id = extract_reply_user(reply)
+            target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 0)
             if not target_id:
-                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
+                return await reply_text(
+                    f"{target_error}\nUsage: /hauth <user_id>\nOr reply to a user with /hauth"
+                )
             data      = load(AUTH_FILE)
             if str(target_id) not in data:
                 data[str(target_id)] = {
@@ -681,12 +824,14 @@ async def handle_message(bot: Client, msg: dict):
         elif raw_cmd in ("hgrant", "hg"):
             if not is_owner(user_id):
                 return
-            if not reply or not args:
-                return await reply_text("Usage: /hgrant <permission>\nReply to moderator")
+            if not args:
+                return await reply_text("Usage: /hgrant <permission> <user_id>\nOr reply to moderator with /hgrant <permission>")
             permission = args[0].lower()
-            target, target_id = extract_reply_user(reply)
+            target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 1)
             if not target_id:
-                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
+                return await reply_text(
+                    f"{target_error}\nUsage: /hgrant <permission> <user_id>\nOr reply to moderator with /hgrant <permission>"
+                )
             target_id  = str(target_id)
             data       = load(AUTH_FILE)
             if target_id not in data:
@@ -694,17 +839,20 @@ async def handle_message(bot: Client, msg: dict):
             data[target_id]["permissions"][permission] = True
             save(AUTH_FILE, data)
             await reply_text(f"✅ Granted `{permission}` to {make_mention(target)}")
+            await send_grant_confirmation(bot, chat_id, msg_id, user_id, target, permission)
 
         # ── /hrevoke
         elif raw_cmd in ("hrevoke", "hr"):
             if not is_owner(user_id):
                 return
-            if not reply or not args:
-                return await reply_text("Usage: /hrevoke <permission>\nReply to moderator")
+            if not args:
+                return await reply_text("Usage: /hrevoke <permission> <user_id>\nOr reply to moderator with /hrevoke <permission>")
             permission = args[0].lower()
-            target, target_id = extract_reply_user(reply)
+            target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 1)
             if not target_id:
-                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
+                return await reply_text(
+                    f"{target_error}\nUsage: /hrevoke <permission> <user_id>\nOr reply to moderator with /hrevoke <permission>"
+                )
             target_id  = str(target_id)
             data       = load(AUTH_FILE)
             if target_id in data:
@@ -716,51 +864,54 @@ async def handle_message(bot: Client, msg: dict):
         elif raw_cmd in ("hban", "hb"):
             if not await check_mod("ban"):
                 return
-            if not reply:
-                return await reply_text("Reply to user to ban")
-            target, target_id = extract_reply_user(reply)
+            target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 0)
             if not target_id:
-                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
+                return await reply_text(
+                    f"{target_error}\nUsage: /hban <user_id> [reason]\nOr reply to user with /hban [reason]"
+                )
+            action_reason = extract_reason_from_args(args, 1, "No Reason") if not reply else extract_reason_from_args(args, 0, "No Reason")
             if is_protected(target_id):
                 return await reply_text("🛡 Protected User")
             if await anti_nuke(bot, chat_id, msg_id, user_id):
                 return
             await bot.ban_chat_member(chat_id, target_id)
-            case_id = create_case("BAN", user_id, target_id, reason)
-            await send_action_log(bot, chat_id, msg_id, "BAN", target, reason, case_id, get_mod_info(user_id))
+            case_id = create_case("BAN", user_id, target_id, action_reason)
+            await send_action_log(bot, chat_id, msg_id, "BAN", target, action_reason, case_id, get_mod_info(user_id))
 
         # ── /hmute
         elif raw_cmd in ("hmute", "hm"):
             if not await check_mod("mute"):
                 return
-            if not reply:
-                return await reply_text("Reply to user to mute")
-            target, target_id = extract_reply_user(reply)
+            target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 0)
             if not target_id:
-                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
+                return await reply_text(
+                    f"{target_error}\nUsage: /hmute <user_id> [reason]\nOr reply to user with /hmute [reason]"
+                )
+            action_reason = extract_reason_from_args(args, 1, "No Reason") if not reply else extract_reason_from_args(args, 0, "No Reason")
             if is_protected(target_id):
                 return await reply_text("🛡 Protected User")
             if await anti_nuke(bot, chat_id, msg_id, user_id):
                 return
             await bot.restrict_chat_member(chat_id, target_id, ChatPermissions())
-            case_id = create_case("MUTE", user_id, target_id, reason)
-            await send_action_log(bot, chat_id, msg_id, "MUTE", target, reason, case_id, get_mod_info(user_id))
+            case_id = create_case("MUTE", user_id, target_id, action_reason)
+            await send_action_log(bot, chat_id, msg_id, "MUTE", target, action_reason, case_id, get_mod_info(user_id))
 
         # ── /hwarn
         elif raw_cmd in ("hwarn", "hw"):
             if not await check_mod("warn"):
                 return
-            if not reply:
-                return await reply_text("Reply to user to warn")
-            target, target_id = extract_reply_user(reply)
+            target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 0)
             if not target_id:
-                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
+                return await reply_text(
+                    f"{target_error}\nUsage: /hwarn <user_id> [reason]\nOr reply to user with /hwarn [reason]"
+                )
             warns     = load(WARN_FILE)
             uid       = str(target_id)
             warns.setdefault(uid, 0)
             warns[uid] += 1
             save(WARN_FILE, warns)
-            case_id = create_case("WARN", user_id, target_id, "Warning")
+            warn_reason = extract_reason_from_args(args, 1, "Warning") if not reply else extract_reason_from_args(args, 0, "Warning")
+            case_id = create_case("WARN", user_id, target_id, warn_reason)
             await send_action_log(
                 bot, chat_id, msg_id, "WARN", target,
                 f"Warning #{warns[uid]}", case_id, get_mod_info(user_id),
@@ -790,11 +941,11 @@ async def handle_message(bot: Client, msg: dict):
         elif raw_cmd in ("hprotect", "hp"):
             if not is_owner(user_id):
                 return
-            if not reply:
-                return await reply_text("Reply to user to protect")
-            target, target_id = extract_reply_user(reply)
+            target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 0)
             if not target_id:
-                return await reply_text("❌ Reply to a normal user message (not anonymous/channel).")
+                return await reply_text(
+                    f"{target_error}\nUsage: /hprotect <user_id>\nOr reply to user with /hprotect"
+                )
             data      = load(PROTECT_FILE)
             data[str(target_id)] = True
             save(PROTECT_FILE, data)
@@ -823,7 +974,16 @@ async def handle_message(bot: Client, msg: dict):
         elif raw_cmd in ("hmodinfo", "hmi"):
             if not is_authorized(user_id):
                 return
-            lookup_id = reply.get("from", {}).get("id", user_id) if reply else user_id
+            lookup_id = user_id
+            if reply:
+                _, reply_uid = extract_reply_user(reply)
+                if reply_uid:
+                    lookup_id = reply_uid
+            elif args:
+                parsed_uid = parse_positive_user_id(args[0])
+                if not parsed_uid:
+                    return await reply_text("❌ Invalid user ID. Usage: /hmodinfo <user_id>")
+                lookup_id = parsed_uid
             mod_data  = get_mod_info(lookup_id)
             if not mod_data:
                 return await reply_text("❌ Not a moderator.")
@@ -843,6 +1003,11 @@ async def handle_message(bot: Client, msg: dict):
     except Exception as e:
         log_msg(f"ERROR in handle_message: {e}", "ERROR")
         log_msg(traceback.format_exc(), "ERROR")
+        try:
+            if OWNER_DEBUG_NOTIFICATIONS:
+                await notify_owner(bot, f"❌ handle_message error: {e}")
+        except Exception:
+            pass
 
 # =========================================================
 # CALLBACK HANDLER
@@ -911,6 +1076,7 @@ async def startup_event():
     try:
         bot = await get_bot()
         webhook_status = await ensure_webhook_registered()
+        commands_status = await sync_bot_commands()
         log_msg("✅ Bot initialized successfully", "INFO")
         await notify_owner(
             bot,
@@ -918,7 +1084,8 @@ async def startup_event():
                 "✅ Bot is running on Koyeb\n"
                 f"Port: `{PORT}`\n"
                 f"Storage: `{STORAGE_PATH}`\n"
-                f"Webhook: `{webhook_status}`"
+                f"Webhook: `{webhook_status}`\n"
+                f"Commands: `{commands_status}`"
             ),
         )
     except Exception as e:
