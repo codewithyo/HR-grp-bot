@@ -72,9 +72,18 @@ STORAGE_PATH=/tmp/modbot
 - **Build Command**: Leave empty (Python auto-detected)
 - **Run Command**: 
   ```
-  python api/index.py
+  python start.py
   ```
 - **Port**: 8000
+
+### Docker Deployment Option (Recommended)
+If you deploy as a Docker service on Koyeb, this repository now includes a `Dockerfile`.
+
+- **Dockerfile path**: `Dockerfile`
+- **Exposed port**: `8000`
+- **Container start command**: `python start.py`
+
+Koyeb injects `$PORT` automatically and the app reads it from environment variables.
 
 ### Step 5: Deploy
 1. Click "Deploy"
@@ -93,7 +102,7 @@ https://your-app.koyeb.app/health
 
 You should see:
 ```json
-{"status": "ok", "bot": "running"}
+{"status": "healthy", "bot_ready": true}
 ```
 
 ### Check Bot Info

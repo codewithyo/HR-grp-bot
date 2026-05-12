@@ -50,6 +50,9 @@ Repository: codewithyo/HR-grp-bot
 Branch: main
 Run command: python start.py
 
+# Optional: Docker deploy on Koyeb
+Dockerfile: ./Dockerfile
+
 # 4. Setup webhook
 https://<your-app>.koyeb.app/api/setup_webhook
 
