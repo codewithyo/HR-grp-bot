@@ -25,6 +25,7 @@ import random
 import string
 import asyncio
 import httpx
+import traceback
 from datetime import datetime
 
 from fastapi import FastAPI, Request, HTTPException
@@ -289,6 +290,7 @@ async def set_webhook(request: Request):
                     {"command": "hprotect", "description": "Protect User"},
                     {"command": "hcase",    "description": "View Case"},
                     {"command": "hmodinfo", "description": "Moderator Info"},
+                    {"command": "start",    "description": "Start Bot"},
                 ]
             },
             timeout=10,
@@ -325,8 +327,9 @@ async def webhook(request: Request):
             await handle_callback(bot, update["callback_query"])
 
     except Exception as e:
-        # Log silently — always return 200 so Telegram doesn't retry
+        # Log errors properly
         print(f"[ERROR] {type(e).__name__}: {e}")
+        print(traceback.format_exc())
 
     return {"ok": True}
 
@@ -336,14 +339,15 @@ async def webhook(request: Request):
 
 async def handle_message(bot: Client, msg: dict):
     text = msg.get("text", "")
-    if not text.startswith("/"):
-        return
-
     chat_id   = msg["chat"]["id"]
     msg_id    = msg["message_id"]
     from_user = msg.get("from", {})
     user_id   = from_user.get("id", 0)
     reply     = msg.get("reply_to_message")
+
+    # Only process commands (messages starting with /)
+    if not text.startswith("/"):
+        return
 
     # Parse /cmd@botusername → cmd, strip leading slash
     raw_cmd = text.split()[0].split("@")[0].lstrip("/").lower()
@@ -375,10 +379,15 @@ async def handle_message(bot: Client, msg: dict):
             return False
         return True
 
+    # ── /start ─────────────────────────────────────────────
+    if raw_cmd == "start":
+        await reply_text("✅ Advanced Moderation Bot Running\n\nUse /hauth to authorize moderators.")
+        return
+
     # ── /hauth ─────────────────────────────────────────────
     if raw_cmd in ("hauth", "ha"):
         if not is_owner(user_id):
-            return
+            return await reply_text("❌ Only owner can authorize moderators")
         if not reply:
             return await reply_text("Reply to a user.")
         target    = reply.get("from", {})
@@ -396,8 +405,10 @@ async def handle_message(bot: Client, msg: dict):
 
     # ── /hgrant ────────────────────────────────────────────
     elif raw_cmd in ("hgrant", "hg"):
-        if not is_owner(user_id) or not reply or not args:
+        if not is_owner(user_id):
             return
+        if not reply or not args:
+            return await reply_text("Usage: /hgrant <permission>\n\nReply to a moderator")
         permission = args[0].lower()
         target     = reply.get("from", {})
         target_id  = str(target.get("id"))
@@ -410,8 +421,10 @@ async def handle_message(bot: Client, msg: dict):
 
     # ── /hrevoke ───────────────────────────────────────────
     elif raw_cmd in ("hrevoke", "hr"):
-        if not is_owner(user_id) or not reply or not args:
+        if not is_owner(user_id):
             return
+        if not reply or not args:
+            return await reply_text("Usage: /hrevoke <permission>\n\nReply to a moderator")
         permission = args[0].lower()
         target     = reply.get("from", {})
         target_id  = str(target.get("id"))
@@ -426,7 +439,7 @@ async def handle_message(bot: Client, msg: dict):
         if not await check_mod("ban"):
             return
         if not reply:
-            return
+            return await reply_text("Reply to a user to ban them")
         target    = reply.get("from", {})
         target_id = target.get("id")
         if is_protected(target_id):
@@ -442,7 +455,7 @@ async def handle_message(bot: Client, msg: dict):
         if not await check_mod("mute"):
             return
         if not reply:
-            return
+            return await reply_text("Reply to a user to mute them")
         target    = reply.get("from", {})
         target_id = target.get("id")
         if is_protected(target_id):
@@ -458,7 +471,7 @@ async def handle_message(bot: Client, msg: dict):
         if not await check_mod("warn"):
             return
         if not reply:
-            return
+            return await reply_text("Reply to a user to warn them")
         target    = reply.get("from", {})
         target_id = target.get("id")
         warns     = load(WARN_FILE)
@@ -478,7 +491,7 @@ async def handle_message(bot: Client, msg: dict):
         if not await check_mod("delete"):
             return
         if not reply:
-            return
+            return await reply_text("Reply to a message to delete it")
         target        = reply.get("from", {})
         target_id     = target.get("id")
         reply_msg_id  = reply.get("message_id")
@@ -493,8 +506,10 @@ async def handle_message(bot: Client, msg: dict):
 
     # ── /hprotect ──────────────────────────────────────────
     elif raw_cmd in ("hprotect", "hp"):
-        if not is_owner(user_id) or not reply:
+        if not is_owner(user_id):
             return
+        if not reply:
+            return await reply_text("Reply to a user to protect them")
         target    = reply.get("from", {})
         target_id = target.get("id")
         data      = load(PROTECT_FILE)
@@ -541,12 +556,6 @@ async def handle_message(bot: Client, msg: dict):
             f"Status: {status}\n\n"
             f"**Permissions:**\n{perm_list}"
         )
-
-    # ── /start ─────────────────────────────────────────────
-    elif raw_cmd == "start":
-        if not is_authorized(user_id):
-            return
-        await reply_text("✅ Advanced Moderation Bot Running")
 
 # =========================================================
 # CALLBACK ROUTER
