@@ -10,12 +10,12 @@
 # CONFIG
 # =========================================================
 
-API_ID = 123456
-API_HASH = "YOUR_API_HASH"
-BOT_TOKEN = "YOUR_BOT_TOKEN"
+API_ID = 9605646
+API_HASH = "822d45aa548a53682a458efa1933e4c9"
+BOT_TOKEN = "8707026358:AAF-DAP96HYUZe6d4aQ7g_d3lyE97q8KOBo"
 
-OWNER_ID = 123456789
-LOG_GROUP_ID = -100123456789
+OWNER_ID = 8457503781
+LOG_GROUP_ID = -1003834934514
 
 # =========================================================
 # IMPORTS
