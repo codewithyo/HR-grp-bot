@@ -38,6 +38,8 @@ from pyrogram.types import ChatPermissions, InlineKeyboardMarkup, InlineKeyboard
 
 BOT_COMMANDS = [
     {"command": "start", "description": "Start Bot"},
+    {"command": "help", "description": "Show command help"},
+    {"command": "happeal", "description": "Appeal moderation case"},
     {"command": "hauth", "description": "Authorize Moderator"},
     {"command": "hgrant", "description": "Grant Permission"},
     {"command": "hrevoke", "description": "Revoke Permission"},
@@ -49,6 +51,8 @@ BOT_COMMANDS = [
     {"command": "hcase", "description": "View Case"},
     {"command": "hmodinfo", "description": "Moderator Info"},
 ]
+
+VALID_PERMISSIONS = {"ban", "mute", "warn", "delete"}
 
 # =========================================================
 # LOGGING SETUP
@@ -132,12 +136,16 @@ WARN_FILE    = f"{STORAGE_PATH}/warns.json"
 CASE_FILE    = f"{STORAGE_PATH}/cases.json"
 PROTECT_FILE = f"{STORAGE_PATH}/protected.json"
 ABUSE_FILE   = f"{STORAGE_PATH}/abuse.json"
+TEMP_ACTIONS_FILE = f"{STORAGE_PATH}/temp_actions.json"
+APPEALS_FILE = f"{STORAGE_PATH}/appeals.json"
 
 FALLBACK_AUTH_FILE    = f"{FALLBACK_STORAGE_PATH}/auth.json"
 FALLBACK_WARN_FILE    = f"{FALLBACK_STORAGE_PATH}/warns.json"
 FALLBACK_CASE_FILE    = f"{FALLBACK_STORAGE_PATH}/cases.json"
 FALLBACK_PROTECT_FILE = f"{FALLBACK_STORAGE_PATH}/protected.json"
 FALLBACK_ABUSE_FILE   = f"{FALLBACK_STORAGE_PATH}/abuse.json"
+FALLBACK_TEMP_ACTIONS_FILE = f"{FALLBACK_STORAGE_PATH}/temp_actions.json"
+FALLBACK_APPEALS_FILE = f"{FALLBACK_STORAGE_PATH}/appeals.json"
 
 FALLBACK_FILE_MAP = {
     AUTH_FILE: FALLBACK_AUTH_FILE,
@@ -145,6 +153,8 @@ FALLBACK_FILE_MAP = {
     CASE_FILE: FALLBACK_CASE_FILE,
     PROTECT_FILE: FALLBACK_PROTECT_FILE,
     ABUSE_FILE: FALLBACK_ABUSE_FILE,
+    TEMP_ACTIONS_FILE: FALLBACK_TEMP_ACTIONS_FILE,
+    APPEALS_FILE: FALLBACK_APPEALS_FILE,
 }
 
 def ensure_json_file(file_path: str):
@@ -365,6 +375,92 @@ def create_case(action: str, moderator: int, target: int, reason: str) -> str:
     save(CASE_FILE, cases)
     return case_id
 
+def load_temp_actions() -> list[dict]:
+    data = load(TEMP_ACTIONS_FILE)
+    if isinstance(data, list):
+        return data
+    return []
+
+def save_temp_actions(actions: list[dict]):
+    save(TEMP_ACTIONS_FILE, actions)
+
+def parse_duration_token(token: str) -> int | None:
+    """Parse duration token like 15m, 2h, 3d into seconds."""
+    if not token:
+        return None
+    token = token.strip().lower()
+    if len(token) < 2:
+        return None
+    unit = token[-1]
+    num_part = token[:-1]
+    if not num_part.isdigit():
+        return None
+    value = int(num_part)
+    if value <= 0:
+        return None
+    scale = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if unit not in scale:
+        return None
+    return value * scale[unit]
+
+def parse_duration_and_reason(args: list[str], start_index: int, default_reason: str = "No Reason") -> tuple[int | None, str]:
+    """Parse optional duration token and reason from args."""
+    if len(args) <= start_index:
+        return None, default_reason
+    maybe_duration = parse_duration_token(args[start_index])
+    if maybe_duration is not None:
+        reason = extract_reason_from_args(args, start_index + 1, default_reason)
+        return maybe_duration, reason
+    return None, extract_reason_from_args(args, start_index, default_reason)
+
+def format_duration(seconds: int) -> str:
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+def role_help_text(user_id: int) -> str:
+    if is_owner(user_id):
+        return (
+            "📘 **Owner Help**\n\n"
+            "General: /start, /help, /happeal <case_id> <message>\n"
+            "Owner: /hauth, /hgrant, /hrevoke, /hprotect\n"
+            "Moderation: /hban, /hmute, /hwarn, /hdel, /hcase, /hmodinfo\n\n"
+            "Timed actions: use duration token like `30m`, `2h`, `1d`\n"
+            "Examples:\n"
+            "`/hban 123456789 2h spam`\n"
+            "`/hmute 123456789 30m abuse`"
+        )
+    if is_authorized(user_id):
+        return (
+            "📘 **Moderator Help**\n\n"
+            "Commands: /hban, /hmute, /hwarn, /hdel, /hcase, /hmodinfo\n"
+            "Timed actions supported for ban/mute with `30m`, `2h`, `1d`."
+        )
+    return (
+        "📘 **User Help**\n\n"
+        "Commands: /start, /help\n"
+        "Appeal: `/happeal <case_id> <message>` in bot DM."
+    )
+
+def create_appeal(user_id: int, case_id: str, message: str) -> str:
+    appeals = load(APPEALS_FILE)
+    if not isinstance(appeals, dict):
+        appeals = {}
+    appeal_id = str(len(appeals) + 1)
+    appeals[appeal_id] = {
+        "case_id": case_id,
+        "user_id": user_id,
+        "message": message,
+        "status": "open",
+        "time": str(datetime.now()),
+    }
+    save(APPEALS_FILE, appeals)
+    return appeal_id
+
 def track_action(user_id: int) -> int:
     data = load(ABUSE_FILE)
     uid  = str(user_id)
@@ -381,6 +477,7 @@ def track_action(user_id: int) -> int:
 
 _bot: Client = None
 bot_ready = False
+_temp_action_worker_task: asyncio.Task | None = None
 
 async def get_bot() -> Client:
     """Get or initialize the Pyrogram bot client"""
@@ -480,6 +577,55 @@ async def sync_bot_commands() -> str:
     except Exception as e:
         return f"error:{e}"
 
+async def process_due_temp_actions(bot: Client):
+    """Process due unmute/unban actions from persistent storage."""
+    actions = load_temp_actions()
+    if not actions:
+        return
+
+    now_ts = int(time.time())
+    pending: list[dict] = []
+
+    for action in actions:
+        until_ts = int(action.get("until_ts", 0))
+        if until_ts > now_ts:
+            pending.append(action)
+            continue
+
+        chat_id = action.get("chat_id")
+        target_id = action.get("target_id")
+        action_type = action.get("type")
+
+        try:
+            if action_type == "mute":
+                await bot.restrict_chat_member(
+                    chat_id,
+                    target_id,
+                    ChatPermissions(can_send_messages=True),
+                )
+                await bot.send_message(chat_id, f"🔊 Temporary mute ended for `{target_id}`")
+            elif action_type == "ban":
+                await bot.unban_chat_member(chat_id, target_id)
+                await bot.send_message(chat_id, f"🔓 Temporary ban ended for `{target_id}`")
+        except Exception as e:
+            log_msg(f"ERROR processing temp action {action}: {e}", "ERROR")
+            pending.append(action)
+
+    if len(pending) != len(actions):
+        save_temp_actions(pending)
+
+async def temp_action_worker():
+    """Background worker to auto-revert timed moderation actions."""
+    while True:
+        try:
+            bot = await get_bot()
+            await process_due_temp_actions(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_msg(f"ERROR in temp action worker: {e}", "ERROR")
+        await asyncio.sleep(10)
+
 # =========================================================
 # ANTI-NUKE
 # =========================================================
@@ -575,16 +721,20 @@ async def send_grant_confirmation(
     granted_by: int,
     target: dict,
     permission: str,
+    case_id: str | None = None,
 ):
     """Post permission grant confirmation in the current group/chat."""
     try:
+        case_line = f"\n📜 Case ID: #{case_id}" if case_id else ""
         text = (
             "✅ Permission Granted\n\n"
             f"👤 Moderator: {make_mention(target)}\n"
             f"🔐 Permission: `{permission}`\n"
             f"🛡 Granted by: `{granted_by}`"
+            f"{case_line}"
         )
         await bot.send_message(chat_id, text, reply_to_message_id=reply_to)
+        await bot.send_message(LOG_GROUP_ID, f"📝 Grant logged\n\n{text}")
     except Exception as e:
         log_msg(f"ERROR sending grant confirmation: {e}", "ERROR")
 
@@ -794,9 +944,48 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd == "start":
             await reply_text(
                 "✅ Advanced Moderation Bot Running\n\n"
+                "Use /help to see commands based on your role.\n"
                 "📋 Command menu is auto-synced on startup.\n"
                 "Use menu button or these commands:\n"
-                "/hauth, /hgrant, /hrevoke, /hban, /hmute, /hwarn, /hdel, /hprotect, /hcase, /hmodinfo"
+                "/help, /happeal, /hauth, /hgrant, /hrevoke, /hban, /hmute, /hwarn, /hdel, /hprotect, /hcase, /hmodinfo"
+            )
+            return
+
+        # ── /help
+        if raw_cmd == "help":
+            await reply_text(role_help_text(user_id))
+            return
+
+        # ── /happeal
+        if raw_cmd == "happeal":
+            chat_type = msg.get("chat", {}).get("type")
+            if chat_type != "private":
+                return await reply_text("❌ Use /happeal in bot private chat (DM) only.")
+            if len(args) < 2:
+                return await reply_text("Usage: /happeal <case_id> <message>")
+            case_id = args[0]
+            appeal_message = " ".join(args[1:]).strip()
+            if not appeal_message:
+                return await reply_text("❌ Appeal message is required.")
+
+            cases = load(CASE_FILE)
+            if case_id not in cases:
+                return await reply_text("❌ Case not found.")
+
+            case = cases[case_id]
+            if int(case.get("target", 0)) != user_id and not is_owner(user_id):
+                return await reply_text("❌ You can only appeal your own case.")
+
+            appeal_id = create_appeal(user_id, case_id, appeal_message)
+            await reply_text(f"✅ Appeal submitted. Appeal ID: #{appeal_id}")
+            await notify_owner(
+                bot,
+                (
+                    f"📨 New appeal #{appeal_id}\n"
+                    f"Case: #{case_id}\n"
+                    f"User: `{user_id}`\n"
+                    f"Message: {appeal_message}"
+                ),
             )
             return
 
@@ -827,6 +1016,8 @@ async def handle_message(bot: Client, msg: dict):
             if not args:
                 return await reply_text("Usage: /hgrant <permission> <user_id>\nOr reply to moderator with /hgrant <permission>")
             permission = args[0].lower()
+            if permission not in VALID_PERMISSIONS:
+                return await reply_text("❌ Invalid permission. Use: ban, mute, warn, delete")
             target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 1)
             if not target_id:
                 return await reply_text(
@@ -838,8 +1029,9 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("❌ Authorize first with /hauth")
             data[target_id]["permissions"][permission] = True
             save(AUTH_FILE, data)
+            case_id = create_case("GRANT", user_id, int(target_id), f"Granted permission: {permission}")
             await reply_text(f"✅ Granted `{permission}` to {make_mention(target)}")
-            await send_grant_confirmation(bot, chat_id, msg_id, user_id, target, permission)
+            await send_grant_confirmation(bot, chat_id, msg_id, user_id, target, permission, case_id)
 
         # ── /hrevoke
         elif raw_cmd in ("hrevoke", "hr"):
@@ -848,6 +1040,8 @@ async def handle_message(bot: Client, msg: dict):
             if not args:
                 return await reply_text("Usage: /hrevoke <permission> <user_id>\nOr reply to moderator with /hrevoke <permission>")
             permission = args[0].lower()
+            if permission not in VALID_PERMISSIONS:
+                return await reply_text("❌ Invalid permission. Use: ban, mute, warn, delete")
             target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 1)
             if not target_id:
                 return await reply_text(
@@ -858,6 +1052,14 @@ async def handle_message(bot: Client, msg: dict):
             if target_id in data:
                 data[target_id]["permissions"][permission] = False
                 save(AUTH_FILE, data)
+                case_id = create_case("REVOKE", user_id, int(target_id), f"Revoked permission: {permission}")
+                await bot.send_message(LOG_GROUP_ID, (
+                    "📝 Permission Revoked\n\n"
+                    f"👤 Moderator: {make_mention(target)}\n"
+                    f"🔐 Permission: `{permission}`\n"
+                    f"🛡 Revoked by: `{user_id}`\n"
+                    f"📜 Case ID: #{case_id}"
+                ))
             await reply_text(f"❌ Revoked `{permission}` from {make_mention(target)}")
 
         # ── /hban
@@ -867,14 +1069,33 @@ async def handle_message(bot: Client, msg: dict):
             target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 0)
             if not target_id:
                 return await reply_text(
-                    f"{target_error}\nUsage: /hban <user_id> [reason]\nOr reply to user with /hban [reason]"
+                    f"{target_error}\nUsage: /hban <user_id> [duration] [reason]\nOr reply to user with /hban [duration] [reason]"
                 )
-            action_reason = extract_reason_from_args(args, 1, "No Reason") if not reply else extract_reason_from_args(args, 0, "No Reason")
+            duration_secs, action_reason = parse_duration_and_reason(args, 1, "No Reason") if not reply else parse_duration_and_reason(args, 0, "No Reason")
             if is_protected(target_id):
                 return await reply_text("🛡 Protected User")
             if await anti_nuke(bot, chat_id, msg_id, user_id):
                 return
-            await bot.ban_chat_member(chat_id, target_id)
+            until_ts = None
+            if duration_secs:
+                until_ts = int(time.time()) + duration_secs
+            await bot.ban_chat_member(chat_id, target_id, until_date=until_ts)
+
+            if duration_secs:
+                actions = load_temp_actions()
+                actions.append(
+                    {
+                        "type": "ban",
+                        "chat_id": chat_id,
+                        "target_id": target_id,
+                        "until_ts": until_ts,
+                        "set_by": user_id,
+                        "reason": action_reason,
+                    }
+                )
+                save_temp_actions(actions)
+                action_reason = f"{action_reason} | Duration: {format_duration(duration_secs)}"
+
             case_id = create_case("BAN", user_id, target_id, action_reason)
             await send_action_log(bot, chat_id, msg_id, "BAN", target, action_reason, case_id, get_mod_info(user_id))
 
@@ -885,14 +1106,33 @@ async def handle_message(bot: Client, msg: dict):
             target, target_id, target_error = resolve_target_from_reply_or_args(reply, args, 0)
             if not target_id:
                 return await reply_text(
-                    f"{target_error}\nUsage: /hmute <user_id> [reason]\nOr reply to user with /hmute [reason]"
+                    f"{target_error}\nUsage: /hmute <user_id> [duration] [reason]\nOr reply to user with /hmute [duration] [reason]"
                 )
-            action_reason = extract_reason_from_args(args, 1, "No Reason") if not reply else extract_reason_from_args(args, 0, "No Reason")
+            duration_secs, action_reason = parse_duration_and_reason(args, 1, "No Reason") if not reply else parse_duration_and_reason(args, 0, "No Reason")
             if is_protected(target_id):
                 return await reply_text("🛡 Protected User")
             if await anti_nuke(bot, chat_id, msg_id, user_id):
                 return
-            await bot.restrict_chat_member(chat_id, target_id, ChatPermissions())
+            until_ts = None
+            if duration_secs:
+                until_ts = int(time.time()) + duration_secs
+            await bot.restrict_chat_member(chat_id, target_id, ChatPermissions(), until_date=until_ts)
+
+            if duration_secs:
+                actions = load_temp_actions()
+                actions.append(
+                    {
+                        "type": "mute",
+                        "chat_id": chat_id,
+                        "target_id": target_id,
+                        "until_ts": until_ts,
+                        "set_by": user_id,
+                        "reason": action_reason,
+                    }
+                )
+                save_temp_actions(actions)
+                action_reason = f"{action_reason} | Duration: {format_duration(duration_secs)}"
+
             case_id = create_case("MUTE", user_id, target_id, action_reason)
             await send_action_log(bot, chat_id, msg_id, "MUTE", target, action_reason, case_id, get_mod_info(user_id))
 
@@ -1072,11 +1312,14 @@ async def handle_callback(bot: Client, cb: dict):
 @app.on_event("startup")
 async def startup_event():
     """Initialize bot on server startup"""
+    global _temp_action_worker_task
     log_msg("🚀 Server starting up...", "INFO")
     try:
         bot = await get_bot()
         webhook_status = await ensure_webhook_registered()
         commands_status = await sync_bot_commands()
+        if _temp_action_worker_task is None or _temp_action_worker_task.done():
+            _temp_action_worker_task = asyncio.create_task(temp_action_worker())
         log_msg("✅ Bot initialized successfully", "INFO")
         await notify_owner(
             bot,
@@ -1094,7 +1337,14 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Gracefully shutdown bot"""
+    global _temp_action_worker_task
     log_msg("🛑 Server shutting down...", "INFO")
+    if _temp_action_worker_task and not _temp_action_worker_task.done():
+        _temp_action_worker_task.cancel()
+        try:
+            await _temp_action_worker_task
+        except asyncio.CancelledError:
+            pass
     await shutdown_bot()
 
 # =========================================================
