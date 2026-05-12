@@ -49,12 +49,13 @@ def log_msg(msg: str, level: str = "INFO"):
 # CONFIG — read from environment variables
 # =========================================================
 
-API_ID       = int(os.environ.get("API_ID", "9605646"))
-API_HASH     = os.environ.get("API_HASH", "822d45aa548a53682a458efa1933e4c9")
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "8707026358:AAF-DAP96HYUZe6d4aQ7g_d3lyE97q8KOBo")
-OWNER_ID     = int(os.environ.get("OWNER_ID", "8457503781"))
-LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "-1003834934514"))
+API_ID       = int(os.environ.get("API_ID", "0"))
+API_HASH     = os.environ.get("API_HASH", "")
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
+OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
+LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))
 PORT         = int(os.environ.get("PORT", "8000"))
+OWNER_DEBUG_NOTIFICATIONS = os.environ.get("OWNER_DEBUG_NOTIFICATIONS", "1") == "1"
 
 def resolve_storage_path() -> str:
     """Prefer persistent disk and fallback to /tmp when unavailable."""
@@ -303,6 +304,51 @@ async def shutdown_bot():
             log_msg("Bot disconnected", "INFO")
         except Exception as e:
             log_msg(f"ERROR shutting down bot: {e}", "ERROR")
+
+async def notify_owner(bot: Client, text: str):
+    """Send operational notifications to owner without breaking runtime."""
+    if OWNER_ID == 0:
+        return
+    try:
+        await bot.send_message(OWNER_ID, text)
+    except Exception as e:
+        log_msg(f"Owner notify failed: {e}", "WARNING")
+
+async def ensure_webhook_registered() -> str:
+    """Ensure webhook is configured when APP_URL or WEBHOOK_URL is available."""
+    base = os.environ.get("WEBHOOK_URL") or os.environ.get("APP_URL")
+    if not base:
+        return "skipped:no-url"
+
+    base = base.rstrip("/")
+    webhook_url = f"{base}/api/webhook"
+    try:
+        async with httpx.AsyncClient() as client:
+            info_resp = await client.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo",
+                timeout=10,
+            )
+            info = info_resp.json().get("result", {})
+            current = info.get("url", "")
+
+            if current == webhook_url:
+                return "ok:already-set"
+
+            set_resp = await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+                json={
+                    "url": webhook_url,
+                    "allowed_updates": ["message", "callback_query"],
+                    "drop_pending_updates": False,
+                },
+                timeout=10,
+            )
+            set_result = set_resp.json()
+            if set_result.get("ok"):
+                return f"ok:set:{webhook_url}"
+            return f"error:{set_result.get('description', 'unknown')}"
+    except Exception as e:
+        return f"error:{e}"
 
 # =========================================================
 # ANTI-NUKE
@@ -576,6 +622,17 @@ async def handle_message(bot: Client, msg: dict):
         if user_identity_error:
             await reply_text(user_identity_error)
             return
+
+        if OWNER_DEBUG_NOTIFICATIONS:
+            await notify_owner(
+                bot,
+                (
+                    f"📨 Command received\n"
+                    f"User ID: `{user_id}`\n"
+                    f"Chat ID: `{chat_id}`\n"
+                    f"Command: `/{raw_cmd}`"
+                ),
+            )
 
         async def security_fail():
             try:
@@ -853,7 +910,17 @@ async def startup_event():
     log_msg("🚀 Server starting up...", "INFO")
     try:
         bot = await get_bot()
+        webhook_status = await ensure_webhook_registered()
         log_msg("✅ Bot initialized successfully", "INFO")
+        await notify_owner(
+            bot,
+            (
+                "✅ Bot is running on Koyeb\n"
+                f"Port: `{PORT}`\n"
+                f"Storage: `{STORAGE_PATH}`\n"
+                f"Webhook: `{webhook_status}`"
+            ),
+        )
     except Exception as e:
         log_msg(f"❌ Failed to initialize bot: {e}", "ERROR")
 
