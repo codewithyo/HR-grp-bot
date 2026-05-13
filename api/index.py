@@ -84,19 +84,20 @@ _cache = DataCache(ttl_seconds=60)  # 60-second cache TTL
 # =========================================================
 
 BOT_COMMANDS = [
-    {"command": "start",    "description": "Start Bot"},
-    {"command": "help",     "description": "Show command help"},
-    {"command": "happeal",  "description": "Appeal moderation case"},
-    {"command": "hauth",    "description": "Authorize Moderator"},
-    {"command": "hgrant",   "description": "Grant Permission"},
-    {"command": "hrevoke",  "description": "Revoke Permission"},
-    {"command": "hban",     "description": "Ban User"},
-    {"command": "hmute",    "description": "Mute User"},
-    {"command": "hwarn",    "description": "Warn User"},
-    {"command": "hdel",     "description": "Delete Message"},
-    {"command": "hprotect", "description": "Protect User"},
-    {"command": "hcase",    "description": "View Case"},
-    {"command": "hmodinfo", "description": "Moderator Info"},
+    {"command": "start",    "description": "🚀 Start the bot & view welcome message"},
+    {"command": "help",     "description": "📖 Display available commands for your role"},
+    {"command": "id",       "description": "🆔 Get user ID & profile information"},
+    {"command": "happeal",  "description": "📢 Appeal a moderation case (DM only)"},
+    {"command": "hauth",    "description": "🔐 Authorize a moderator (Owner)"},
+    {"command": "hgrant",   "description": "✅ Grant permission to moderator (Owner)"},
+    {"command": "hrevoke",  "description": "❌ Revoke permission from moderator (Owner)"},
+    {"command": "hban",     "description": "🚫 Ban a user from group"},
+    {"command": "hmute",    "description": "🔇 Mute a user in group"},
+    {"command": "hwarn",    "description": "⚠️ Issue warning to user"},
+    {"command": "hdel",     "description": "🗑️ Delete a message"},
+    {"command": "hprotect", "description": "🛡️ Protect user from moderation"},
+    {"command": "hcase",    "description": "📋 View moderation case details"},
+    {"command": "hmodinfo", "description": "👮 View moderator information"},
 ]
 
 VALID_PERMISSIONS = {"ban", "mute", "warn", "delete"}
@@ -845,24 +846,64 @@ def create_appeal(uid: int, case_id: str, message: str) -> str:
 def role_help_text(uid: int) -> str:
     if is_owner(uid):
         return (
-            "📘 **Owner Help**\n\n"
-            "General: /start, /help, /happeal <case_id> <msg>\n"
-            "Owner only: /hauth, /hgrant, /hrevoke, /hprotect\n"
-            "Moderation: /hban, /hmute, /hwarn, /hdel, /hcase, /hmodinfo\n\n"
-            "Timed actions: `/hban [id] 2h spam`  `/hmute [id] 30m abuse`\n"
-            "Reply to a message to target without passing user ID."
+            "╔════════════════════════════════════════╗\n"
+            "║  👑 OWNER COMMAND REFERENCE            ║\n"
+            "╚════════════════════════════════════════╝\n\n"
+            "🔐 **Authorization Commands:**\n"
+            "`/hauth <user_id>` - Authorize a moderator\n"
+            "`/hrevoke <perm> <user_id>` - Remove permission\n"
+            "`/hgrant <perm> <user_id>` - Grant permission\n"
+            "Permissions: ban, mute, warn, delete\n\n"
+            "🛡️ **Protection Commands:**\n"
+            "`/hprotect <user_id>` - Protect user from moderation\n\n"
+            "📋 **Moderation Commands:**\n"
+            "`/hban [user_id] [duration] [reason]` - Ban user\n"
+            "`/hmute [user_id] [duration] [reason]` - Mute user\n"
+            "`/hwarn [user_id] [reason]` - Warn user\n"
+            "`/hdel <msg_id>` - Delete message\n"
+            "`/hcase <case_id>` - View case details\n"
+            "`/hmodinfo [user_id]` - View moderator info\n\n"
+            "⏱️ **Duration Format:** 30m, 2h, 1d (for timed actions)\n\n"
+            "💡 **Tip:** Reply to a message to target without ID\n\n"
+            "📖 **Examples:**\n"
+            "`/hban @user 2h spam` - Ban for 2 hours\n"
+            "`/hmute 123456789 30m abuse` - Mute for 30 mins\n"
+            "`/hwarn @user off-topic` - Issue warning\n"
         )
     if is_authorized(uid):
         return (
-            "📘 **Moderator Help**\n\n"
-            "Commands: /hban, /hmute, /hwarn, /hdel, /hcase, /hmodinfo\n"
-            "Timed ban/mute: `/hban [user_id] 30m [reason]`\n"
-            "Reply to a user message to target without their ID."
+            "╔════════════════════════════════════════╗\n"
+            "║  👮 MODERATOR COMMAND REFERENCE       ║\n"
+            "╚════════════════════════════════════════╝\n\n"
+            "🚫 **Moderation Commands:**\n"
+            "`/hban [user_id] [duration] [reason]` - Ban user\n"
+            "`/hmute [user_id] [duration] [reason]` - Mute user\n"
+            "`/hwarn [user_id] [reason]` - Warn user\n"
+            "`/hdel <msg_id>` - Delete message\n\n"
+            "📋 **Information Commands:**\n"
+            "`/hcase <case_id>` - View case details\n"
+            "`/hmodinfo` - View your moderator info\n"
+            "`/id` - Get user information\n\n"
+            "⏱️ **Duration Format:** 30m, 2h, 1d (for timed actions)\n\n"
+            "💡 **Tip:** Reply to a message to target without ID\n\n"
+            "📖 **Examples:**\n"
+            "`/hban @user 30m spam` - Ban for 30 minutes\n"
+            "`/hwarn 123456789 off-topic` - Issue warning\n"
         )
     return (
-        "📘 **User Help**\n\n"
-        "Commands: /start, /help\n"
-        "Appeal a case in bot DM: `/happeal <case_id> <message>`"
+        "╔════════════════════════════════════════╗\n"
+        "║  👤 USER COMMAND REFERENCE            ║\n"
+        "╚════════════════════════════════════════╝\n\n"
+        "🆔 **Available Commands:**\n"
+        "`/start` - View welcome message\n"
+        "`/help` - Show this help message\n"
+        "`/id` - Get user ID & profile info\n\n"
+        "📢 **Appeals:**\n"
+        "Disputed a moderation action?\n"
+        "Use `/happeal <case_id> <message>` in bot DM\n\n"
+        "📞 **Support:**\n"
+        "Contact your group administrator for assistance\n\n"
+        "✨ *For more features, ask a group moderator*"
     )
 
 # =========================================================
@@ -1264,10 +1305,32 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /start ────────────────────────────────────────
         if raw_cmd == "start":
-            await reply_text(
-                "✅ **Advanced Moderation Bot**\n\n"
-                "Use /help to see your available commands."
+            start_msg = (
+                "╔══════════════════════════════════════╗\n"
+                "║  🤖 ADVANCED MODERATION BOT          ║\n"
+                "╚══════════════════════════════════════╝\n\n"
+                "👋 **Welcome to HR Group Moderation Bot**\n\n"
+                "🔹 **What I Do:**\n"
+                "• Manage group members with intelligent moderation\n"
+                "• Issue warnings and enforce progressive discipline\n"
+                "• Ban, mute, and protect users as needed\n"
+                "• Track all moderation cases with full audit trail\n"
+                "• Support appeals for disputed actions\n\n"
+                "🔹 **Quick Start:**\n"
+                "• Use /help to see commands for your role\n"
+                "• Use /id to get user information\n"
+                "• Use /happeal in DM to dispute moderation\n\n"
+                "🔹 **Features:**\n"
+                "✅ MongoDB persistence (data survives restarts)\n"
+                "✅ Real-time moderation with auto-delete\n"
+                "✅ Configurable warning thresholds\n"
+                "✅ Full permission management\n"
+                "✅ Complete case history & logging\n\n"
+                "📖 Type /help for available commands\n"
+                "🆘 Need help? Contact the group administrator\n\n"
+                "*Bot Status: ✅ Online & Operational*"
             )
+            await reply_text(start_msg)
             return
 
         # ── /help ─────────────────────────────────────────
