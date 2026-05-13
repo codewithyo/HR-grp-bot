@@ -1220,8 +1220,8 @@ async def temp_action_worker():
 
 app = FastAPI(title="Moderation Bot")
 
-# ── Root endpoint (fixes 404 on GET /) ──────────────────
-@app.get("/")
+# ── Root endpoint ──────────────────
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {
         "service":   "Telegram Moderation Bot",
