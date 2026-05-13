@@ -34,6 +34,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from pyrogram import Client
+from db import mongo_db
 # Pyrogram is used only for: get_me(), get_chat(), get_dialogs(),
 # get_chat_member(), get_chat_history(), download_media().
 # All moderation actions (ban/mute/restrict/delete) go through
@@ -163,6 +164,43 @@ FILE_LABEL = {
     APPEALS_FILE:      "appeals",
 }
 
+MONGO_LOADERS = {
+    AUTH_FILE: mongo_db.load_auth,
+    WARN_FILE: mongo_db.load_warns,
+    CASE_FILE: mongo_db.load_cases,
+    PROTECT_FILE: mongo_db.load_protected,
+    ABUSE_FILE: mongo_db.load_abuse,
+    TEMP_ACTIONS_FILE: mongo_db.load_temp_actions,
+    APPEALS_FILE: mongo_db.load_appeals,
+}
+
+MONGO_SAVERS = {
+    AUTH_FILE: mongo_db.save_auth,
+    WARN_FILE: mongo_db.save_warns,
+    CASE_FILE: mongo_db.save_cases,
+    PROTECT_FILE: mongo_db.save_protected,
+    ABUSE_FILE: mongo_db.save_abuse,
+    TEMP_ACTIONS_FILE: mongo_db.save_temp_actions,
+    APPEALS_FILE: mongo_db.save_appeals,
+}
+
+def _read_local_json(file: str):
+    if not os.path.exists(file):
+        return None
+    try:
+        with open(file, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _write_local_json(file: str, data):
+    Path(file).parent.mkdir(parents=True, exist_ok=True)
+    with open(file, "w") as f:
+        json.dump(data, f, indent=2)
+
+def _is_empty_payload(data) -> bool:
+    return data is None or data == {} or data == []
+
 def ensure_json_file(path: str):
     if os.path.exists(path):
         return
@@ -196,7 +234,20 @@ def load(file: str):
     try:
         if os.path.exists(file):
             with open(file, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+            loader = MONGO_LOADERS.get(file)
+            if loader and _is_empty_payload(data) and mongo_db.is_connected():
+                remote = loader()
+                if not _is_empty_payload(remote):
+                    _write_local_json(file, remote)
+                    return remote
+            return data
+        loader = MONGO_LOADERS.get(file)
+        if loader and mongo_db.is_connected():
+            remote = loader()
+            if not _is_empty_payload(remote):
+                _write_local_json(file, remote)
+            return remote if remote is not None else {}
         fallback = FALLBACK_FILE_MAP.get(file)
         if fallback and os.path.exists(fallback):
             with open(fallback, "r") as f:
@@ -237,8 +288,24 @@ def save(file: str, data):
             with open(f"{fallback}.tmp", "w") as f:
                 json.dump(data, f, indent=2)
             os.replace(f"{fallback}.tmp", fallback)
+        saver = MONGO_SAVERS.get(file)
+        if saver and mongo_db.is_connected():
+            saver(data)
     except Exception as e:
         log_msg(f"ERROR saving {file}: {e}", "ERROR")
+
+def sync_storage_with_mongo():
+    if not mongo_db.is_connected():
+        return
+    for file, loader in MONGO_LOADERS.items():
+        local_data = _read_local_json(file)
+        remote_data = loader()
+        if not _is_empty_payload(local_data):
+            saver = MONGO_SAVERS.get(file)
+            if saver:
+                saver(local_data)
+        elif not _is_empty_payload(remote_data):
+            _write_local_json(file, remote_data)
 
 # =========================================================
 # BOT API HELPER (httpx) — avoids Pyrogram peer-ID issues
@@ -564,6 +631,16 @@ def load_temp_actions() -> list:
 
 def save_temp_actions(actions: list):
     save(TEMP_ACTIONS_FILE, actions)
+
+def schedule_message_delete(chat_id: int, message_id: int, delay: int = 60):
+    actions = load_temp_actions()
+    actions.append({
+        "type": "delete",
+        "chat_id": chat_id,
+        "target_id": message_id,
+        "until_ts": int(time.time()) + delay,
+    })
+    save_temp_actions(actions)
 
 def parse_duration_token(token: str) -> int | None:
     if not token or len(token) < 2:
@@ -897,6 +974,8 @@ async def process_due_temp_actions(bot: Client):
                 ok, err = await api_unban(chat_id, target_id)
                 msg_text = f"🔓 Temporary ban ended for `{target_id}`" if ok else f"⚠️ Auto-unban failed for `{target_id}`: {err}"
                 await tg_send(chat_id, msg_text)
+            elif atype == "delete":
+                await tg_delete(chat_id, target_id)
         except Exception as e:
             log_msg(f"temp action error {action}: {e}", "ERROR")
             pending.append(action)
@@ -998,7 +1077,15 @@ async def handle_message(bot: Client, msg: dict):
         log_msg(f"/{raw_cmd} from uid={uid} chat={chat_id}", "INFO")
 
         async def reply_text(t: str):
-            await tg_send(chat_id, t, reply_to=msg_id)
+            sent = await tg_send(chat_id, t, reply_to=msg_id)
+            if msg.get("chat", {}).get("type") != "private" and sent.get("ok"):
+                result = sent.get("result", {})
+                reply_message_id = result.get("message_id")
+                if reply_message_id:
+                    schedule_message_delete(chat_id, reply_message_id)
+
+        if msg.get("chat", {}).get("type") != "private":
+            schedule_message_delete(chat_id, msg_id)
 
         if err:
             await reply_text(err)
@@ -1034,6 +1121,87 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd == "help":
             await reply_text(role_help_text(uid))
             return
+
+        # ── /id ───────────────────────────────────────────
+        if raw_cmd == "id":
+            try:
+                target_id = None
+                target_user = None
+                
+                # Mode 1: /id me
+                if args and args[0].lower() == "me":
+                    target_id = uid
+                
+                # Mode 2: /id @username
+                elif args and args[0].startswith("@"):
+                    username = args[0][1:]  # Remove @
+                    try:
+                        bot = await get_bot()
+                        target_user = await bot.get_user(username)
+                        target_id = target_user.id
+                    except Exception as e:
+                        return await reply_text(f"❌ User @{username} not found: {str(e)}")
+                
+                # Mode 3: /id <raw_id>
+                elif args and args[0].isdigit():
+                    parsed_id = parse_positive_user_id(args[0])
+                    if parsed_id:
+                        target_id = parsed_id
+                        try:
+                            bot = await get_bot()
+                            target_user = await bot.get_user(target_id)
+                        except Exception as e:
+                            return await reply_text(f"❌ User ID {target_id} not found: {str(e)}")
+                    else:
+                        return await reply_text("❌ Invalid user ID.")
+                
+                # Mode 4: /id (reply to message)
+                elif reply:
+                    target_dict, tid, err = resolve_target(reply, [], 0)
+                    if tid:
+                        target_id = tid
+                        try:
+                            bot = await get_bot()
+                            target_user = await bot.get_user(target_id)
+                        except Exception:
+                            # Fallback if get_user fails
+                            pass
+                    else:
+                        return await reply_text("❌ Reply to a user or use /id @username, /id me, or /id <user_id>")
+                else:
+                    return await reply_text("❌ Reply to a user or use /id @username, /id me, or /id <user_id>")
+                
+                # Build profile card
+                if target_id is None:
+                    return await reply_text("❌ Could not determine target user.")
+                
+                first_name = target_user.first_name if target_user and target_user.first_name else "User"
+                last_name = target_user.last_name if target_user and target_user.last_name else ""
+                username = target_user.username if target_user and target_user.username else None
+                
+                # Format the response
+                response = f"👤 **User Profile**\n\n"
+                response += f"🆔 ID: `{target_id}`\n"
+                response += f"📝 Name: {first_name}"
+                if last_name:
+                    response += f" {last_name}"
+                response += f"\n"
+                if username:
+                    response += f"🔗 Username: @{username}\n"
+                    response += f"📌 Link: [Profile](tg://user?id={target_id})"
+                else:
+                    response += f"🔗 Link: [Profile](tg://user?id={target_id})"
+                
+                # Send to owner's DM if owner uses /id in a group, otherwise reply in chat
+                is_group = msg.get("chat", {}).get("type") != "private"
+                if is_owner(uid) and is_group:
+                    await notify_owner(response)
+                else:
+                    await reply_text(response)
+                return
+            except Exception as e:
+                log_msg(f"Error in /id command: {e}\n{traceback.format_exc()}", "ERROR")
+                return await reply_text(f"❌ Error: {str(e)}")
 
         # ── /happeal ──────────────────────────────────────
         if raw_cmd == "happeal":
@@ -1381,6 +1549,8 @@ async def startup_event():
     global _temp_worker_task
     log_msg("🚀 Starting up...", "INFO")
     try:
+        mongo_db.connect()
+        sync_storage_with_mongo()
         bot = await get_bot()
 
         # 1. Resolve / auto-detect the log group
@@ -1428,6 +1598,7 @@ async def shutdown_event():
         except asyncio.CancelledError:
             pass
     await shutdown_bot()
+    mongo_db.disconnect()
 
 # =========================================================
 # MAIN

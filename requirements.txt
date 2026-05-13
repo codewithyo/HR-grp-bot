@@ -12,3 +12,6 @@ httpx
 
 # ASGI server for local runs and container startup
 uvicorn[standard]
+
+# MongoDB database driver for persistent data storage
+pymongo>=4.0
