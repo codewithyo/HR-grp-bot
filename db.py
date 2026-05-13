@@ -68,7 +68,7 @@ class MongoDBHandler:
     def _create_indexes(self):
         """Create necessary indexes for collections to improve query performance."""
         try:
-            if self.db:
+            if self.db is not None:
                 for collection_name in self.collections.values():
                     self.db[collection_name].create_index("_id", unique=True)
                     # Create index for faster lookups by updated_at for cache invalidation
@@ -108,7 +108,7 @@ class MongoDBHandler:
     
     def is_connected(self) -> bool:
         """Check if MongoDB is connected (fast check using client state)."""
-        if not self.connected or not self.db:
+        if not self.connected or self.db is None:
             return False
         try:
             # Use ismaster which is faster than ping
@@ -184,7 +184,7 @@ class MongoDBHandler:
     
     def disconnect(self):
         """Disconnect from MongoDB and close connection pool."""
-        if self.client:
+        if self.client is not None:
             self.client.close()
             self.connected = False
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] MongoDB disconnected", flush=True)
