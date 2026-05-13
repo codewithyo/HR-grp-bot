@@ -1,8 +1,0 @@
-API_ID       = int(os.environ.get("API_ID", "9605646"))
-API_HASH     = os.environ.get("API_HASH", "822d45aa548a53682a458efa1933e4c9")
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "your_bot_token_here")
-OWNER_ID     = int(os.environ.get("OWNER_ID", "8457503781"))
-LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "-1003834934514"))
-
-MONGODB_URI     = os.environ.get("MONGODB_URI", "mongodb+srv://yatink9678:Yatin123@cluster0.auwzkl.mongodb.net/?appName=Cluster0")
-MONGODB_DB_NAME = os.environ.get("MONGODB_DB_NAME", "hr_moderation_bot")
