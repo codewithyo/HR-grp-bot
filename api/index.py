@@ -1005,18 +1005,31 @@ async def resolve_log_group(bot: Client):
         # Verify the configured group is accessible
         try:
             chat = await bot.get_chat(_log_group_id)
-            log_msg(f"✅ Log group confirmed: {chat.title} ({_log_group_id})", "INFO")
+            log_msg(f"✅ Log group confirmed: {chat.title} ()", "INFO")
             _tg_backup_enabled = True
             if _backup_chat_id == 0:
                 _backup_chat_id = _log_group_id
             return
         except Exception as e:
-            log_msg(f"WARNING: configured LOG_GROUP_ID {_log_group_id} inaccessible: {e}", "WARNING")
-            log_msg("Set a valid LOG_GROUP_ID in env vars; auto-detection is not available for bots.", "INFO")
+            log_msg(
+                f"⚠️ LOG_GROUP_ID={_log_group_id} is configured but inaccessible: {e}. "
+                "Ensure the bot is a member/admin of that group.",
+                "WARNING",
+            )
+            _tg_backup_enabled = True          # keep trying; bot may be added later
+            if _backup_chat_id == 0:
+                _backup_chat_id = _log_group_id
+            await tg_send(
+                OWNER_ID,
+                f"⚠️ LOG_GROUP_ID `{_log_group_id}` is set but the bot can't access that chat.\n"
+                "Add the bot as an admin to the log group, then restart.",
+            )
+            return                             # ← critical: don't fall through to auto-detect
 
+    # Only reached when LOG_GROUP_ID == 0
     groups = await detect_admin_groups(bot)
     if not groups:
-        log_msg("⚠️ LOG_GROUP_ID is not set. Auto-detection is not available for bots; log messages will be skipped.", "WARNING")
+        log_msg("⚠️ LOG_GROUP_ID is not set. Set it in Koyeb env vars; log messages will be skipped.", "WARNING")
         await tg_send(OWNER_ID, "⚠️ Set LOG_GROUP_ID in Koyeb env vars. Auto-detection is not available for bots.")
         return
 
@@ -1827,7 +1840,9 @@ async def startup_event():
         # 1. Resolve / auto-detect the log group
         await resolve_log_group(bot)
 
+        
         # 2. Restore data from Telegram backup (survives ephemeral FS)
+        restored = 0                           # ← must be initialised before the branch
         if _tg_backup_enabled and get_backup_chat() != 0:
             restored = await restore_from_telegram_pyrogram(bot)
             if restored:
