@@ -1219,6 +1219,21 @@ async def temp_action_worker():
 # =========================================================
 
 app = FastAPI(title="Moderation Bot")
+@app.on_event("startup")
+async def startup_event():
+    global _temp_worker_task
+
+    log_msg("Starting bot...", "INFO")
+
+    bot = await get_bot()
+
+    await resolve_log_group(bot)
+
+    await sync_commands()
+
+    _temp_worker_task = asyncio.create_task(temp_action_worker())
+
+    log_msg("✅ Bot fully started", "INFO")
 
 # ── Root endpoint ──────────────────
 @app.api_route("/", methods=["GET", "HEAD"])
