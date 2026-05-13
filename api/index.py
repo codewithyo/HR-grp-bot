@@ -86,7 +86,7 @@ _cache = DataCache(ttl_seconds=60)  # 60-second cache TTL
 BOT_COMMANDS = [
     {"command": "start",    "description": "🚀 Start the bot & view welcome message"},
     {"command": "help",     "description": "📖 Display available commands for your role"},
-    {"command": "id",       "description": "🆔 Get user ID & profile information"},
+    {"command": "hr",       "description": "🆔 Get user ID & profile information"},
     {"command": "happeal",  "description": "📢 Appeal a moderation case (DM only)"},
     {"command": "hauth",    "description": "🔐 Authorize a moderator (Owner)"},
     {"command": "hgrant",   "description": "✅ Grant permission to moderator (Owner)"},
@@ -581,6 +581,9 @@ async def restore_from_telegram() -> dict[str, bool]:
 
 async def restore_from_telegram_pyrogram(bot: Client) -> int:
     """Use Pyrogram to scan backup chat history for MODBOT_BACKUP captions."""
+    if not _tg_backup_enabled:
+        return 0
+
     backup_chat = get_backup_chat()
     if backup_chat == 0:
         return 0
@@ -701,15 +704,32 @@ def make_mention(user: dict) -> str:
     name  = ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip() or "User"
     return f"[{name}](tg://user?id={uid})" if uid else name
 
-def extract_actor_user_id(msg: dict) -> tuple[int | None, str | None]:
-    from_user = msg.get("from") if isinstance(msg, dict) else None
+def extract_actor_user_id(msg: dict) -> tuple[int | None, str | None, bool]:
+    """Resolve actor ID and detect anonymous admin messages.
+
+    Returns (actor_uid, error_text, is_anonymous_admin).
+    For anonymous admins in groups/supergroups, actor_uid is a stable negative key per chat.
+    """
+    if not isinstance(msg, dict):
+        return None, "❌ Could not identify your Telegram account.", False
+
+    sender_chat = msg.get("sender_chat")
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    chat_type = chat.get("type")
+    if isinstance(sender_chat, dict):
+        sender_chat_id = sender_chat.get("id")
+        # Anonymous admin sends as the same supergroup/group chat.
+        if sender_chat_id == chat_id and chat_type in ("group", "supergroup"):
+            return -abs(int(chat_id)), None, True
+        return None, "❌ Channel messages are not supported for moderation commands.", False
+
+    from_user = msg.get("from")
     if isinstance(from_user, dict):
         uid = from_user.get("id")
         if isinstance(uid, int) and uid > 0:
-            return uid, None
-    if msg.get("sender_chat"):
-        return None, "❌ Anonymous admin/channel messages are not supported."
-    return None, "❌ Could not identify your Telegram account."
+            return uid, None, False
+    return None, "❌ Could not identify your Telegram account.", False
 
 def extract_reply_user(reply: dict) -> tuple[dict, int | None]:
     if not isinstance(reply, dict):
@@ -890,7 +910,7 @@ def role_help_text(uid: int) -> str:
             "📋 **Information Commands:**\n"
             "`/hcase <case_id>` - View case details\n"
             "`/hmodinfo` - View your moderator info\n"
-            "`/id` - Get user information\n\n"
+            "`/hr` - Get user information\n\n"
             "⏱️ **Duration Format:** 30m, 2h, 1d (for timed actions)\n\n"
             "💡 **Tip:** Reply to a message to target without ID\n\n"
             "📖 **Examples:**\n"
@@ -904,7 +924,7 @@ def role_help_text(uid: int) -> str:
         "🆔 **Available Commands:**\n"
         "`/start` - View welcome message\n"
         "`/help` - Show this help message\n"
-        "`/id` - Get user ID & profile info\n\n"
+        "`/hr` - Get user ID & profile info\n\n"
         "📢 **Appeals:**\n"
         "Disputed a moderation action?\n"
         "Use `/happeal <case_id> <message>` in bot DM\n\n"
@@ -992,7 +1012,7 @@ async def resolve_log_group(bot: Client):
             return
         except Exception as e:
             log_msg(f"WARNING: configured LOG_GROUP_ID {_log_group_id} inaccessible: {e}", "WARNING")
-            log_msg("Attempting auto-detection...", "INFO")
+            log_msg("Set a valid LOG_GROUP_ID in env vars; auto-detection is not available for bots.", "INFO")
 
     groups = await detect_admin_groups(bot)
     if not groups:
@@ -1255,14 +1275,15 @@ async def handle_message(bot: Client, msg: dict):
 
         chat_id  = msg["chat"]["id"]
         msg_id   = msg["message_id"]
-        uid, err = extract_actor_user_id(msg)
+        uid, err, is_anon_admin = extract_actor_user_id(msg)
         reply    = msg.get("reply_to_message") or {}
 
         parts   = text.split(None, 1)
         raw_cmd = parts[0].split("@")[0].lstrip("/").lower()
         args    = parts[1].split() if len(parts) > 1 else []
 
-        log_msg(f"/{raw_cmd} from uid={uid} chat={chat_id}", "INFO")
+        actor_label = f"anon_admin:{chat_id}" if is_anon_admin else str(uid)
+        log_msg(f"/{raw_cmd} from actor={actor_label} chat={chat_id}", "INFO")
 
         async def reply_text(t: str):
             sent = await tg_send(chat_id, t, reply_to=msg_id)
@@ -1280,19 +1301,36 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         if OWNER_DEBUG_NOTIFICATIONS and raw_cmd not in ("start", "help"):
-            await notify_owner(f"📨 /{raw_cmd}\nUser: `{uid}`\nChat: `{chat_id}`")
+            await notify_owner(f"📨 /{raw_cmd}\nActor: `{actor_label}`\nChat: `{chat_id}`")
+
+        def is_owner_actor() -> bool:
+            return (not is_anon_admin) and is_owner(uid)
+
+        def is_authorized_actor() -> bool:
+            return is_anon_admin or is_authorized(uid)
+
+        def is_frozen_actor() -> bool:
+            return False if is_anon_admin else is_frozen(uid)
+
+        def has_permission_actor(perm: str) -> bool:
+            return True if is_anon_admin else has_permission(uid, perm)
+
+        def actor_mod_info() -> dict:
+            if is_anon_admin:
+                return {"badge": "🎭 Anonymous Admin", "mod_id": f"ANON-{abs(chat_id)}"}
+            return get_mod_info(uid)
 
         async def security_fail():
             await tg_delete(chat_id, msg_id)
 
         async def check_mod(perm: str) -> bool:
-            if not is_authorized(uid):
+            if not is_authorized_actor():
                 await security_fail()
                 return False
-            if is_frozen(uid):
+            if is_frozen_actor():
                 await reply_text("🚫 Your moderator account is frozen.")
                 return False
-            if not has_permission(uid, perm):
+            if not has_permission_actor(perm):
                 await reply_text(f"❌ You don't have `{perm}` permission.")
                 return False
             return True
@@ -1312,7 +1350,7 @@ async def handle_message(bot: Client, msg: dict):
                 "• Support appeals for disputed actions\n\n"
                 "🔹 **Quick Start:**\n"
                 "• Use /help to see commands for your role\n"
-                "• Use /id to get user information\n"
+                "• Use /hr to get user information\n"
                 "• Use /happeal in DM to dispute moderation\n\n"
                 "🔹 **Features:**\n"
                 "✅ MongoDB persistence (data survives restarts)\n"
@@ -1329,20 +1367,30 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /help ─────────────────────────────────────────
         if raw_cmd == "help":
-            await reply_text(role_help_text(uid))
+            if is_anon_admin:
+                await reply_text(
+                    "🎭 **Anonymous Admin Mode**\n\n"
+                    "You can use moderation commands while posting anonymously:\n"
+                    "`/hban`, `/hmute`, `/hwarn`, `/hdel`, `/hcase`, `/hmodinfo`, `/hr`\n\n"
+                    "Owner-only commands (`/hauth`, `/hgrant`, `/hrevoke`, `/hprotect`) require a normal account identity."
+                )
+            else:
+                await reply_text(role_help_text(uid))
             return
 
-        # ── /id ───────────────────────────────────────────
-        if raw_cmd == "id":
+        # ── /hr (/id legacy alias) ────────────────────────
+        if raw_cmd in ("hr", "id"):
             try:
                 target_id = None
                 target_user = None
                 
-                # Mode 1: /id me
+                # Mode 1: /hr me
                 if args and args[0].lower() == "me":
+                    if is_anon_admin:
+                        return await reply_text("❌ `me` is unavailable in anonymous mode. Use reply/@username/user_id.")
                     target_id = uid
                 
-                # Mode 2: /id @username
+                # Mode 2: /hr @username
                 elif args and args[0].startswith("@"):
                     username = args[0][1:]  # Remove @
                     try:
@@ -1352,7 +1400,7 @@ async def handle_message(bot: Client, msg: dict):
                     except Exception as e:
                         return await reply_text(f"❌ User @{username} not found: {str(e)}")
                 
-                # Mode 3: /id <raw_id>
+                # Mode 3: /hr <raw_id>
                 elif args and args[0].isdigit():
                     parsed_id = parse_positive_user_id(args[0])
                     if parsed_id:
@@ -1365,7 +1413,7 @@ async def handle_message(bot: Client, msg: dict):
                     else:
                         return await reply_text("❌ Invalid user ID.")
                 
-                # Mode 4: /id (reply to message)
+                # Mode 4: /hr (reply to message)
                 elif reply:
                     target_dict, tid, err = resolve_target(reply, [], 0)
                     if tid:
@@ -1377,9 +1425,9 @@ async def handle_message(bot: Client, msg: dict):
                             # Fallback if get_user fails
                             pass
                     else:
-                        return await reply_text("❌ Reply to a user or use /id @username, /id me, or /id <user_id>")
+                        return await reply_text("❌ Reply to a user or use /hr @username, /hr me, or /hr <user_id>")
                 else:
-                    return await reply_text("❌ Reply to a user or use /id @username, /id me, or /id <user_id>")
+                    return await reply_text("❌ Reply to a user or use /hr @username, /hr me, or /hr <user_id>")
                 
                 # Build profile card
                 if target_id is None:
@@ -1402,15 +1450,15 @@ async def handle_message(bot: Client, msg: dict):
                 else:
                     response += f"🔗 Link: [Profile](tg://user?id={target_id})"
                 
-                # Send to owner's DM if owner uses /id in a group, otherwise reply in chat
+                # Send to owner's DM if owner uses /hr in a group, otherwise reply in chat
                 is_group = msg.get("chat", {}).get("type") != "private"
-                if is_owner(uid) and is_group:
+                if is_owner_actor() and is_group:
                     await notify_owner(response)
                 else:
                     await reply_text(response)
                 return
             except Exception as e:
-                log_msg(f"Error in /id command: {e}\n{traceback.format_exc()}", "ERROR")
+                log_msg(f"Error in /hr command: {e}\n{traceback.format_exc()}", "ERROR")
                 return await reply_text(f"❌ Error: {str(e)}")
 
         # ── /happeal ──────────────────────────────────────
@@ -1426,7 +1474,7 @@ async def handle_message(bot: Client, msg: dict):
             cases = load(CASE_FILE)
             if case_id not in cases:
                 return await reply_text("❌ Case not found.")
-            if int(cases[case_id].get("target", 0)) != uid and not is_owner(uid):
+            if int(cases[case_id].get("target", 0)) != uid and not is_owner_actor():
                 return await reply_text("❌ You can only appeal your own case.")
             aid = create_appeal(uid, case_id, appeal_msg)
             await reply_text(f"✅ Appeal submitted. Appeal ID: #{aid}")
@@ -1437,7 +1485,7 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /hauth ────────────────────────────────────────
         if raw_cmd in ("hauth", "ha"):
-            if not is_owner(uid):
+            if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
             target, tid, terr = resolve_target(reply, args, 0)
             if not tid:
@@ -1462,7 +1510,7 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /hgrant ───────────────────────────────────────
         if raw_cmd in ("hgrant", "hg"):
-            if not is_owner(uid):
+            if not is_owner_actor():
                 return
             if not args:
                 return await reply_text(
@@ -1485,8 +1533,8 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # ── /hrevoke ──────────────────────────────────────
-        if raw_cmd in ("hrevoke", "hr"):
-            if not is_owner(uid):
+        if raw_cmd in ("hrevoke", "hrev"):
+            if not is_owner_actor():
                 return
             if not args:
                 return await reply_text("Usage: /hrevoke <permission> <user_id>")
@@ -1541,7 +1589,7 @@ async def handle_message(bot: Client, msg: dict):
                 save_temp_actions(actions)
                 reason = f"{reason} | Duration: {format_duration(dur)}"
             case_id = create_case("BAN", uid, tid, reason)
-            await send_action_log(chat_id, msg_id, "BAN", target, reason, case_id, get_mod_info(uid))
+            await send_action_log(chat_id, msg_id, "BAN", target, reason, case_id, actor_mod_info())
             return
 
         # ── /hmute ────────────────────────────────────────
@@ -1570,7 +1618,7 @@ async def handle_message(bot: Client, msg: dict):
                 save_temp_actions(actions)
                 reason = f"{reason} | Duration: {format_duration(dur)}"
             case_id = create_case("MUTE", uid, tid, reason)
-            await send_action_log(chat_id, msg_id, "MUTE", target, reason, case_id, get_mod_info(uid))
+            await send_action_log(chat_id, msg_id, "MUTE", target, reason, case_id, actor_mod_info())
             return
 
         # ── /hwarn ────────────────────────────────────────
@@ -1589,7 +1637,7 @@ async def handle_message(bot: Client, msg: dict):
             save(WARN_FILE, warns)
             case_id = create_case("WARN", uid, tid, reason)
             await send_action_log(
-                chat_id, msg_id, "WARN", target, reason, case_id, get_mod_info(uid),
+                chat_id, msg_id, "WARN", target, reason, case_id, actor_mod_info(),
                 extra=f"📊 Total Warns: {warns[key]}",
             )
             return
@@ -1611,14 +1659,14 @@ async def handle_message(bot: Client, msg: dict):
             case_id = create_case("DELETE", uid, tid, "Message Deleted")
             await send_action_log(
                 chat_id, msg_id, "DELETE", target, "Message Deleted",
-                case_id, get_mod_info(uid),
+                case_id, actor_mod_info(),
                 extra=f"💬 Content: {deleted_text[:200]}",
             )
             return
 
         # ── /hprotect ─────────────────────────────────────
         if raw_cmd in ("hprotect", "hp"):
-            if not is_owner(uid):
+            if not is_owner_actor():
                 return
             target, tid, terr = resolve_target(reply, args, 0)
             if not tid:
@@ -1634,7 +1682,7 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /hcase ────────────────────────────────────────
         if raw_cmd in ("hcase", "hc"):
-            if not is_authorized(uid):
+            if not is_authorized_actor():
                 return
             if not args:
                 return await reply_text("Usage: /hcase <case_id>")
@@ -1654,7 +1702,20 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /hmodinfo ─────────────────────────────────────
         if raw_cmd in ("hmodinfo", "hmi"):
-            if not is_authorized(uid):
+            if not is_authorized_actor():
+                return
+            if is_anon_admin and not reply and not args:
+                await reply_text(
+                    "👮 **Moderator Info**\n\n"
+                    f"🆔 Mod ID: `ANON-{abs(chat_id)}`\n"
+                    "🎭 Anonymous Admin\n"
+                    "Status: 🟢 Active\n\n"
+                    "**Permissions:**\n"
+                    "  ✅ ban\n"
+                    "  ✅ mute\n"
+                    "  ✅ warn\n"
+                    "  ✅ delete"
+                )
                 return
             lookup = uid
             if reply:
@@ -1767,9 +1828,12 @@ async def startup_event():
         await resolve_log_group(bot)
 
         # 2. Restore data from Telegram backup (survives ephemeral FS)
-        restored = await restore_from_telegram_pyrogram(bot)
-        if restored:
-            log_msg(f"✅ Restored {restored} file(s) from Telegram backup", "INFO")
+        if _tg_backup_enabled and get_backup_chat() != 0:
+            restored = await restore_from_telegram_pyrogram(bot)
+            if restored:
+                log_msg(f"✅ Restored {restored} file(s) from Telegram backup", "INFO")
+        else:
+            log_msg("Telegram backup restore skipped: LOG_GROUP_ID/BACKUP_CHAT_ID not configured or inaccessible.", "INFO")
 
         # 3. Webhook + commands
         wh_status  = await ensure_webhook()
