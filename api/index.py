@@ -1261,13 +1261,10 @@ async def bot_status():
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
-
 @app.get("/api/setup_webhook")
-async def setup_webhook_endpoint(request: Request):
-    base = str(request.base_url).rstrip("/")
-    base = base.replace("http://", "https://")
+async def setup_webhook_endpoint():
 
-    webhook_url = f"{base}/api/webhook"
+    webhook_url = "https://objective-jorey-yatinbst-00b7f95b.koyeb.app/api/webhook"
 
     result = await tg_api("setWebhook", json={
         "url": webhook_url,
@@ -1284,7 +1281,6 @@ async def setup_webhook_endpoint(request: Request):
         "commands": cmds,
         "info": info
     }
-
 # ── Webhook ──────────────────────────────────────────────
 @app.post("/api/webhook")
 async def webhook(request: Request):
