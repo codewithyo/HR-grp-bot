@@ -590,6 +590,13 @@ async def restore_from_telegram_pyrogram(bot: Client) -> int:
     seen_labels: set[str] = set()
 
     try:
+        # Validate chat access first to avoid noisy PeerIdInvalid errors on startup.
+        try:
+            await bot.get_chat(backup_chat)
+        except Exception as e:
+            log_msg(f"Backup restore skipped: chat {backup_chat} is not accessible ({e})", "WARNING")
+            return 0
+
         async for msg in bot.get_chat_history(backup_chat, limit=500):
             caption = (msg.caption or "") + (msg.text or "")
             if not caption.startswith("MODBOT_BACKUP:"):
@@ -625,7 +632,7 @@ async def restore_from_telegram_pyrogram(bot: Client) -> int:
                 break
 
     except Exception as e:
-        log_msg(f"restore_from_telegram_pyrogram error: {e}", "WARNING")
+        log_msg(f"restore_from_telegram_pyrogram skipped: {e}", "WARNING")
 
     return restored_count
 
@@ -966,22 +973,9 @@ async def shutdown_bot():
 # =========================================================
 
 async def detect_admin_groups(bot: Client) -> list[int]:
-    """Return list of group/supergroup chat IDs where the bot is admin."""
-    groups = []
-    try:
-        async for dialog in bot.get_dialogs():
-            chat = dialog.chat
-            if chat.type.value not in ("group", "supergroup", "channel"):
-                continue
-            try:
-                me = await bot.get_chat_member(chat.id, "me")
-                if me.status.value in ("administrator", "creator"):
-                    groups.append(chat.id)
-            except Exception:
-                pass
-    except Exception as e:
-        log_msg(f"detect_admin_groups error: {e}", "WARNING")
-    return groups
+    """Bots cannot list dialogs via MTProto; return empty and require explicit LOG_GROUP_ID."""
+    _ = bot
+    return []
 
 async def resolve_log_group(bot: Client):
     """Set _log_group_id and _backup_chat_id; auto-detect if LOG_GROUP_ID == 0."""
@@ -1002,8 +996,8 @@ async def resolve_log_group(bot: Client):
 
     groups = await detect_admin_groups(bot)
     if not groups:
-        log_msg("⚠️ No admin groups found. Log messages will be skipped.", "WARNING")
-        await tg_send(OWNER_ID, "⚠️ Bot started but no admin group found. Set LOG_GROUP_ID.")
+        log_msg("⚠️ LOG_GROUP_ID is not set. Auto-detection is not available for bots; log messages will be skipped.", "WARNING")
+        await tg_send(OWNER_ID, "⚠️ Set LOG_GROUP_ID in Koyeb env vars. Auto-detection is not available for bots.")
         return
 
     _log_group_id = groups[0]
