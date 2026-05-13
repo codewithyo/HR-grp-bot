@@ -26,15 +26,54 @@
 # =========================================================
 
 import os, json, time, random, string, asyncio, httpx
-import traceback, sys, shutil, io
+import traceback, sys, shutil, io, threading
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from pyrogram import Client
 from db import mongo_db
+
+# =========================================================
+# CACHING LAYER — reduces disk/db I/O dramatically
+# =========================================================
+
+class DataCache:
+    """Thread-safe in-memory cache with TTL."""
+    def __init__(self, ttl_seconds: int = 60):
+        self.cache: Dict[str, tuple[Any, float]] = {}
+        self.lock = threading.RLock()
+        self.ttl = ttl_seconds
+    
+    def get(self, key: str) -> Any:
+        with self.lock:
+            if key not in self.cache:
+                return None
+            data, ts = self.cache[key]
+            if time.time() - ts > self.ttl:
+                del self.cache[key]
+                return None
+            return data
+    
+    def set(self, key: str, data: Any):
+        with self.lock:
+            self.cache[key] = (data, time.time())
+    
+    def invalidate(self, key: str = None):
+        with self.lock:
+            if key:
+                self.cache.pop(key, None)
+            else:
+                self.cache.clear()
+    
+    def keys(self):
+        with self.lock:
+            return list(self.cache.keys())
+
+_cache = DataCache(ttl_seconds=60)  # 60-second cache TTL
 # Pyrogram is used only for: get_me(), get_chat(), get_dialogs(),
 # get_chat_member(), get_chat_history(), download_media().
 # All moderation actions (ban/mute/restrict/delete) go through
@@ -137,6 +176,7 @@ Path(STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 AUTH_FILE         = f"{STORAGE_PATH}/auth.json"
 WARN_FILE         = f"{STORAGE_PATH}/warns.json"
 CASE_FILE         = f"{STORAGE_PATH}/cases.json"
+WARN_CONFIG_FILE   = f"{STORAGE_PATH}/warn_config.json"
 PROTECT_FILE      = f"{STORAGE_PATH}/protected.json"
 ABUSE_FILE        = f"{STORAGE_PATH}/abuse.json"
 TEMP_ACTIONS_FILE = f"{STORAGE_PATH}/temp_actions.json"
@@ -146,6 +186,7 @@ FALLBACK_FILE_MAP = {
     AUTH_FILE:         f"{FALLBACK_STORAGE_PATH}/auth.json",
     WARN_FILE:         f"{FALLBACK_STORAGE_PATH}/warns.json",
     CASE_FILE:         f"{FALLBACK_STORAGE_PATH}/cases.json",
+        WARN_CONFIG_FILE:  f"{FALLBACK_STORAGE_PATH}/warn_config.json",
     PROTECT_FILE:      f"{FALLBACK_STORAGE_PATH}/protected.json",
     ABUSE_FILE:        f"{FALLBACK_STORAGE_PATH}/abuse.json",
     TEMP_ACTIONS_FILE: f"{FALLBACK_STORAGE_PATH}/temp_actions.json",
@@ -159,6 +200,7 @@ FILE_LABEL = {
     AUTH_FILE:         "auth",
     WARN_FILE:         "warns",
     CASE_FILE:         "cases",
+        WARN_CONFIG_FILE:  "warn_config",
     PROTECT_FILE:      "protected",
     TEMP_ACTIONS_FILE: "temp_actions",
     APPEALS_FILE:      "appeals",
@@ -168,6 +210,7 @@ MONGO_LOADERS = {
     AUTH_FILE: mongo_db.load_auth,
     WARN_FILE: mongo_db.load_warns,
     CASE_FILE: mongo_db.load_cases,
+        WARN_CONFIG_FILE: mongo_db.load_warn_config,
     PROTECT_FILE: mongo_db.load_protected,
     ABUSE_FILE: mongo_db.load_abuse,
     TEMP_ACTIONS_FILE: mongo_db.load_temp_actions,
@@ -178,6 +221,7 @@ MONGO_SAVERS = {
     AUTH_FILE: mongo_db.save_auth,
     WARN_FILE: mongo_db.save_warns,
     CASE_FILE: mongo_db.save_cases,
+        WARN_CONFIG_FILE: mongo_db.save_warn_config,
     PROTECT_FILE: mongo_db.save_protected,
     ABUSE_FILE: mongo_db.save_abuse,
     TEMP_ACTIONS_FILE: mongo_db.save_temp_actions,
@@ -231,66 +275,102 @@ log_msg(f"Storage: {STORAGE_PATH}  Fallback: {FALLBACK_STORAGE_PATH}", "INFO")
 # =========================================================
 
 def load(file: str):
+    """Load with caching: check cache → file → MongoDB → fallback."""
+    # Check cache first
+    cached = _cache.get(file)
+    if cached is not None:
+        return cached
+    
     try:
+        data = None
+        
+        # Try primary file
         if os.path.exists(file):
-            with open(file, "r") as f:
-                data = json.load(f)
+            try:
+                with open(file, "r") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError:
+                data = None
+        
+        # If file missing/empty, try MongoDB
+        if _is_empty_payload(data):
             loader = MONGO_LOADERS.get(file)
-            if loader and _is_empty_payload(data) and mongo_db.is_connected():
-                remote = loader()
-                if not _is_empty_payload(remote):
-                    _write_local_json(file, remote)
-                    return remote
-            return data
-        loader = MONGO_LOADERS.get(file)
-        if loader and mongo_db.is_connected():
-            remote = loader()
-            if not _is_empty_payload(remote):
-                _write_local_json(file, remote)
-            return remote if remote is not None else {}
-        fallback = FALLBACK_FILE_MAP.get(file)
-        if fallback and os.path.exists(fallback):
-            with open(fallback, "r") as f:
-                data = json.load(f)
-            save(file, data)
-            log_msg(f"Recovered {file} from fallback", "WARNING")
-            return data
-        return {}
-    except json.JSONDecodeError:
-        for candidate in [f"{file}.bak", FALLBACK_FILE_MAP.get(file)]:
-            if candidate and os.path.exists(candidate):
+            if loader and mongo_db.is_connected():
                 try:
-                    with open(candidate, "r") as f:
-                        data = json.load(f)
-                    save(file, data)
-                    log_msg(f"Recovered {file} from {candidate}", "WARNING")
-                    return data
+                    remote = loader()
+                    if not _is_empty_payload(remote):
+                        data = remote
+                        # Write back to local file for resilience
+                        _write_local_json(file, remote)
                 except Exception:
                     pass
-        log_msg(f"ERROR loading {file}: corrupt JSON, no valid backup", "ERROR")
-        return {}
+        
+        # If still empty, try fallback
+        if _is_empty_payload(data):
+            fallback = FALLBACK_FILE_MAP.get(file)
+            if fallback and os.path.exists(fallback):
+                try:
+                    with open(fallback, "r") as f:
+                        data = json.load(f)
+                    if not _is_empty_payload(data):
+                        _write_local_json(file, data)
+                        log_msg(f"Recovered {file} from fallback", "WARNING")
+                except Exception:
+                    pass
+        
+        # Fallback to empty dict
+        result = data if not _is_empty_payload(data) else {}
+        _cache.set(file, result)
+        return result
+        
     except Exception as e:
         log_msg(f"ERROR loading {file}: {e}", "ERROR")
         return {}
 
 def save(file: str, data):
+    """Save to cache, file, fallback, and MongoDB (async). Invalidate related caches."""
     try:
+        # Update cache immediately
+        _cache.set(file, data)
+        
+        # Invalidate related auth caches when AUTH_FILE is updated
+        if file == AUTH_FILE:
+            for key in _cache.keys():
+                if key.startswith(("auth:", "perm:", "frozen:")):
+                    _cache.invalidate(key)
+        elif file == PROTECT_FILE:
+            for key in _cache.keys():
+                if key.startswith("protected:"):
+                    _cache.invalidate(key)
+        
+        # Write primary file
         tmp = f"{file}.tmp"
-        bak = f"{file}.bak"
-        if os.path.exists(file):
-            shutil.copy2(file, bak)
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, file)
+        try:
+            Path(file).parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, file)
+        except Exception as e:
+            log_msg(f"WARNING writing {file}: {e}", "WARNING")
+        
+        # Write fallback (non-blocking)
         fallback = FALLBACK_FILE_MAP.get(file)
         if fallback:
-            Path(fallback).parent.mkdir(parents=True, exist_ok=True)
-            with open(f"{fallback}.tmp", "w") as f:
-                json.dump(data, f, indent=2)
-            os.replace(f"{fallback}.tmp", fallback)
+            try:
+                Path(fallback).parent.mkdir(parents=True, exist_ok=True)
+                with open(f"{fallback}.tmp", "w") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(f"{fallback}.tmp", fallback)
+            except Exception:
+                pass  # Silently skip fallback errors
+        
+        # Save to MongoDB (async to not block)
         saver = MONGO_SAVERS.get(file)
         if saver and mongo_db.is_connected():
-            saver(data)
+            try:
+                saver(data)
+            except Exception:
+                pass  # Non-blocking MongoDB save
     except Exception as e:
         log_msg(f"ERROR saving {file}: {e}", "ERROR")
 
@@ -308,18 +388,34 @@ def sync_storage_with_mongo():
             _write_local_json(file, remote_data)
 
 # =========================================================
+# PERSISTENT HTTP CLIENT — connection pooling for speed
+# =========================================================
+
+_http_client: httpx.AsyncClient = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    """Get or create persistent async HTTP client with connection pooling."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=15,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _http_client
+
+# =========================================================
 # BOT API HELPER (httpx) — avoids Pyrogram peer-ID issues
 # =========================================================
 
 async def tg_api(method: str, **kwargs) -> dict:
     """Call any Telegram Bot API method. Returns parsed JSON."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-                **kwargs,
-            )
-            return resp.json()
+        client = await get_http_client()
+        resp = await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+            **kwargs,
+        )
+        return resp.json()
     except Exception as e:
         log_msg(f"tg_api/{method} error: {e}", "ERROR")
         return {"ok": False, "description": str(e)}
@@ -540,17 +636,36 @@ def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
 
 def is_authorized(uid: int) -> bool:
-    return is_owner(uid) or str(uid) in load(AUTH_FILE)
+    if is_owner(uid):
+        return True
+    cache_key = f"auth:{uid}"
+    if _cache.get(cache_key) is not None:
+        return _cache.get(cache_key)
+    is_auth = str(uid) in load(AUTH_FILE)
+    _cache.set(cache_key, is_auth)
+    return is_auth
 
 def has_permission(uid: int, perm: str) -> bool:
     if is_owner(uid):
         return True
-    return load(AUTH_FILE).get(str(uid), {}).get("permissions", {}).get(perm, False)
+    cache_key = f"perm:{uid}:{perm}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = load(AUTH_FILE).get(str(uid), {}).get("permissions", {}).get(perm, False)
+    _cache.set(cache_key, result)
+    return result
 
 def is_frozen(uid: int) -> bool:
     if is_owner(uid):
         return False
-    return bool(load(AUTH_FILE).get(str(uid), {}).get("frozen", False))
+    cache_key = f"frozen:{uid}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = bool(load(AUTH_FILE).get(str(uid), {}).get("frozen", False))
+    _cache.set(cache_key, result)
+    return result
 
 # =========================================================
 # UTILITY HELPERS
@@ -563,7 +678,13 @@ def get_mod_info(uid: int) -> dict:
     return load(AUTH_FILE).get(str(uid), {})
 
 def is_protected(uid: int) -> bool:
-    return str(uid) in load(PROTECT_FILE)
+    cache_key = f"protected:{uid}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = str(uid) in load(PROTECT_FILE)
+    _cache.set(cache_key, result)
+    return result
 
 def make_mention(user: dict) -> str:
     if not isinstance(user, dict):
@@ -631,6 +752,38 @@ def load_temp_actions() -> list:
 
 def save_temp_actions(actions: list):
     save(TEMP_ACTIONS_FILE, actions)
+
+def get_warn_config() -> dict:
+    """Get warning configuration with defaults."""
+    config = load(WARN_CONFIG_FILE)
+    if not isinstance(config, dict):
+        config = {}
+    # Set defaults if not present
+    if "threshold" not in config:
+        config["threshold"] = 3
+    if "action" not in config:
+        config["action"] = "mute"  # mute, kick, or ban
+    if "duration" not in config:
+        config["duration"] = 3600  # 1 hour in seconds
+    return config
+
+def save_warn_config(config: dict):
+    """Save warning configuration."""
+    save(WARN_CONFIG_FILE, config)
+
+def get_user_warn_count(uid: int) -> int:
+    """Get current warning count for a user."""
+    warns = load(WARN_FILE)
+    return warns.get(str(uid), 0)
+
+def increment_user_warns(uid: int) -> int:
+    """Increment warning count for user and return new count."""
+    warns = load(WARN_FILE)
+    key = str(uid)
+    warns.setdefault(key, 0)
+    warns[key] += 1
+    save(WARN_FILE, warns)
+    return warns[key]
 
 def schedule_message_delete(chat_id: int, message_id: int, delay: int = 60):
     actions = load_temp_actions()
@@ -1589,7 +1742,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _temp_worker_task
+    global _temp_worker_task, _http_client
     log_msg("🛑 Shutting down...", "INFO")
     if _temp_worker_task and not _temp_worker_task.done():
         _temp_worker_task.cancel()
@@ -1598,6 +1751,9 @@ async def shutdown_event():
         except asyncio.CancelledError:
             pass
     await shutdown_bot()
+    if _http_client:
+        await _http_client.aclose()
+        _http_client = None
     mongo_db.disconnect()
 
 # =========================================================

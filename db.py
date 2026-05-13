@@ -1,5 +1,5 @@
 # =========================================================
-# MONGODB DATABASE HANDLER
+# MONGODB DATABASE HANDLER — Optimized with connection pooling
 # =========================================================
 # Provides MongoDB-backed storage for all bot data
 # Falls back to JSON if MongoDB is unavailable
@@ -14,7 +14,7 @@ from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
 class MongoDBHandler:
-    """Handle MongoDB operations with JSON fallback."""
+    """Handle MongoDB operations with JSON fallback and connection pooling."""
     
     def __init__(self):
         self.client = None
@@ -23,6 +23,7 @@ class MongoDBHandler:
         self.collections = {
             "auth": "moderator_auth",
             "warns": "user_warns",
+            "warn_config": "warning_configuration",
             "cases": "moderation_cases",
             "protected": "protected_users",
             "abuse": "abuse_tracking",
@@ -31,7 +32,7 @@ class MongoDBHandler:
         }
         
     def connect(self) -> bool:
-        """Connect to MongoDB. Returns True if successful."""
+        """Connect to MongoDB with connection pooling. Returns True if successful."""
         try:
             mongodb_uri = os.environ.get(
                 "MONGODB_URI",
@@ -41,7 +42,10 @@ class MongoDBHandler:
                 mongodb_uri,
                 serverSelectionTimeoutMS=5000,
                 connectTimeoutMS=5000,
-                retryWrites=True
+                retryWrites=True,
+                maxPoolSize=10,  # Connection pooling
+                minPoolSize=2,
+                waitQueueTimeoutMS=5000,
             )
             # Test the connection
             self.client.admin.command('ping')
@@ -53,7 +57,7 @@ class MongoDBHandler:
             # Create indexes for better performance
             self._create_indexes()
             
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] MongoDB connected successfully", flush=True)
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [INFO] MongoDB connected successfully (pool: 2-10)", flush=True)
             return True
             
         except (ConnectionFailure, ServerSelectionTimeoutError, Exception) as e:
@@ -62,11 +66,13 @@ class MongoDBHandler:
             return False
     
     def _create_indexes(self):
-        """Create necessary indexes for collections."""
+        """Create necessary indexes for collections to improve query performance."""
         try:
             if self.db:
                 for collection_name in self.collections.values():
                     self.db[collection_name].create_index("_id", unique=True)
+                    # Create index for faster lookups by updated_at for cache invalidation
+                    self.db[collection_name].create_index("updated_at")
         except Exception as e:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [WARNING] Failed to create indexes: {e}", flush=True)
 
@@ -101,11 +107,12 @@ class MongoDBHandler:
             return False
     
     def is_connected(self) -> bool:
-        """Check if MongoDB is connected."""
+        """Check if MongoDB is connected (fast check using client state)."""
         if not self.connected or not self.db:
             return False
         try:
-            self.db.command('ping')
+            # Use ismaster which is faster than ping
+            self.db.command('ismaster')
             return True
         except Exception:
             self.connected = False
@@ -126,6 +133,14 @@ class MongoDBHandler:
     def save_warns(self, data: Dict[str, Any]) -> bool:
         """Save warn data."""
         return self._save_collection_data("warns", data)
+    
+    def load_warn_config(self) -> Dict[str, Any]:
+        """Load warning configuration."""
+        return self._load_collection_data("warn_config", {})
+    
+    def save_warn_config(self, data: Dict[str, Any]) -> bool:
+        """Save warning configuration."""
+        return self._save_collection_data("warn_config", data)
     
     def load_cases(self) -> Dict[str, Any]:
         """Load all moderation cases."""
@@ -168,7 +183,7 @@ class MongoDBHandler:
         return self._save_collection_data("appeals", data)
     
     def disconnect(self):
-        """Disconnect from MongoDB."""
+        """Disconnect from MongoDB and close connection pool."""
         if self.client:
             self.client.close()
             self.connected = False
