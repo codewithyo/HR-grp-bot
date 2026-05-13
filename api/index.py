@@ -26,14 +26,54 @@
 # =========================================================
 
 import os, json, time, random, string, asyncio, httpx
-import traceback, sys, shutil, io
+import traceback, sys, shutil, io, threading
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
 from pyrogram import Client
+from db import mongo_db
+
+# =========================================================
+# CACHING LAYER — reduces disk/db I/O dramatically
+# =========================================================
+
+class DataCache:
+    """Thread-safe in-memory cache with TTL."""
+    def __init__(self, ttl_seconds: int = 60):
+        self.cache: Dict[str, tuple[Any, float]] = {}
+        self.lock = threading.RLock()
+        self.ttl = ttl_seconds
+    
+    def get(self, key: str) -> Any:
+        with self.lock:
+            if key not in self.cache:
+                return None
+            data, ts = self.cache[key]
+            if time.time() - ts > self.ttl:
+                del self.cache[key]
+                return None
+            return data
+    
+    def set(self, key: str, data: Any):
+        with self.lock:
+            self.cache[key] = (data, time.time())
+    
+    def invalidate(self, key: str = None):
+        with self.lock:
+            if key:
+                self.cache.pop(key, None)
+            else:
+                self.cache.clear()
+    
+    def keys(self):
+        with self.lock:
+            return list(self.cache.keys())
+
+_cache = DataCache(ttl_seconds=60)  # 60-second cache TTL
 # Pyrogram is used only for: get_me(), get_chat(), get_dialogs(),
 # get_chat_member(), get_chat_history(), download_media().
 # All moderation actions (ban/mute/restrict/delete) go through
@@ -136,6 +176,7 @@ Path(STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 AUTH_FILE         = f"{STORAGE_PATH}/auth.json"
 WARN_FILE         = f"{STORAGE_PATH}/warns.json"
 CASE_FILE         = f"{STORAGE_PATH}/cases.json"
+WARN_CONFIG_FILE   = f"{STORAGE_PATH}/warn_config.json"
 PROTECT_FILE      = f"{STORAGE_PATH}/protected.json"
 ABUSE_FILE        = f"{STORAGE_PATH}/abuse.json"
 TEMP_ACTIONS_FILE = f"{STORAGE_PATH}/temp_actions.json"
@@ -145,6 +186,7 @@ FALLBACK_FILE_MAP = {
     AUTH_FILE:         f"{FALLBACK_STORAGE_PATH}/auth.json",
     WARN_FILE:         f"{FALLBACK_STORAGE_PATH}/warns.json",
     CASE_FILE:         f"{FALLBACK_STORAGE_PATH}/cases.json",
+        WARN_CONFIG_FILE:  f"{FALLBACK_STORAGE_PATH}/warn_config.json",
     PROTECT_FILE:      f"{FALLBACK_STORAGE_PATH}/protected.json",
     ABUSE_FILE:        f"{FALLBACK_STORAGE_PATH}/abuse.json",
     TEMP_ACTIONS_FILE: f"{FALLBACK_STORAGE_PATH}/temp_actions.json",
@@ -158,10 +200,50 @@ FILE_LABEL = {
     AUTH_FILE:         "auth",
     WARN_FILE:         "warns",
     CASE_FILE:         "cases",
+        WARN_CONFIG_FILE:  "warn_config",
     PROTECT_FILE:      "protected",
     TEMP_ACTIONS_FILE: "temp_actions",
     APPEALS_FILE:      "appeals",
 }
+
+MONGO_LOADERS = {
+    AUTH_FILE: mongo_db.load_auth,
+    WARN_FILE: mongo_db.load_warns,
+    CASE_FILE: mongo_db.load_cases,
+        WARN_CONFIG_FILE: mongo_db.load_warn_config,
+    PROTECT_FILE: mongo_db.load_protected,
+    ABUSE_FILE: mongo_db.load_abuse,
+    TEMP_ACTIONS_FILE: mongo_db.load_temp_actions,
+    APPEALS_FILE: mongo_db.load_appeals,
+}
+
+MONGO_SAVERS = {
+    AUTH_FILE: mongo_db.save_auth,
+    WARN_FILE: mongo_db.save_warns,
+    CASE_FILE: mongo_db.save_cases,
+        WARN_CONFIG_FILE: mongo_db.save_warn_config,
+    PROTECT_FILE: mongo_db.save_protected,
+    ABUSE_FILE: mongo_db.save_abuse,
+    TEMP_ACTIONS_FILE: mongo_db.save_temp_actions,
+    APPEALS_FILE: mongo_db.save_appeals,
+}
+
+def _read_local_json(file: str):
+    if not os.path.exists(file):
+        return None
+    try:
+        with open(file, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _write_local_json(file: str, data):
+    Path(file).parent.mkdir(parents=True, exist_ok=True)
+    with open(file, "w") as f:
+        json.dump(data, f, indent=2)
+
+def _is_empty_payload(data) -> bool:
+    return data is None or data == {} or data == []
 
 def ensure_json_file(path: str):
     if os.path.exists(path):
@@ -193,52 +275,133 @@ log_msg(f"Storage: {STORAGE_PATH}  Fallback: {FALLBACK_STORAGE_PATH}", "INFO")
 # =========================================================
 
 def load(file: str):
+    """Load with caching: check cache → file → MongoDB → fallback."""
+    # Check cache first
+    cached = _cache.get(file)
+    if cached is not None:
+        return cached
+    
     try:
+        data = None
+        
+        # Try primary file
         if os.path.exists(file):
-            with open(file, "r") as f:
-                return json.load(f)
-        fallback = FALLBACK_FILE_MAP.get(file)
-        if fallback and os.path.exists(fallback):
-            with open(fallback, "r") as f:
-                data = json.load(f)
-            save(file, data)
-            log_msg(f"Recovered {file} from fallback", "WARNING")
-            return data
-        return {}
-    except json.JSONDecodeError:
-        for candidate in [f"{file}.bak", FALLBACK_FILE_MAP.get(file)]:
-            if candidate and os.path.exists(candidate):
+            try:
+                with open(file, "r") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError:
+                data = None
+        
+        # If file missing/empty, try MongoDB
+        if _is_empty_payload(data):
+            loader = MONGO_LOADERS.get(file)
+            if loader and mongo_db.is_connected():
                 try:
-                    with open(candidate, "r") as f:
-                        data = json.load(f)
-                    save(file, data)
-                    log_msg(f"Recovered {file} from {candidate}", "WARNING")
-                    return data
+                    remote = loader()
+                    if not _is_empty_payload(remote):
+                        data = remote
+                        # Write back to local file for resilience
+                        _write_local_json(file, remote)
                 except Exception:
                     pass
-        log_msg(f"ERROR loading {file}: corrupt JSON, no valid backup", "ERROR")
-        return {}
+        
+        # If still empty, try fallback
+        if _is_empty_payload(data):
+            fallback = FALLBACK_FILE_MAP.get(file)
+            if fallback and os.path.exists(fallback):
+                try:
+                    with open(fallback, "r") as f:
+                        data = json.load(f)
+                    if not _is_empty_payload(data):
+                        _write_local_json(file, data)
+                        log_msg(f"Recovered {file} from fallback", "WARNING")
+                except Exception:
+                    pass
+        
+        # Fallback to empty dict
+        result = data if not _is_empty_payload(data) else {}
+        _cache.set(file, result)
+        return result
+        
     except Exception as e:
         log_msg(f"ERROR loading {file}: {e}", "ERROR")
         return {}
 
 def save(file: str, data):
+    """Save to cache, file, fallback, and MongoDB (async). Invalidate related caches."""
     try:
+        # Update cache immediately
+        _cache.set(file, data)
+        
+        # Invalidate related auth caches when AUTH_FILE is updated
+        if file == AUTH_FILE:
+            for key in _cache.keys():
+                if key.startswith(("auth:", "perm:", "frozen:")):
+                    _cache.invalidate(key)
+        elif file == PROTECT_FILE:
+            for key in _cache.keys():
+                if key.startswith("protected:"):
+                    _cache.invalidate(key)
+        
+        # Write primary file
         tmp = f"{file}.tmp"
-        bak = f"{file}.bak"
-        if os.path.exists(file):
-            shutil.copy2(file, bak)
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, file)
+        try:
+            Path(file).parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, file)
+        except Exception as e:
+            log_msg(f"WARNING writing {file}: {e}", "WARNING")
+        
+        # Write fallback (non-blocking)
         fallback = FALLBACK_FILE_MAP.get(file)
         if fallback:
-            Path(fallback).parent.mkdir(parents=True, exist_ok=True)
-            with open(f"{fallback}.tmp", "w") as f:
-                json.dump(data, f, indent=2)
-            os.replace(f"{fallback}.tmp", fallback)
+            try:
+                Path(fallback).parent.mkdir(parents=True, exist_ok=True)
+                with open(f"{fallback}.tmp", "w") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(f"{fallback}.tmp", fallback)
+            except Exception:
+                pass  # Silently skip fallback errors
+        
+        # Save to MongoDB (async to not block)
+        saver = MONGO_SAVERS.get(file)
+        if saver and mongo_db.is_connected():
+            try:
+                saver(data)
+            except Exception:
+                pass  # Non-blocking MongoDB save
     except Exception as e:
         log_msg(f"ERROR saving {file}: {e}", "ERROR")
+
+def sync_storage_with_mongo():
+    if not mongo_db.is_connected():
+        return
+    for file, loader in MONGO_LOADERS.items():
+        local_data = _read_local_json(file)
+        remote_data = loader()
+        if not _is_empty_payload(local_data):
+            saver = MONGO_SAVERS.get(file)
+            if saver:
+                saver(local_data)
+        elif not _is_empty_payload(remote_data):
+            _write_local_json(file, remote_data)
+
+# =========================================================
+# PERSISTENT HTTP CLIENT — connection pooling for speed
+# =========================================================
+
+_http_client: httpx.AsyncClient = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    """Get or create persistent async HTTP client with connection pooling."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            timeout=15,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _http_client
 
 # =========================================================
 # BOT API HELPER (httpx) — avoids Pyrogram peer-ID issues
@@ -247,12 +410,12 @@ def save(file: str, data):
 async def tg_api(method: str, **kwargs) -> dict:
     """Call any Telegram Bot API method. Returns parsed JSON."""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-                **kwargs,
-            )
-            return resp.json()
+        client = await get_http_client()
+        resp = await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+            **kwargs,
+        )
+        return resp.json()
     except Exception as e:
         log_msg(f"tg_api/{method} error: {e}", "ERROR")
         return {"ok": False, "description": str(e)}
@@ -473,17 +636,36 @@ def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
 
 def is_authorized(uid: int) -> bool:
-    return is_owner(uid) or str(uid) in load(AUTH_FILE)
+    if is_owner(uid):
+        return True
+    cache_key = f"auth:{uid}"
+    if _cache.get(cache_key) is not None:
+        return _cache.get(cache_key)
+    is_auth = str(uid) in load(AUTH_FILE)
+    _cache.set(cache_key, is_auth)
+    return is_auth
 
 def has_permission(uid: int, perm: str) -> bool:
     if is_owner(uid):
         return True
-    return load(AUTH_FILE).get(str(uid), {}).get("permissions", {}).get(perm, False)
+    cache_key = f"perm:{uid}:{perm}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = load(AUTH_FILE).get(str(uid), {}).get("permissions", {}).get(perm, False)
+    _cache.set(cache_key, result)
+    return result
 
 def is_frozen(uid: int) -> bool:
     if is_owner(uid):
         return False
-    return bool(load(AUTH_FILE).get(str(uid), {}).get("frozen", False))
+    cache_key = f"frozen:{uid}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = bool(load(AUTH_FILE).get(str(uid), {}).get("frozen", False))
+    _cache.set(cache_key, result)
+    return result
 
 # =========================================================
 # UTILITY HELPERS
@@ -496,7 +678,13 @@ def get_mod_info(uid: int) -> dict:
     return load(AUTH_FILE).get(str(uid), {})
 
 def is_protected(uid: int) -> bool:
-    return str(uid) in load(PROTECT_FILE)
+    cache_key = f"protected:{uid}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    result = str(uid) in load(PROTECT_FILE)
+    _cache.set(cache_key, result)
+    return result
 
 def make_mention(user: dict) -> str:
     if not isinstance(user, dict):
@@ -564,6 +752,48 @@ def load_temp_actions() -> list:
 
 def save_temp_actions(actions: list):
     save(TEMP_ACTIONS_FILE, actions)
+
+def get_warn_config() -> dict:
+    """Get warning configuration with defaults."""
+    config = load(WARN_CONFIG_FILE)
+    if not isinstance(config, dict):
+        config = {}
+    # Set defaults if not present
+    if "threshold" not in config:
+        config["threshold"] = 3
+    if "action" not in config:
+        config["action"] = "mute"  # mute, kick, or ban
+    if "duration" not in config:
+        config["duration"] = 3600  # 1 hour in seconds
+    return config
+
+def save_warn_config(config: dict):
+    """Save warning configuration."""
+    save(WARN_CONFIG_FILE, config)
+
+def get_user_warn_count(uid: int) -> int:
+    """Get current warning count for a user."""
+    warns = load(WARN_FILE)
+    return warns.get(str(uid), 0)
+
+def increment_user_warns(uid: int) -> int:
+    """Increment warning count for user and return new count."""
+    warns = load(WARN_FILE)
+    key = str(uid)
+    warns.setdefault(key, 0)
+    warns[key] += 1
+    save(WARN_FILE, warns)
+    return warns[key]
+
+def schedule_message_delete(chat_id: int, message_id: int, delay: int = 60):
+    actions = load_temp_actions()
+    actions.append({
+        "type": "delete",
+        "chat_id": chat_id,
+        "target_id": message_id,
+        "until_ts": int(time.time()) + delay,
+    })
+    save_temp_actions(actions)
 
 def parse_duration_token(token: str) -> int | None:
     if not token or len(token) < 2:
@@ -897,6 +1127,8 @@ async def process_due_temp_actions(bot: Client):
                 ok, err = await api_unban(chat_id, target_id)
                 msg_text = f"🔓 Temporary ban ended for `{target_id}`" if ok else f"⚠️ Auto-unban failed for `{target_id}`: {err}"
                 await tg_send(chat_id, msg_text)
+            elif atype == "delete":
+                await tg_delete(chat_id, target_id)
         except Exception as e:
             log_msg(f"temp action error {action}: {e}", "ERROR")
             pending.append(action)
@@ -998,7 +1230,15 @@ async def handle_message(bot: Client, msg: dict):
         log_msg(f"/{raw_cmd} from uid={uid} chat={chat_id}", "INFO")
 
         async def reply_text(t: str):
-            await tg_send(chat_id, t, reply_to=msg_id)
+            sent = await tg_send(chat_id, t, reply_to=msg_id)
+            if msg.get("chat", {}).get("type") != "private" and sent.get("ok"):
+                result = sent.get("result", {})
+                reply_message_id = result.get("message_id")
+                if reply_message_id:
+                    schedule_message_delete(chat_id, reply_message_id)
+
+        if msg.get("chat", {}).get("type") != "private":
+            schedule_message_delete(chat_id, msg_id)
 
         if err:
             await reply_text(err)
@@ -1034,6 +1274,87 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd == "help":
             await reply_text(role_help_text(uid))
             return
+
+        # ── /id ───────────────────────────────────────────
+        if raw_cmd == "id":
+            try:
+                target_id = None
+                target_user = None
+                
+                # Mode 1: /id me
+                if args and args[0].lower() == "me":
+                    target_id = uid
+                
+                # Mode 2: /id @username
+                elif args and args[0].startswith("@"):
+                    username = args[0][1:]  # Remove @
+                    try:
+                        bot = await get_bot()
+                        target_user = await bot.get_user(username)
+                        target_id = target_user.id
+                    except Exception as e:
+                        return await reply_text(f"❌ User @{username} not found: {str(e)}")
+                
+                # Mode 3: /id <raw_id>
+                elif args and args[0].isdigit():
+                    parsed_id = parse_positive_user_id(args[0])
+                    if parsed_id:
+                        target_id = parsed_id
+                        try:
+                            bot = await get_bot()
+                            target_user = await bot.get_user(target_id)
+                        except Exception as e:
+                            return await reply_text(f"❌ User ID {target_id} not found: {str(e)}")
+                    else:
+                        return await reply_text("❌ Invalid user ID.")
+                
+                # Mode 4: /id (reply to message)
+                elif reply:
+                    target_dict, tid, err = resolve_target(reply, [], 0)
+                    if tid:
+                        target_id = tid
+                        try:
+                            bot = await get_bot()
+                            target_user = await bot.get_user(target_id)
+                        except Exception:
+                            # Fallback if get_user fails
+                            pass
+                    else:
+                        return await reply_text("❌ Reply to a user or use /id @username, /id me, or /id <user_id>")
+                else:
+                    return await reply_text("❌ Reply to a user or use /id @username, /id me, or /id <user_id>")
+                
+                # Build profile card
+                if target_id is None:
+                    return await reply_text("❌ Could not determine target user.")
+                
+                first_name = target_user.first_name if target_user and target_user.first_name else "User"
+                last_name = target_user.last_name if target_user and target_user.last_name else ""
+                username = target_user.username if target_user and target_user.username else None
+                
+                # Format the response
+                response = f"👤 **User Profile**\n\n"
+                response += f"🆔 ID: `{target_id}`\n"
+                response += f"📝 Name: {first_name}"
+                if last_name:
+                    response += f" {last_name}"
+                response += f"\n"
+                if username:
+                    response += f"🔗 Username: @{username}\n"
+                    response += f"📌 Link: [Profile](tg://user?id={target_id})"
+                else:
+                    response += f"🔗 Link: [Profile](tg://user?id={target_id})"
+                
+                # Send to owner's DM if owner uses /id in a group, otherwise reply in chat
+                is_group = msg.get("chat", {}).get("type") != "private"
+                if is_owner(uid) and is_group:
+                    await notify_owner(response)
+                else:
+                    await reply_text(response)
+                return
+            except Exception as e:
+                log_msg(f"Error in /id command: {e}\n{traceback.format_exc()}", "ERROR")
+                return await reply_text(f"❌ Error: {str(e)}")
 
         # ── /happeal ──────────────────────────────────────
         if raw_cmd == "happeal":
@@ -1381,6 +1702,8 @@ async def startup_event():
     global _temp_worker_task
     log_msg("🚀 Starting up...", "INFO")
     try:
+        mongo_db.connect()
+        sync_storage_with_mongo()
         bot = await get_bot()
 
         # 1. Resolve / auto-detect the log group
@@ -1419,7 +1742,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _temp_worker_task
+    global _temp_worker_task, _http_client
     log_msg("🛑 Shutting down...", "INFO")
     if _temp_worker_task and not _temp_worker_task.done():
         _temp_worker_task.cancel()
@@ -1428,6 +1751,10 @@ async def shutdown_event():
         except asyncio.CancelledError:
             pass
     await shutdown_bot()
+    if _http_client:
+        await _http_client.aclose()
+        _http_client = None
+    mongo_db.disconnect()
 
 # =========================================================
 # MAIN
