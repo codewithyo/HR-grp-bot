@@ -1226,7 +1226,7 @@ async def root():
     return {
         "service":   "Telegram Moderation Bot",
         "status":    "running" if bot_ready else "starting",
-        "endpoints": ["/health", "/api/status", "/api/setup_webhook", "/api/webhook"],
+        "endpoints": ["/health", "/api/status", "", "/api/webhook"],
     }
 
 @app.get("/health")
@@ -1250,15 +1250,25 @@ async def bot_status():
 @app.get("/api/setup_webhook")
 async def setup_webhook_endpoint(request: Request):
     base = str(request.base_url).rstrip("/")
+    base = base.replace("http://", "https://")
+
     webhook_url = f"{base}/api/webhook"
+
     result = await tg_api("setWebhook", json={
         "url": webhook_url,
         "allowed_updates": ["message", "callback_query"],
         "drop_pending_updates": True,
     })
-    cmds   = await sync_commands()
-    info   = await tg_api("getWebhookInfo")
-    return {"webhook_url": webhook_url, "set_webhook": result, "commands": cmds, "info": info}
+
+    cmds = await sync_commands()
+    info = await tg_api("getWebhookInfo")
+
+    return {
+        "webhook_url": webhook_url,
+        "set_webhook": result,
+        "commands": cmds,
+        "info": info
+    }
 
 # ── Webhook ──────────────────────────────────────────────
 @app.post("/api/webhook")
