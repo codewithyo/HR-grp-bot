@@ -44,6 +44,7 @@ from games import (
     handle_ttt_end,
     handle_ttt_callback,
     games_cleanup_worker,
+    shutdown_games,
     TTT_CALLBACK_PREFIXES,
 )
 
@@ -1508,21 +1509,6 @@ async def temp_action_worker():
 # =========================================================
 
 app = FastAPI(title="Moderation Bot")
-@app.on_event("startup")
-async def startup_event():
-    global _temp_worker_task
-
-    log_msg("Starting bot...", "INFO")
-
-    bot = await get_bot()
-
-    await resolve_log_group(bot)
-
-    await sync_commands()
-
-    _temp_worker_task = asyncio.create_task(temp_action_worker())
-
-    log_msg("✅ Bot fully started", "INFO")
 
 # ── Root endpoint ──────────────────
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -1552,21 +1538,12 @@ async def bot_status():
         return {"status": "error", "error": str(e)}
 @app.get("/api/setup_webhook")
 async def setup_webhook_endpoint():
-
-    webhook_url = "https://objective-jorey-yatinbst-00b7f95b.koyeb.app/api/webhook"
-
-    result = await tg_api("setWebhook", json={
-        "url": webhook_url,
-        "allowed_updates": ["message", "callback_query"],
-        "drop_pending_updates": True,
-    })
-
+    webhook_result = await ensure_webhook()
     cmds = await sync_commands()
     info = await tg_api("getWebhookInfo")
 
     return {
-        "webhook_url": webhook_url,
-        "set_webhook": result,
+        "set_webhook": webhook_result,
         "commands": cmds,
         "info": info
     }
@@ -1661,29 +1638,14 @@ async def handle_message(bot: Client, msg: dict):
         # ── /start ────────────────────────────────────────
         if raw_cmd == "start":
             start_msg = (
-                "╔══════════════════════════════════════╗\n"
-                "║  🤖 ADVANCED MODERATION BOT          ║\n"
-                "╚══════════════════════════════════════╝\n\n"
-                "👋 **Welcome to HR Group Moderation Bot**\n\n"
-                "🔹 **What I Do:**\n"
-                "• Manage group members with intelligent moderation\n"
-                "• Issue warnings and enforce progressive discipline\n"
-                "• Ban, mute, and protect users as needed\n"
-                "• Track all moderation cases with full audit trail\n"
-                "• Support appeals for disputed actions\n\n"
-                "🔹 **Quick Start:**\n"
-                "• Use /help to see commands for your role\n"
-                "• Use /hr to get user information\n"
-                "• Use /happeal in DM to dispute moderation\n\n"
-                "🔹 **Features:**\n"
-                "✅ MongoDB persistence (data survives restarts)\n"
-                "✅ Real-time moderation with auto-delete\n"
-                "✅ Configurable warning thresholds\n"
-                "✅ Full permission management\n"
-                "✅ Complete case history & logging\n\n"
-                "📖 Type /help for available commands\n"
-                "🆘 Need help? Contact the group administrator\n\n"
-                "*Bot Status: ✅ Online & Operational*"
+                "🤖 **HR Group Bot**\n\n"
+                "Fast moderation + utility tools for your group.\n\n"
+                "**Quick Commands**\n"
+                "• `/help` - Commands by your role\n"
+                "• `/hr` - User info\n"
+                "• `/ttt` - Play Tic-Tac-Toe\n"
+                "• `/happeal` - Appeal in DM\n\n"
+                "✅ Online and ready."
             )
             await reply_text(start_msg)
             return
@@ -2342,6 +2304,7 @@ async def shutdown_event():
         except asyncio.CancelledError:
             pass
     await shutdown_bot()
+    await shutdown_games()
     if _http_client:
         await _http_client.aclose()
         _http_client = None

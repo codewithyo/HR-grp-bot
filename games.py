@@ -6,6 +6,7 @@ Commands: /ttt, /tttleaderboard, /tttmystats, /tttend
 
 import asyncio
 import json
+import re
 import random
 import string
 import time
@@ -23,6 +24,7 @@ SCORES_FILE = "data/ttt_scores.json"
 STATE_FILE = "data/ttt_state.json"
 SAVE_FN: Optional[Callable] = None
 LOAD_FN: Optional[Callable] = None
+_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
 # Game storage
 GAMES: Dict[str, dict] = {}  # game_id → game state
@@ -44,6 +46,25 @@ TTT_CALLBACK_PREFIXES = (
     "ttt_noop_",
     "ttt_leaderboard",
 )
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Reuse a single HTTP client for better latency and connection pooling."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        _HTTP_CLIENT = httpx.AsyncClient(
+            timeout=10,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _HTTP_CLIENT
+
+
+async def shutdown_games():
+    """Close shared HTTP resources."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is not None:
+        await _HTTP_CLIENT.aclose()
+        _HTTP_CLIENT = None
 
 
 def _load_data(file_path: str, default):
@@ -137,6 +158,11 @@ def _restore_state():
 def generate_game_id() -> str:
     """Generate unique game ID."""
     return "TTT-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+
+def generate_challenge_id() -> str:
+    """Generate compact challenge ID for callback payload."""
+    return "C" + "".join(random.choices(string.ascii_uppercase + string.digits, k=7))
 
 
 def _name_from_user(user: dict, default: str = "Player") -> str:
@@ -300,29 +326,55 @@ async def tg_send_message(
     text: str,
     reply_to: Optional[int] = None,
     markup: Optional[dict] = None,
-    parse_mode: str = "Markdown",
+    parse_mode: Optional[str] = "Markdown",
 ) -> Optional[dict]:
     """Send a message via Bot API."""
     try:
-        async with httpx.AsyncClient() as client:
-            payload = {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse_mode,
-            }
-            if reply_to:
-                payload["reply_to_message_id"] = reply_to
-            if markup:
-                payload["reply_markup"] = markup
-            resp = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                json=payload,
-                timeout=10,
-            )
-            return resp.json() if resp.status_code == 200 else None
+        client = await _get_http_client()
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+        if markup:
+            payload["reply_markup"] = markup
+        resp = await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json=payload,
+        )
+        data = resp.json()
+        if resp.status_code != 200 or not data.get("ok", False):
+            print(f"[TTT] sendMessage failed ({resp.status_code}): {data}")
+            return None
+        return data
     except Exception as e:
         print(f"[TTT] Error sending message: {e}")
         return None
+
+
+def _escape_markdown(text: str) -> str:
+    """Escape Telegram Markdown v1 control characters for usernames and dynamic labels."""
+    if text is None:
+        return ""
+    return re.sub(r"([_*`\[])", r"\\\1", str(text))
+
+
+def _to_plain_text(text: str) -> str:
+    """Strip simple markdown markers for fallback plain text send."""
+    if text is None:
+        return ""
+    return str(text).replace("*", "").replace("`", "").replace("_", "")
+
+
+async def _send_markdown_with_fallback(chat_id: int, text: str, reply_to: Optional[int] = None):
+    """Try Markdown first; if Telegram rejects formatting, fallback to plain text."""
+    sent = await tg_send_message(chat_id, text, reply_to=reply_to, parse_mode="Markdown")
+    if sent:
+        return sent
+    return await tg_send_message(chat_id, _to_plain_text(text), reply_to=reply_to, parse_mode=None)
 
 
 async def tg_edit_message(
@@ -334,21 +386,20 @@ async def tg_edit_message(
 ) -> bool:
     """Edit an existing message via Bot API."""
     try:
-        async with httpx.AsyncClient() as client:
-            payload = {
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text,
-                "parse_mode": parse_mode,
-            }
-            if markup:
-                payload["reply_markup"] = markup
-            resp = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText",
-                json=payload,
-                timeout=10,
-            )
-            return resp.status_code == 200
+        client = await _get_http_client()
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": parse_mode,
+        }
+        if markup:
+            payload["reply_markup"] = markup
+        resp = await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText",
+            json=payload,
+        )
+        return resp.status_code == 200
     except Exception as e:
         print(f"[TTT] Error editing message: {e}")
         return False
@@ -357,13 +408,12 @@ async def tg_edit_message(
 async def tg_delete_message(chat_id: int, message_id: int) -> bool:
     """Delete a message via Bot API."""
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
-                json={"chat_id": chat_id, "message_id": message_id},
-                timeout=10,
-            )
-            return resp.status_code == 200
+        client = await _get_http_client()
+        resp = await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
+            json={"chat_id": chat_id, "message_id": message_id},
+        )
+        return resp.status_code == 200
     except Exception as e:
         print(f"[TTT] Error deleting message: {e}")
         return False
@@ -376,17 +426,16 @@ async def tg_answer_callback(
 ) -> bool:
     """Answer a callback query."""
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
-                json={
-                    "callback_query_id": callback_id,
-                    "text": text,
-                    "show_alert": alert,
-                },
-                timeout=10,
-            )
-            return resp.status_code == 200
+        client = await _get_http_client()
+        resp = await client.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery",
+            json={
+                "callback_query_id": callback_id,
+                "text": text,
+                "show_alert": alert,
+            },
+        )
+        return resp.status_code == 200
     except Exception as e:
         print(f"[TTT] Error answering callback: {e}")
         return False
@@ -423,13 +472,13 @@ def build_board_markup(board: list[str], game_id: str, winning_line: Optional[li
     return {"inline_keyboard": keyboard}
 
 
-def build_challenge_markup(msg_id: int) -> dict:
+def build_challenge_markup(challenge_id: str) -> dict:
     """Build challenge accept/decline buttons."""
     return {
         "inline_keyboard": [
             [
-                {"text": "✅ Accept", "callback_data": f"ttt_accept_{msg_id}"},
-                {"text": "❌ Decline", "callback_data": f"ttt_decline_{msg_id}"},
+                {"text": "✅ Accept", "callback_data": f"ttt_accept_{challenge_id}"},
+                {"text": "❌ Decline", "callback_data": f"ttt_decline_{challenge_id}"},
             ]
         ]
     }
@@ -776,9 +825,11 @@ async def handle_ttt_command(
         
         # Resolve opponent (reply, @username/plain username, or user_id)
         opponent_id = None
+        opponent_name = "Player"
         if reply:
             from_reply = reply.get("from", {})
             opponent_id = from_reply.get("id")
+            opponent_name = _name_from_user(from_reply)
         elif args:
             arg = (args[0] or "").strip()
             lookup = arg[1:] if arg.startswith("@") else arg
@@ -791,10 +842,28 @@ async def handle_ttt_command(
 
             if lookup.isdigit():
                 opponent_id = int(lookup)
+                try:
+                    target_user = await bot.get_users(opponent_id)
+                    opponent_name = _name_from_user(
+                        {
+                            "first_name": getattr(target_user, "first_name", ""),
+                            "last_name": getattr(target_user, "last_name", ""),
+                            "username": getattr(target_user, "username", ""),
+                        }
+                    )
+                except Exception:
+                    opponent_name = str(opponent_id)
             else:
                 try:
                     target_user = await bot.get_users(lookup)
                     opponent_id = getattr(target_user, "id", None)
+                    opponent_name = _name_from_user(
+                        {
+                            "first_name": getattr(target_user, "first_name", ""),
+                            "last_name": getattr(target_user, "last_name", ""),
+                            "username": getattr(target_user, "username", ""),
+                        }
+                    )
                 except Exception:
                     return await tg_send_message(
                         chat_id,
@@ -827,23 +896,30 @@ async def handle_ttt_command(
                 reply_to=msg_id,
             )
             return
+
+        challenge_id = generate_challenge_id()
         
         # Send challenge
-        challenge_text = f"🎮 *{challenger_name}* challenges you to Tic-Tac-Toe!\n\n⏳ _60 seconds to respond_"
+        challenge_text = (
+            f"🎮 *{_escape_markdown(challenger_name)}* challenges *{_escape_markdown(opponent_name)}* to Tic-Tac-Toe!\n\n"
+            "⏳ _60 seconds to respond_"
+        )
         result = await tg_send_message(
             chat_id,
             challenge_text,
             reply_to=None,
-            markup=build_challenge_markup(msg_id),
+            markup=build_challenge_markup(challenge_id),
         )
         
         if result and result.get("ok"):
             challenge_msg_id = result["result"]["message_id"]
-            CHALLENGES[challenge_msg_id] = {
+            CHALLENGES[challenge_id] = {
                 "challenger_id": challenger_id,
                 "challenger_name": challenger_name,
                 "opponent_id": opponent_id,
+                "opponent_name": opponent_name,
                 "chat_id": chat_id,
+                "challenge_msg_id": challenge_msg_id,
                 "created_at": time.time(),
             }
             _persist_state()
@@ -851,11 +927,12 @@ async def handle_ttt_command(
             # Auto-expire challenge
             async def expire_challenge():
                 await asyncio.sleep(CHALLENGE_TIMEOUT)
-                if challenge_msg_id in CHALLENGES:
-                    del CHALLENGES[challenge_msg_id]
+                challenge = CHALLENGES.get(challenge_id)
+                if challenge:
+                    del CHALLENGES[challenge_id]
                     _persist_state()
                     try:
-                        await tg_delete_message(chat_id, challenge_msg_id)
+                        await tg_delete_message(chat_id, challenge.get("challenge_msg_id", challenge_msg_id))
                     except Exception:
                         pass
             
@@ -871,7 +948,7 @@ async def handle_ttt_leaderboard(chat_id: int, msg_id: int):
         scores = load_scores()
         
         if not scores:
-            await tg_send_message(
+            await _send_markdown_with_fallback(
                 chat_id,
                 "📊 *Leaderboard*\n\nNo games recorded yet.",
                 reply_to=msg_id,
@@ -879,8 +956,9 @@ async def handle_ttt_leaderboard(chat_id: int, msg_id: int):
             return
         
         # Sort by wins descending
+        player_rows = [row for row in scores.values() if isinstance(row, dict)]
         sorted_players = sorted(
-            scores.values(),
+            player_rows,
             key=lambda x: x.get("wins", 0),
             reverse=True,
         )[:10]
@@ -892,13 +970,14 @@ async def handle_ttt_leaderboard(chat_id: int, msg_id: int):
             draws = player.get("draws", 0)
             total = wins + losses + draws
             wr = (wins / total * 100) if total > 0 else 0
+            name = _escape_markdown(player.get("name", "Unknown"))
             lines.append(
-                f"{idx}. *{player.get('name', 'Unknown')}* — "
+                f"{idx}. *{name}* — "
                 f"W:{wins} L:{losses} D:{draws} ({wr:.0f}%)"
             )
         
         text = "\n".join(lines)
-        await tg_send_message(chat_id, text, reply_to=msg_id)
+        await _send_markdown_with_fallback(chat_id, text, reply_to=msg_id)
     
     except Exception as e:
         print(f"[TTT] Error in handle_ttt_leaderboard: {e}")
@@ -911,7 +990,7 @@ async def handle_ttt_mystats(uid: int, chat_id: int, msg_id: int):
         player_score = scores.get(str(uid), {})
         
         if not player_score:
-            await tg_send_message(
+            await _send_markdown_with_fallback(
                 chat_id,
                 "📊 *Your Stats*\n\nNo games yet. Play one to see stats!",
                 reply_to=msg_id,
@@ -932,7 +1011,7 @@ async def handle_ttt_mystats(uid: int, chat_id: int, msg_id: int):
             f"🎯 Win Rate: `{wr:.1f}%`\n"
             f"🧮 Total: `{total}`"
         )
-        await tg_send_message(chat_id, text, reply_to=msg_id)
+        await _send_markdown_with_fallback(chat_id, text, reply_to=msg_id)
     
     except Exception as e:
         print(f"[TTT] Error in handle_ttt_mystats: {e}")
@@ -1000,12 +1079,12 @@ async def handle_ttt_callback(
     try:
         # Parse callback data
         if data.startswith("ttt_accept_"):
-            msg_id = int(data.replace("ttt_accept_", ""))
-            await handle_accept_challenge(cb_id, msg_id, uid, from_user, chat_id, message)
+            challenge_id = data.replace("ttt_accept_", "", 1)
+            await handle_accept_challenge(cb_id, challenge_id, uid, from_user, chat_id, message)
         
         elif data.startswith("ttt_decline_"):
-            msg_id = int(data.replace("ttt_decline_", ""))
-            await handle_decline_challenge(cb_id, msg_id, uid, chat_id)
+            challenge_id = data.replace("ttt_decline_", "", 1)
+            await handle_decline_challenge(cb_id, challenge_id, uid, chat_id)
         
         elif data.startswith("ttt_move_"):
             parts = data.replace("ttt_move_", "").split("_")
@@ -1031,7 +1110,7 @@ async def handle_ttt_callback(
 
 async def handle_accept_challenge(
     cb_id: str,
-    msg_id: int,
+    challenge_id: str,
     uid: int,
     from_user: dict,
     chat_id: int,
@@ -1039,21 +1118,27 @@ async def handle_accept_challenge(
 ):
     """Accept challenge and start game."""
     try:
-        challenge = CHALLENGES.get(msg_id)
+        challenge = CHALLENGES.get(challenge_id)
         if not challenge:
             await tg_answer_callback(cb_id, "⏳ Challenge expired.", alert=True)
+            return
+
+        if challenge.get("chat_id") != chat_id:
+            await tg_answer_callback(cb_id, "❌ Invalid challenge context.", alert=True)
             return
         
         # Check: opponent accepting
         if uid != challenge["opponent_id"]:
             await tg_answer_callback(cb_id, "❌ Only opponent can accept.", alert=True)
             return
+
+        # Re-check player availability to avoid race conditions.
+        if get_game_for_player(challenge["challenger_id"]) or get_game_for_player(challenge["opponent_id"]):
+            await tg_answer_callback(cb_id, "❌ One player is already in another game.", alert=True)
+            return
         
         # Create game
-        opponent_name = (
-            (from_user.get("first_name", "") + " " + from_user.get("last_name", "")).strip()
-            or from_user.get("username", "Player")
-        )
+        opponent_name = _name_from_user(from_user, challenge.get("opponent_name", "Player"))
         game = create_game(
             challenge["challenger_id"],
             challenge["challenger_name"],
@@ -1063,8 +1148,8 @@ async def handle_accept_challenge(
         )
         
         # Delete challenge message
-        await tg_delete_message(chat_id, msg_id)
-        del CHALLENGES[msg_id]
+        await tg_delete_message(chat_id, challenge.get("challenge_msg_id", 0))
+        del CHALLENGES[challenge_id]
         _persist_state()
         
         # Send board
@@ -1093,20 +1178,24 @@ async def handle_accept_challenge(
         print(f"[TTT] Error in handle_accept_challenge: {e}")
 
 
-async def handle_decline_challenge(cb_id: str, msg_id: int, uid: int, chat_id: int):
+async def handle_decline_challenge(cb_id: str, challenge_id: str, uid: int, chat_id: int):
     """Decline challenge."""
     try:
-        challenge = CHALLENGES.get(msg_id)
+        challenge = CHALLENGES.get(challenge_id)
         if not challenge:
             await tg_answer_callback(cb_id, "⏳ Challenge expired.", alert=True)
+            return
+
+        if challenge.get("chat_id") != chat_id:
+            await tg_answer_callback(cb_id, "❌ Invalid challenge context.", alert=True)
             return
         
         if uid != challenge["opponent_id"]:
             await tg_answer_callback(cb_id, "❌ Only opponent can decline.", alert=True)
             return
         
-        await tg_delete_message(chat_id, msg_id)
-        del CHALLENGES[msg_id]
+        await tg_delete_message(chat_id, challenge.get("challenge_msg_id", 0))
+        del CHALLENGES[challenge_id]
         _persist_state()
         await tg_answer_callback(cb_id, "👋 Challenge declined.")
     
@@ -1227,6 +1316,10 @@ async def handle_rematch(cb_id: str, game_id: str, uid: int, chat_id: int, messa
         old_game = GAMES[game_id]
         if old_game["status"] != "finished":
             await tg_answer_callback(cb_id, "Game still active.", alert=True)
+            return
+
+        if uid not in (old_game.get("player_x"), old_game.get("player_o")):
+            await tg_answer_callback(cb_id, "❌ Only players can start rematch.", alert=True)
             return
         
         # Create new game with swapped sides
