@@ -107,7 +107,7 @@ BOT_COMMANDS = [
     {"command": "hmodinfo", "description": "👮 View moderator information"},
 ]
 
-VALID_PERMISSIONS = {"ban", "mute", "warn", "delete"}
+VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
 
 # =========================================================
 # LOGGING
@@ -1074,7 +1074,7 @@ def role_help_text(uid: int) -> str:
             "`/hauth <user_id>` - Authorize a moderator\n"
             "`/hrevoke <perm> <user_id>` - Remove permission\n"
             "`/hgrant <perm> <user_id>` - Grant permission\n"
-            "Permissions: ban, mute, warn, delete\n\n"
+            "Permissions: ban, unban, mute, unmute, kick, warn, delete, pin\n\n"
             "🛡️ **Protection Commands:**\n"
             "`/hprotect <user_id>` - Protect user from moderation\n\n"
             "📋 **Moderation Commands:**\n"
@@ -1786,11 +1786,11 @@ async def handle_message(bot: Client, msg: dict):
             if not args:
                 return await reply_text(
                     f"Usage: /hgrant <permission> <user_id>\n"
-                    f"Valid: {', '.join(VALID_PERMISSIONS)}"
+                    f"Valid: {', '.join(sorted(VALID_PERMISSIONS))}"
                 )
             perm = args[0].lower()
             if perm not in VALID_PERMISSIONS:
-                return await reply_text(f"❌ Invalid permission. Valid: {', '.join(VALID_PERMISSIONS)}")
+                return await reply_text(f"❌ Invalid permission. Valid: {', '.join(sorted(VALID_PERMISSIONS))}")
             target, tid, terr = resolve_target(reply, args, 1)
             if not tid:
                 return await reply_text(f"{terr}")
@@ -1811,7 +1811,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("Usage: /hrevoke <permission> <user_id>")
             perm = args[0].lower()
             if perm not in VALID_PERMISSIONS:
-                return await reply_text(f"❌ Invalid. Valid: {', '.join(VALID_PERMISSIONS)}")
+                return await reply_text(f"❌ Invalid. Valid: {', '.join(sorted(VALID_PERMISSIONS))}")
             target, tid, terr = resolve_target(reply, args, 1)
             if not tid:
                 return await reply_text(f"{terr}")
@@ -1873,7 +1873,7 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /hkick ───────────────────────────────────────
         if raw_cmd in ("hkick", "hk"):
-            if not await check_mod("ban"):
+            if not await check_mod("kick"):
                 return
             target, tid, terr = resolve_target(reply, args, 0)
             if not tid:
@@ -1895,7 +1895,7 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /pin ─────────────────────────────────────────
         if raw_cmd == "pin":
-            if not is_authorized_actor():
+            if not await check_mod("pin"):
                 return await reply_text("❌ Moderator access required.")
             if not reply:
                 return await reply_text("❌ Reply to the message you want to pin.")
@@ -1910,7 +1910,7 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /unpin ───────────────────────────────────────
         if raw_cmd == "unpin":
-            if not is_authorized_actor():
+            if not await check_mod("pin"):
                 return await reply_text("❌ Moderator access required.")
             ok, err = await api_unpin(chat_id)
             if not ok:
@@ -1927,7 +1927,7 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /zombies ─────────────────────────────────────
         if raw_cmd == "zombies":
-            if not await check_mod("ban"):
+            if not await check_mod("kick"):
                 return
             if await anti_nuke(chat_id, msg_id, uid):
                 return
@@ -2141,8 +2141,8 @@ async def handle_callback(bot: Client, cb: dict):
             return
 
         if data.startswith("unban_"):
-            if not has_permission(uid, "ban"):
-                return await tg_answer_cb(cb_id, "❌ No ban permission.", alert=True)
+            if not has_permission(uid, "unban"):
+                return await tg_answer_cb(cb_id, "❌ No unban permission.", alert=True)
             tid = int(data.split("_", 1)[1])
             ok, err = await api_unban(chat_id, tid)
             if ok:
@@ -2151,8 +2151,8 @@ async def handle_callback(bot: Client, cb: dict):
                 await tg_answer_cb(cb_id, f"❌ {err}", alert=True)
 
         elif data.startswith("unmute_"):
-            if not has_permission(uid, "mute"):
-                return await tg_answer_cb(cb_id, "❌ No mute permission.", alert=True)
+            if not has_permission(uid, "unmute"):
+                return await tg_answer_cb(cb_id, "❌ No unmute permission.", alert=True)
             tid = int(data.split("_", 1)[1])
             ok, err = await api_unmute(chat_id, tid)
             if ok:
