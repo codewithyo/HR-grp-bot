@@ -942,7 +942,7 @@ async def handle_ttt_command(
         print(f"[TTT] Error in handle_ttt_command: {e}")
 
 
-async def handle_ttt_leaderboard(chat_id: int, msg_id: int):
+async def handle_ttt_leaderboard(chat_id: int, msg_id: Optional[int] = None):
     """Handle /tttleaderboard."""
     try:
         scores = load_scores()
@@ -1102,7 +1102,7 @@ async def handle_ttt_callback(
         
         elif data == "ttt_leaderboard":
             await tg_answer_callback(cb_id)
-            await handle_ttt_leaderboard(chat_id, message.get("message_id"))
+            await handle_ttt_leaderboard(chat_id, None)
     
     except Exception as e:
         print(f"[TTT] Error in handle_ttt_callback: {e}")
