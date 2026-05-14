@@ -36,6 +36,16 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from pyrogram import Client, enums
 from db import mongo_db
+from games import (
+    init_games,
+    handle_ttt_command,
+    handle_ttt_leaderboard,
+    handle_ttt_mystats,
+    handle_ttt_end,
+    handle_ttt_callback,
+    games_cleanup_worker,
+    TTT_CALLBACK_PREFIXES,
+)
 
 # =========================================================
 # CACHING LAYER — reduces disk/db I/O dramatically
@@ -87,6 +97,10 @@ BOT_COMMANDS = [
     {"command": "start",    "description": "🚀 Start the bot & view welcome message"},
     {"command": "help",     "description": "📖 Display available commands for your role"},
     {"command": "hr",       "description": "🆔 Get user ID & profile information"},
+    {"command": "ttt",      "description": "🎮 Play Tic-Tac-Toe"},
+    {"command": "tttleaderboard", "description": "📊 Tic-Tac-Toe leaderboard"},
+    {"command": "tttmystats", "description": "📈 Your Tic-Tac-Toe stats"},
+    {"command": "tttend",   "description": "🏳️ End your Tic-Tac-Toe game"},
     {"command": "happeal",  "description": "📢 Appeal a moderation case (DM only)"},
     {"command": "hauth",    "description": "🔐 Authorize a moderator (Owner)"},
     {"command": "hgrant",   "description": "✅ Grant permission to moderator (Owner)"},
@@ -190,6 +204,8 @@ PROTECT_FILE      = f"{STORAGE_PATH}/protected.json"
 ABUSE_FILE        = f"{STORAGE_PATH}/abuse.json"
 TEMP_ACTIONS_FILE = f"{STORAGE_PATH}/temp_actions.json"
 APPEALS_FILE      = f"{STORAGE_PATH}/appeals.json"
+TTT_SCORES_FILE   = f"{STORAGE_PATH}/ttt_scores.json"
+TTT_STATE_FILE    = f"{STORAGE_PATH}/ttt_state.json"
 
 FALLBACK_FILE_MAP = {
     AUTH_FILE:         f"{FALLBACK_STORAGE_PATH}/auth.json",
@@ -200,6 +216,8 @@ FALLBACK_FILE_MAP = {
     ABUSE_FILE:        f"{FALLBACK_STORAGE_PATH}/abuse.json",
     TEMP_ACTIONS_FILE: f"{FALLBACK_STORAGE_PATH}/temp_actions.json",
     APPEALS_FILE:      f"{FALLBACK_STORAGE_PATH}/appeals.json",
+    TTT_SCORES_FILE:   f"{FALLBACK_STORAGE_PATH}/ttt_scores.json",
+    TTT_STATE_FILE:    f"{FALLBACK_STORAGE_PATH}/ttt_state.json",
 }
 
 ALL_FILES = list(FALLBACK_FILE_MAP.keys())
@@ -213,6 +231,8 @@ FILE_LABEL = {
     PROTECT_FILE:      "protected",
     TEMP_ACTIONS_FILE: "temp_actions",
     APPEALS_FILE:      "appeals",
+    TTT_SCORES_FILE:   "ttt_scores",
+    TTT_STATE_FILE:    "ttt_state",
 }
 
 MONGO_LOADERS = {
@@ -224,6 +244,8 @@ MONGO_LOADERS = {
     ABUSE_FILE: mongo_db.load_abuse,
     TEMP_ACTIONS_FILE: mongo_db.load_temp_actions,
     APPEALS_FILE: mongo_db.load_appeals,
+    TTT_SCORES_FILE: mongo_db.load_ttt_scores,
+    TTT_STATE_FILE: mongo_db.load_ttt_state,
 }
 
 MONGO_SAVERS = {
@@ -235,6 +257,8 @@ MONGO_SAVERS = {
     ABUSE_FILE: mongo_db.save_abuse,
     TEMP_ACTIONS_FILE: mongo_db.save_temp_actions,
     APPEALS_FILE: mongo_db.save_appeals,
+    TTT_SCORES_FILE: mongo_db.save_ttt_scores,
+    TTT_STATE_FILE: mongo_db.save_ttt_state,
 }
 
 def _read_local_json(file: str):
@@ -1088,6 +1112,11 @@ def role_help_text(uid: int) -> str:
             "`/hdel <msg_id>` - Delete message\n"
             "`/hcase <case_id>` - View case details\n"
             "`/hmodinfo [user_id]` - View moderator info\n\n"
+            "🎮 **Games:**\n"
+            "`/ttt [user_id]` - Start Tic-Tac-Toe (DM plays vs bot)\n"
+            "`/tttleaderboard` - Show top players\n"
+            "`/tttmystats` - Show your game stats\n"
+            "`/tttend` - Forfeit active game\n\n"
             "⏱️ **Duration Format:** 30m, 2h, 1d (for timed actions)\n\n"
             "💡 **Tip:** Reply to a message to target without ID\n\n"
             "📖 **Examples:**\n"
@@ -1112,6 +1141,11 @@ def role_help_text(uid: int) -> str:
             "`/hmod list` - List authorized moderators\n"
             "`/hmodinfo` - View your moderator info\n"
             "`/hr` - Get user information\n\n"
+            "🎮 **Games:**\n"
+            "`/ttt [user_id]` - Start Tic-Tac-Toe\n"
+            "`/tttleaderboard` - Show top players\n"
+            "`/tttmystats` - Show your game stats\n"
+            "`/tttend` - Forfeit active game\n\n"
             "⏱️ **Duration Format:** 30m, 2h, 1d (for timed actions)\n\n"
             "💡 **Tip:** Reply to a message to target without ID\n\n"
             "📖 **Examples:**\n"
@@ -1125,7 +1159,11 @@ def role_help_text(uid: int) -> str:
         "🆔 **Available Commands:**\n"
         "`/start` - View welcome message\n"
         "`/help` - Show this help message\n"
-        "`/hr` - Get user ID & profile info\n\n"
+        "`/hr` - Get user ID & profile info\n"
+        "`/ttt [user_id]` - Play Tic-Tac-Toe (DM plays vs bot)\n"
+        "`/tttleaderboard` - Show top players\n"
+        "`/tttmystats` - Show your game stats\n"
+        "`/tttend` - Forfeit active game\n\n"
         "📢 **Appeals:**\n"
         "Disputed a moderation action?\n"
         "Use `/happeal <case_id> <message>` in bot DM\n\n"
@@ -1164,6 +1202,7 @@ def build_markup(*rows) -> dict:
 _bot: Client      = None
 bot_ready: bool   = False
 _temp_worker_task = None
+_games_worker_task = None
 
 async def get_bot() -> Client:
     global _bot, bot_ready
@@ -1745,6 +1784,23 @@ async def handle_message(bot: Client, msg: dict):
                 log_msg(f"Error in /hr command: {e}\n{traceback.format_exc()}", "ERROR")
                 return await reply_text(f"❌ Error: {str(e)}")
 
+        # ── /ttt commands (all users) ───────────────────
+        if raw_cmd in ("ttt", "ttt_game"):
+            await handle_ttt_command(bot, msg, args, reply, uid, chat_id, msg_id)
+            return
+
+        if raw_cmd == "tttleaderboard":
+            await handle_ttt_leaderboard(chat_id, msg_id)
+            return
+
+        if raw_cmd == "tttmystats":
+            await handle_ttt_mystats(uid, chat_id, msg_id)
+            return
+
+        if raw_cmd == "tttend":
+            await handle_ttt_end(uid, chat_id, msg_id, is_owner=is_owner_actor())
+            return
+
         # ── /happeal ──────────────────────────────────────
         if raw_cmd == "happeal":
             if msg.get("chat", {}).get("type") != "private":
@@ -2149,6 +2205,11 @@ async def handle_callback(bot: Client, cb: dict):
         message   = cb.get("message", {})
         chat_id   = message.get("chat", {}).get("id")
 
+        for prefix in TTT_CALLBACK_PREFIXES:
+            if data.startswith(prefix):
+                await handle_ttt_callback(cb_id, data, uid, from_user, chat_id, message)
+                return
+
         if not is_authorized(uid):
             await tg_answer_cb(cb_id, "⛔ Only moderators can use this.", alert=True)
             return
@@ -2209,12 +2270,19 @@ async def handle_callback(bot: Client, cb: dict):
 
 @app.on_event("startup")
 async def startup_event():
-    global _temp_worker_task
+    global _temp_worker_task, _games_worker_task
     log_msg("🚀 Starting up...", "INFO")
     try:
         mongo_db.connect()
         sync_storage_with_mongo()
         bot = await get_bot()
+
+        init_games(
+            save_fn=save,
+            load_fn=load,
+            scores_file=TTT_SCORES_FILE,
+            bot_token=BOT_TOKEN,
+        )
 
         # 1. Resolve / auto-detect the log group
         await resolve_log_group(bot)
@@ -2236,6 +2304,8 @@ async def startup_event():
         # 4. Start temp-action worker
         if _temp_worker_task is None or _temp_worker_task.done():
             _temp_worker_task = asyncio.create_task(temp_action_worker())
+        if _games_worker_task is None or _games_worker_task.done():
+            _games_worker_task = asyncio.create_task(games_cleanup_worker())
 
         lg = get_log_group()
         startup_text = (
@@ -2257,12 +2327,18 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _temp_worker_task, _http_client
+    global _temp_worker_task, _games_worker_task, _http_client
     log_msg("🛑 Shutting down...", "INFO")
     if _temp_worker_task and not _temp_worker_task.done():
         _temp_worker_task.cancel()
         try:
             await _temp_worker_task
+        except asyncio.CancelledError:
+            pass
+    if _games_worker_task and not _games_worker_task.done():
+        _games_worker_task.cancel()
+        try:
+            await _games_worker_task
         except asyncio.CancelledError:
             pass
     await shutdown_bot()

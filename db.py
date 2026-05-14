@@ -29,6 +29,8 @@ class MongoDBHandler:
             "abuse": "abuse_tracking",
             "temp_actions": "temporary_actions",
             "appeals": "user_appeals",
+            "ttt_scores": "ttt_scores",
+            "ttt_state": "ttt_state",
         }
         
     def connect(self) -> bool:
@@ -181,6 +183,22 @@ class MongoDBHandler:
     def save_appeals(self, data: Dict[str, Any]) -> bool:
         """Save appeals data."""
         return self._save_collection_data("appeals", data)
+
+    def load_ttt_scores(self) -> Dict[str, Any]:
+        """Load Tic-Tac-Toe scores."""
+        return self._load_collection_data("ttt_scores", {})
+
+    def save_ttt_scores(self, data: Dict[str, Any]) -> bool:
+        """Save Tic-Tac-Toe scores."""
+        return self._save_collection_data("ttt_scores", data)
+
+    def load_ttt_state(self) -> Dict[str, Any]:
+        """Load Tic-Tac-Toe runtime state snapshot."""
+        return self._load_collection_data("ttt_state", {})
+
+    def save_ttt_state(self, data: Dict[str, Any]) -> bool:
+        """Save Tic-Tac-Toe runtime state snapshot."""
+        return self._save_collection_data("ttt_state", data)
     
     def disconnect(self):
         """Disconnect from MongoDB and close connection pool."""
