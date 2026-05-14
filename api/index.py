@@ -2,20 +2,6 @@
 # ADVANCED TELEGRAM MODERATION BOT — KOYEB VERSION (FIXED)
 # =========================================================
 #
-# FIXES in this revision:
-#   • Peer ID Invalid  — ALL send_message calls now go through
-#     tg_send() which uses the Bot API (httpx) directly.
-#     Pyrogram's in-memory session no longer needs peer cache.
-#   • Permissions wiped on restart — every save() also uploads
-#     a JSON snapshot as a Telegram document to BACKUP_CHAT_ID
-#     (defaults to LOG_GROUP_ID).  On startup the bot fetches
-#     the latest snapshot and restores local files automatically.
-#   • Auto-detect log group — if LOG_GROUP_ID == 0 the bot
-#     scans its dialogs on startup and picks the first
-#     supergroup/group where it has admin rights.
-#   • GET / 404 — root endpoint now returns a JSON status page.
-#   • Action log now goes to the originating chat AND log group.
-#
 # ENV VARS required:
 #   API_ID  API_HASH  BOT_TOKEN  OWNER_ID  PORT
 #   LOG_GROUP_ID      (0 = auto-detect)
@@ -32,7 +18,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse
 
 from pyrogram import Client, enums
 from db import mongo_db
@@ -49,7 +35,7 @@ from games import (
 )
 
 # =========================================================
-# CACHING LAYER — reduces disk/db I/O dramatically
+# CACHING LAYER
 # =========================================================
 
 class DataCache:
@@ -58,7 +44,7 @@ class DataCache:
         self.cache: Dict[str, tuple[Any, float]] = {}
         self.lock = threading.RLock()
         self.ttl = ttl_seconds
-    
+
     def get(self, key: str) -> Any:
         with self.lock:
             if key not in self.cache:
@@ -68,62 +54,60 @@ class DataCache:
                 del self.cache[key]
                 return None
             return data
-    
+
     def set(self, key: str, data: Any):
         with self.lock:
             self.cache[key] = (data, time.time())
-    
+
     def invalidate(self, key: str = None):
         with self.lock:
             if key:
                 self.cache.pop(key, None)
             else:
                 self.cache.clear()
-    
+
     def keys(self):
         with self.lock:
             return list(self.cache.keys())
 
-_cache = DataCache(ttl_seconds=60)  # 60-second cache TTL
-# Pyrogram is used only for: get_me(), get_chat(), get_dialogs(),
-# get_chat_member(), get_chat_history(), download_media().
-# All moderation actions (ban/mute/restrict/delete) go through
-# the Bot API wrappers (httpx) defined below.
+_cache = DataCache(ttl_seconds=60)
 
 # =========================================================
 # BOT COMMANDS MANIFEST
 # =========================================================
 
 BOT_COMMANDS = [
-    {"command": "start",    "description": "🚀 Start the bot & view welcome message"},
-    {"command": "help",     "description": "📖 Display available commands for your role"},
-    {"command": "hr",       "description": "🆔 Get user ID & profile information"},
-    {"command": "ttt",      "description": "🎮 Play Tic-Tac-Toe"},
-    {"command": "tttleaderboard", "description": "📊 Tic-Tac-Toe leaderboard"},
-    {"command": "tttmystats", "description": "📈 Your Tic-Tac-Toe stats"},
-    {"command": "tttend",   "description": "🏳️ End your Tic-Tac-Toe game"},
-    {"command": "happeal",  "description": "📢 Appeal a moderation case (DM only)"},
-    {"command": "hauth",    "description": "🔐 Authorize a moderator (Owner)"},
-    {"command": "hgrant",   "description": "✅ Grant permission to moderator (Owner)"},
-    {"command": "hrevoke",  "description": "❌ Revoke permission from moderator (Owner)"},
-    {"command": "hban",     "description": "🚫 Ban a user from group"},
-    {"command": "hkick",    "description": "👢 Kick a user from group"},
-    {"command": "hmute",    "description": "🔇 Mute a user in group"},
-    {"command": "hstats",   "description": "📊 Show group moderation stats"},
-    {"command": "hmod",     "description": "👮 List authorized moderators"},
-    {"command": "pin",      "description": "📌 Pin replied message"},
-    {"command": "unpin",    "description": "📍 Unpin current message"},
-    {"command": "adminlist", "description": "👮 Show all group admins"},
-    {"command": "zombies",  "description": "🧟 Scan and kick deleted/bot accounts"},
-    {"command": "hwarn",    "description": "⚠️ Issue warning to user"},
-    {"command": "hdel",     "description": "🗑️ Delete a message"},
-    {"command": "hprotect", "description": "🛡️ Protect user from moderation"},
-    {"command": "hcase",    "description": "📋 View moderation case details"},
-    {"command": "hmodinfo", "description": "👮 View moderator information"},
+    {"command": "start",         "description": "🚀 Start the bot & view welcome message"},
+    {"command": "help",          "description": "📖 Display available commands for your role"},
+    {"command": "hr",            "description": "🆔 Get user ID & profile information"},
+    {"command": "ttt",           "description": "🎮 Play Tic-Tac-Toe"},
+    {"command": "tttleaderboard","description": "📊 Tic-Tac-Toe leaderboard"},
+    {"command": "tttmystats",    "description": "📈 Your Tic-Tac-Toe stats"},
+    {"command": "tttend",        "description": "🏳️ End your Tic-Tac-Toe game"},
+    {"command": "happeal",       "description": "📢 Appeal a moderation case (DM only)"},
+    {"command": "hauth",         "description": "🔐 Authorize a moderator (Owner)"},
+    {"command": "hgrant",        "description": "✅ Grant permission to moderator (Owner)"},
+    {"command": "hrevoke",       "description": "❌ Revoke permission from moderator (Owner)"},
+    {"command": "hban",          "description": "🚫 Ban a user from group"},
+    {"command": "hkick",         "description": "👢 Kick a user from group"},
+    {"command": "hmute",         "description": "🔇 Mute a user in group"},
+    {"command": "hunban",        "description": "🔓 Unban a user from group"},
+    {"command": "hunmute",       "description": "🔊 Unmute a user in group"},
+    {"command": "hstats",        "description": "📊 Show group moderation stats"},
+    {"command": "hmod",          "description": "👮 List authorized moderators"},
+    {"command": "pin",           "description": "📌 Pin replied message"},
+    {"command": "unpin",         "description": "📍 Unpin current message"},
+    {"command": "adminlist",     "description": "👮 Show all group admins"},
+    {"command": "zombies",       "description": "🧟 Scan and kick deleted/bot accounts"},
+    {"command": "hwarn",         "description": "⚠️ Issue warning to user"},
+    {"command": "hdel",          "description": "🗑️ Delete a message"},
+    {"command": "hprotect",      "description": "🛡️ Protect user from moderation"},
+    {"command": "hcase",         "description": "📋 View moderation case details"},
+    {"command": "hmodinfo",      "description": "👮 View moderator information"},
 ]
 
 VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
-ACTION_LOG_AUTO_DELETE = 60  # Auto-delete action log messages after 60 seconds (1 minute)
+ACTION_LOG_AUTO_DELETE = 60  # seconds
 
 # =========================================================
 # LOGGING
@@ -141,12 +125,11 @@ API_ID       = int(os.environ.get("API_ID", "0"))
 API_HASH     = os.environ.get("API_HASH", "")
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
-LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))   # 0 = auto-detect
+LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))
 PORT         = int(os.environ.get("PORT", "8000"))
 OWNER_DEBUG_NOTIFICATIONS = os.environ.get("OWNER_DEBUG_NOTIFICATIONS", "0") == "1"
 
-# Mutable — may be updated after auto-detection
-_log_group_id: int = LOG_GROUP_ID
+_log_group_id: int  = LOG_GROUP_ID
 _backup_chat_id: int = int(os.environ.get("BACKUP_CHAT_ID", str(LOG_GROUP_ID)))
 
 def get_log_group() -> int:
@@ -169,7 +152,7 @@ def resolve_storage_path() -> str:
         log_msg(f"Storage path '{preferred}' unavailable → falling back to {fallback}", "WARNING")
         return fallback
 
-STORAGE_PATH = resolve_storage_path()
+STORAGE_PATH          = resolve_storage_path()
 FALLBACK_STORAGE_PATH = os.environ.get("FALLBACK_STORAGE_PATH", "/tmp/modbot_fallback")
 Path(FALLBACK_STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 
@@ -200,7 +183,7 @@ Path(STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 AUTH_FILE         = f"{STORAGE_PATH}/auth.json"
 WARN_FILE         = f"{STORAGE_PATH}/warns.json"
 CASE_FILE         = f"{STORAGE_PATH}/cases.json"
-WARN_CONFIG_FILE   = f"{STORAGE_PATH}/warn_config.json"
+WARN_CONFIG_FILE  = f"{STORAGE_PATH}/warn_config.json"
 PROTECT_FILE      = f"{STORAGE_PATH}/protected.json"
 ABUSE_FILE        = f"{STORAGE_PATH}/abuse.json"
 TEMP_ACTIONS_FILE = f"{STORAGE_PATH}/temp_actions.json"
@@ -212,7 +195,7 @@ FALLBACK_FILE_MAP = {
     AUTH_FILE:         f"{FALLBACK_STORAGE_PATH}/auth.json",
     WARN_FILE:         f"{FALLBACK_STORAGE_PATH}/warns.json",
     CASE_FILE:         f"{FALLBACK_STORAGE_PATH}/cases.json",
-        WARN_CONFIG_FILE:  f"{FALLBACK_STORAGE_PATH}/warn_config.json",
+    WARN_CONFIG_FILE:  f"{FALLBACK_STORAGE_PATH}/warn_config.json",
     PROTECT_FILE:      f"{FALLBACK_STORAGE_PATH}/protected.json",
     ABUSE_FILE:        f"{FALLBACK_STORAGE_PATH}/abuse.json",
     TEMP_ACTIONS_FILE: f"{FALLBACK_STORAGE_PATH}/temp_actions.json",
@@ -223,13 +206,14 @@ FALLBACK_FILE_MAP = {
 
 ALL_FILES = list(FALLBACK_FILE_MAP.keys())
 
-# Map filename stem → label used in Telegram backup captions
+# FIX #12 — ABUSE_FILE added to FILE_LABEL
 FILE_LABEL = {
     AUTH_FILE:         "auth",
     WARN_FILE:         "warns",
     CASE_FILE:         "cases",
-        WARN_CONFIG_FILE:  "warn_config",
+    WARN_CONFIG_FILE:  "warn_config",
     PROTECT_FILE:      "protected",
+    ABUSE_FILE:        "abuse",
     TEMP_ACTIONS_FILE: "temp_actions",
     APPEALS_FILE:      "appeals",
     TTT_SCORES_FILE:   "ttt_scores",
@@ -237,30 +221,34 @@ FILE_LABEL = {
 }
 
 MONGO_LOADERS = {
-    AUTH_FILE: mongo_db.load_auth,
-    WARN_FILE: mongo_db.load_warns,
-    CASE_FILE: mongo_db.load_cases,
-        WARN_CONFIG_FILE: mongo_db.load_warn_config,
-    PROTECT_FILE: mongo_db.load_protected,
-    ABUSE_FILE: mongo_db.load_abuse,
+    AUTH_FILE:         mongo_db.load_auth,
+    WARN_FILE:         mongo_db.load_warns,
+    CASE_FILE:         mongo_db.load_cases,
+    WARN_CONFIG_FILE:  mongo_db.load_warn_config,
+    PROTECT_FILE:      mongo_db.load_protected,
+    ABUSE_FILE:        mongo_db.load_abuse,
     TEMP_ACTIONS_FILE: mongo_db.load_temp_actions,
-    APPEALS_FILE: mongo_db.load_appeals,
-    TTT_SCORES_FILE: mongo_db.load_ttt_scores,
-    TTT_STATE_FILE: mongo_db.load_ttt_state,
+    APPEALS_FILE:      mongo_db.load_appeals,
+    TTT_SCORES_FILE:   mongo_db.load_ttt_scores,
+    TTT_STATE_FILE:    mongo_db.load_ttt_state,
 }
 
 MONGO_SAVERS = {
-    AUTH_FILE: mongo_db.save_auth,
-    WARN_FILE: mongo_db.save_warns,
-    CASE_FILE: mongo_db.save_cases,
-        WARN_CONFIG_FILE: mongo_db.save_warn_config,
-    PROTECT_FILE: mongo_db.save_protected,
-    ABUSE_FILE: mongo_db.save_abuse,
+    AUTH_FILE:         mongo_db.save_auth,
+    WARN_FILE:         mongo_db.save_warns,
+    CASE_FILE:         mongo_db.save_cases,
+    WARN_CONFIG_FILE:  mongo_db.save_warn_config,
+    PROTECT_FILE:      mongo_db.save_protected,
+    ABUSE_FILE:        mongo_db.save_abuse,
     TEMP_ACTIONS_FILE: mongo_db.save_temp_actions,
-    APPEALS_FILE: mongo_db.save_appeals,
-    TTT_SCORES_FILE: mongo_db.save_ttt_scores,
-    TTT_STATE_FILE: mongo_db.save_ttt_state,
+    APPEALS_FILE:      mongo_db.save_appeals,
+    TTT_SCORES_FILE:   mongo_db.save_ttt_scores,
+    TTT_STATE_FILE:    mongo_db.save_ttt_state,
 }
+
+# =========================================================
+# STORAGE HELPERS
+# =========================================================
 
 def _read_local_json(file: str):
     if not os.path.exists(file):
@@ -305,28 +293,21 @@ init_storage_files()
 log_msg(f"Storage: {STORAGE_PATH}  Fallback: {FALLBACK_STORAGE_PATH}", "INFO")
 
 # =========================================================
-# JSON HELPERS (atomic save + fallback read)
+# JSON HELPERS
 # =========================================================
 
 def load(file: str):
-    """Load with caching: check cache → file → MongoDB → fallback."""
-    # Check cache first
     cached = _cache.get(file)
     if cached is not None:
         return cached
-    
     try:
         data = None
-        
-        # Try primary file
         if os.path.exists(file):
             try:
                 with open(file, "r") as f:
                     data = json.load(f)
             except json.JSONDecodeError:
                 data = None
-        
-        # If file missing/empty, try MongoDB
         if _is_empty_payload(data):
             loader = MONGO_LOADERS.get(file)
             if loader and mongo_db.is_connected():
@@ -334,12 +315,9 @@ def load(file: str):
                     remote = loader()
                     if not _is_empty_payload(remote):
                         data = remote
-                        # Write back to local file for resilience
                         _write_local_json(file, remote)
                 except Exception:
                     pass
-        
-        # If still empty, try fallback
         if _is_empty_payload(data):
             fallback = FALLBACK_FILE_MAP.get(file)
             if fallback and os.path.exists(fallback):
@@ -351,23 +329,16 @@ def load(file: str):
                         log_msg(f"Recovered {file} from fallback", "WARNING")
                 except Exception:
                     pass
-        
-        # Fallback to empty dict
         result = data if not _is_empty_payload(data) else {}
         _cache.set(file, result)
         return result
-        
     except Exception as e:
         log_msg(f"ERROR loading {file}: {e}", "ERROR")
         return {}
 
 def save(file: str, data):
-    """Save to cache, file, fallback, and MongoDB (async). Invalidate related caches."""
     try:
-        # Update cache immediately
         _cache.set(file, data)
-        
-        # Invalidate related auth caches when AUTH_FILE is updated
         if file == AUTH_FILE:
             for key in _cache.keys():
                 if key.startswith(("auth:", "perm:", "frozen:")):
@@ -376,8 +347,6 @@ def save(file: str, data):
             for key in _cache.keys():
                 if key.startswith("protected:"):
                     _cache.invalidate(key)
-        
-        # Write primary file
         tmp = f"{file}.tmp"
         try:
             Path(file).parent.mkdir(parents=True, exist_ok=True)
@@ -386,8 +355,6 @@ def save(file: str, data):
             os.replace(tmp, file)
         except Exception as e:
             log_msg(f"WARNING writing {file}: {e}", "WARNING")
-        
-        # Write fallback (non-blocking)
         fallback = FALLBACK_FILE_MAP.get(file)
         if fallback:
             try:
@@ -396,15 +363,13 @@ def save(file: str, data):
                     json.dump(data, f, indent=2)
                 os.replace(f"{fallback}.tmp", fallback)
             except Exception:
-                pass  # Silently skip fallback errors
-        
-        # Save to MongoDB (async to not block)
+                pass
         saver = MONGO_SAVERS.get(file)
         if saver and mongo_db.is_connected():
             try:
                 saver(data)
             except Exception:
-                pass  # Non-blocking MongoDB save
+                pass
     except Exception as e:
         log_msg(f"ERROR saving {file}: {e}", "ERROR")
 
@@ -412,7 +377,7 @@ def sync_storage_with_mongo():
     if not mongo_db.is_connected():
         return
     for file, loader in MONGO_LOADERS.items():
-        local_data = _read_local_json(file)
+        local_data  = _read_local_json(file)
         remote_data = loader()
         if not _is_empty_payload(local_data):
             saver = MONGO_SAVERS.get(file)
@@ -422,13 +387,12 @@ def sync_storage_with_mongo():
             _write_local_json(file, remote_data)
 
 # =========================================================
-# PERSISTENT HTTP CLIENT — connection pooling for speed
+# PERSISTENT HTTP CLIENT
 # =========================================================
 
 _http_client: httpx.AsyncClient = None
 
 async def get_http_client() -> httpx.AsyncClient:
-    """Get or create persistent async HTTP client with connection pooling."""
     global _http_client
     if _http_client is None:
         _http_client = httpx.AsyncClient(
@@ -438,11 +402,10 @@ async def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 # =========================================================
-# BOT API HELPER (httpx) — avoids Pyrogram peer-ID issues
+# BOT API HELPER
 # =========================================================
 
 async def tg_api(method: str, **kwargs) -> dict:
-    """Call any Telegram Bot API method. Returns parsed JSON."""
     try:
         client = await get_http_client()
         resp = await client.post(
@@ -461,7 +424,6 @@ async def tg_send(
     markup: dict = None,
     parse_mode: str = "Markdown",
 ) -> dict:
-    """Send a text message via Bot API (no Pyrogram peer cache needed)."""
     payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     if reply_to:
         payload["reply_to_message_id"] = reply_to
@@ -480,38 +442,34 @@ async def tg_delete(chat_id: int, message_id: int):
     await tg_api("deleteMessage", json={"chat_id": chat_id, "message_id": message_id})
 
 # =========================================================
-# BOT API MODERATION ACTION WRAPPERS
-# =========================================================
-# All moderation calls go through Bot API (httpx) so they work
-# regardless of Pyrogram's in-memory peer cache state.
-# Each returns (success: bool, error_text: str).
+# MODERATION API WRAPPERS
 # =========================================================
 
 _MUTE_PERMISSIONS = {
-    "can_send_messages":       False,
-    "can_send_audios":         False,
-    "can_send_documents":      False,
-    "can_send_photos":         False,
-    "can_send_videos":         False,
-    "can_send_video_notes":    False,
-    "can_send_voice_notes":    False,
-    "can_send_polls":          False,
-    "can_send_other_messages": False,
+    "can_send_messages":         False,
+    "can_send_audios":           False,
+    "can_send_documents":        False,
+    "can_send_photos":           False,
+    "can_send_videos":           False,
+    "can_send_video_notes":      False,
+    "can_send_voice_notes":      False,
+    "can_send_polls":            False,
+    "can_send_other_messages":   False,
     "can_add_web_page_previews": False,
 }
 
 _FULL_PERMISSIONS = {
-    "can_send_messages":       True,
-    "can_send_audios":         True,
-    "can_send_documents":      True,
-    "can_send_photos":         True,
-    "can_send_videos":         True,
-    "can_send_video_notes":    True,
-    "can_send_voice_notes":    True,
-    "can_send_polls":          True,
-    "can_send_other_messages": True,
+    "can_send_messages":         True,
+    "can_send_audios":           True,
+    "can_send_documents":        True,
+    "can_send_photos":           True,
+    "can_send_videos":           True,
+    "can_send_video_notes":      True,
+    "can_send_voice_notes":      True,
+    "can_send_polls":            True,
+    "can_send_other_messages":   True,
     "can_add_web_page_previews": True,
-    "can_invite_users":        True,
+    "can_invite_users":          True,
 }
 
 async def api_ban(chat_id: int, user_id: int, until_date: int = None) -> tuple[bool, str]:
@@ -523,7 +481,7 @@ async def api_ban(chat_id: int, user_id: int, until_date: int = None) -> tuple[b
 
 async def api_unban(chat_id: int, user_id: int) -> tuple[bool, str]:
     r = await tg_api("unbanChatMember", json={
-        "chat_id": chat_id, "user_id": user_id, "only_if_banned": True
+        "chat_id": chat_id, "user_id": user_id, "only_if_banned": True,
     })
     return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
 
@@ -536,7 +494,7 @@ async def api_mute(chat_id: int, user_id: int, until_date: int = None) -> tuple[
 
 async def api_unmute(chat_id: int, user_id: int) -> tuple[bool, str]:
     r = await tg_api("restrictChatMember", json={
-        "chat_id": chat_id, "user_id": user_id, "permissions": _FULL_PERMISSIONS
+        "chat_id": chat_id, "user_id": user_id, "permissions": _FULL_PERMISSIONS,
     })
     return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
 
@@ -562,20 +520,12 @@ async def api_delete_msg(chat_id: int, message_id: int) -> tuple[bool, str]:
     return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
 
 # =========================================================
-# TELEGRAM-BASED BACKUP (survives ephemeral FS)
-# =========================================================
-# On every save() for auth/warns/cases/protected/temp_actions/appeals
-# we also upload the JSON as a document to BACKUP_CHAT_ID.
-# On startup restore_from_telegram() fetches the last known snapshot.
-#
-# The backup message caption format:  MODBOT_BACKUP:<label>
-# We search recent messages for that caption.
+# TELEGRAM BACKUP
 # =========================================================
 
-_tg_backup_enabled = False   # set True once log group is confirmed
+_tg_backup_enabled = False
 
 async def upload_backup(label: str, data) -> bool:
-    """Upload a JSON snapshot as a Telegram document."""
     backup_chat = get_backup_chat()
     if not _tg_backup_enabled or backup_chat == 0:
         return False
@@ -592,64 +542,30 @@ async def upload_backup(label: str, data) -> bool:
         log_msg(f"Backup upload failed ({label}): {e}", "WARNING")
         return False
 
+# FIX #3/#4 — all critical files go through save_and_backup
+_BACKUP_LABELS = {"auth", "warns", "cases", "protected", "abuse", "temp_actions", "appeals"}
+
 async def save_and_backup(file: str, data):
-    """Save locally and push a Telegram backup for critical files."""
     save(file, data)
     label = FILE_LABEL.get(file)
-    if label and label in ("auth", "warns", "cases", "protected", "temp_actions", "appeals"):
+    if label and label in _BACKUP_LABELS:
         asyncio.create_task(upload_backup(label, data))
 
-async def restore_from_telegram() -> dict[str, bool]:
-    """
-    Search the last 200 messages in the backup chat for MODBOT_BACKUP:<label>
-    captions and download each one to restore local JSON files.
-    Returns {label: restored?} for each label.
-    """
-    backup_chat = get_backup_chat()
-    if backup_chat == 0:
-        return {}
-
-    label_to_file = {v: k for k, v in FILE_LABEL.items()}
-    restored: dict[str, bool] = {}
-    found_labels: set[str] = set()
-
-    try:
-        resp = await tg_api("getUpdates", json={"limit": 1, "offset": -1})
-    except Exception:
-        pass  # just to warm up
-
-    # getMessages via getChatHistory (Bot API only gives us messages through getUpdates)
-    # We use the forwardMessages trick: call getUpdates with large offset then check history.
-    # Simpler: just call getUpdates with allowed_updates=[] to get nothing, then use
-    # copyMessage trick. Actually the clean approach here is calling getFile after
-    # searching via forwardMessages... But Bot API doesn't have a getHistory endpoint.
-    #
-    # Better approach: use Pyrogram's get_chat_history() which works via MTProto.
-    # We do this AFTER the bot is started.
-    log_msg("Telegram backup restore will be attempted via Pyrogram after bot start", "INFO")
-    return restored
-
 async def restore_from_telegram_pyrogram(bot: Client) -> int:
-    """Use Pyrogram to scan backup chat history for MODBOT_BACKUP captions."""
     if not _tg_backup_enabled:
         return 0
-
     backup_chat = get_backup_chat()
     if backup_chat == 0:
         return 0
-
     label_to_file = {v: k for k, v in FILE_LABEL.items()}
     restored_count = 0
     seen_labels: set[str] = set()
-
     try:
-        # Validate chat access first to avoid noisy PeerIdInvalid errors on startup.
         try:
             await bot.get_chat(backup_chat)
         except Exception as e:
-            log_msg(f"Backup restore skipped: chat {backup_chat} is not accessible ({e})", "WARNING")
+            log_msg(f"Backup restore skipped: chat {backup_chat} not accessible ({e})", "WARNING")
             return 0
-
         async for msg in bot.get_chat_history(backup_chat, limit=500):
             caption = (msg.caption or "") + (msg.text or "")
             if not caption.startswith("MODBOT_BACKUP:"):
@@ -659,17 +575,14 @@ async def restore_from_telegram_pyrogram(bot: Client) -> int:
                 continue
             seen_labels.add(label)
             target_file = label_to_file[label]
-
-            # Skip if local file already exists and is non-empty
             if os.path.exists(target_file):
                 try:
                     with open(target_file, "r") as f:
                         existing = json.load(f)
-                    if existing:  # already has data
+                    if existing:
                         continue
                 except Exception:
                     pass
-
             if msg.document:
                 try:
                     file_bytes = await bot.download_media(msg, in_memory=True)
@@ -680,13 +593,10 @@ async def restore_from_telegram_pyrogram(bot: Client) -> int:
                         restored_count += 1
                 except Exception as e:
                     log_msg(f"Failed to restore {label}: {e}", "WARNING")
-
             if len(seen_labels) == len(label_to_file):
                 break
-
     except Exception as e:
         log_msg(f"restore_from_telegram_pyrogram skipped: {e}", "WARNING")
-
     return restored_count
 
 # =========================================================
@@ -700,8 +610,9 @@ def is_authorized(uid: int) -> bool:
     if is_owner(uid):
         return True
     cache_key = f"auth:{uid}"
-    if _cache.get(cache_key) is not None:
-        return _cache.get(cache_key)
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
     is_auth = str(uid) in load(AUTH_FILE)
     _cache.set(cache_key, is_auth)
     return is_auth
@@ -750,30 +661,22 @@ def is_protected(uid: int) -> bool:
 def make_mention(user: dict) -> str:
     if not isinstance(user, dict):
         return "User"
-    uid   = user.get("id")
-    name  = ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip() or "User"
+    uid  = user.get("id")
+    name = ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip() or "User"
     return f"[{name}](tg://user?id={uid})" if uid else name
 
 def extract_actor_user_id(msg: dict) -> tuple[int | None, str | None, bool]:
-    """Resolve actor ID and detect anonymous admin messages.
-
-    Returns (actor_uid, error_text, is_anonymous_admin).
-    For anonymous admins in groups/supergroups, actor_uid is a stable negative key per chat.
-    """
     if not isinstance(msg, dict):
         return None, "❌ Could not identify your Telegram account.", False
-
     sender_chat = msg.get("sender_chat")
-    chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
-    chat_type = chat.get("type")
+    chat        = msg.get("chat") or {}
+    chat_id     = chat.get("id")
+    chat_type   = chat.get("type")
     if isinstance(sender_chat, dict):
         sender_chat_id = sender_chat.get("id")
-        # Anonymous admin sends as the same supergroup/group chat.
         if sender_chat_id == chat_id and chat_type in ("group", "supergroup"):
             return -abs(int(chat_id)), None, True
         return None, "❌ Channel messages are not supported for moderation commands.", False
-
     from_user = msg.get("from")
     if isinstance(from_user, dict):
         uid = from_user.get("id")
@@ -833,43 +736,37 @@ def load_temp_actions() -> list:
 def save_temp_actions(actions: list):
     save(TEMP_ACTIONS_FILE, actions)
 
+# FIX #6 — shared helper to cancel pending temp actions
+def cancel_temp_action(action_type: str, chat_id: int, target_id: int):
+    actions  = load_temp_actions()
+    filtered = [
+        a for a in actions
+        if not (
+            a.get("type") == action_type
+            and a.get("chat_id") == chat_id
+            and a.get("target_id") == target_id
+        )
+    ]
+    if len(filtered) != len(actions):
+        save_temp_actions(filtered)
+
 def get_warn_config() -> dict:
-    """Get warning configuration with defaults."""
     config = load(WARN_CONFIG_FILE)
     if not isinstance(config, dict):
         config = {}
-    # Set defaults if not present
-    if "threshold" not in config:
-        config["threshold"] = 3
-    if "action" not in config:
-        config["action"] = "mute"  # mute, kick, or ban
-    if "duration" not in config:
-        config["duration"] = 3600  # 1 hour in seconds
+    config.setdefault("threshold", 3)
+    config.setdefault("action", "mute")
+    config.setdefault("duration", 3600)
     return config
 
 def save_warn_config(config: dict):
-    """Save warning configuration."""
     save(WARN_CONFIG_FILE, config)
-
-def get_user_warn_count(uid: int) -> int:
-    """Get current warning count for a user."""
-    warns = load(WARN_FILE)
-    return warns.get(str(uid), 0)
-
-def increment_user_warns(uid: int) -> int:
-    """Increment warning count for user and return new count."""
-    warns = load(WARN_FILE)
-    key = str(uid)
-    warns.setdefault(key, 0)
-    warns[key] += 1
-    save(WARN_FILE, warns)
-    return warns[key]
 
 def schedule_message_delete(chat_id: int, message_id: int, delay: int = 60):
     actions = load_temp_actions()
     actions.append({
-        "type": "delete",
-        "chat_id": chat_id,
+        "type":     "delete",
+        "chat_id":  chat_id,
         "target_id": message_id,
         "until_ts": int(time.time()) + delay,
     })
@@ -905,56 +802,46 @@ def format_timestamp(ts: int | None) -> str:
     return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def format_permission_set(perms: dict) -> str:
-    granted = [perm for perm, enabled in sorted(perms.items()) if enabled]
+    granted = [p for p, enabled in sorted(perms.items()) if enabled]
     return ", ".join(granted) if granted else "none"
 
 def format_admin_privileges(privileges) -> str:
     fields = [
-        "can_change_info",
-        "can_delete_messages",
-        "can_restrict_members",
-        "can_promote_members",
-        "can_manage_video_chats",
-        "can_post_messages",
-        "can_edit_messages",
-        "is_anonymous",
-        "can_invite_users",
-        "can_pin_messages",
-        "can_manage_chat",
-        "can_manage_topics",
+        "can_change_info", "can_delete_messages", "can_restrict_members",
+        "can_promote_members", "can_manage_video_chats", "can_post_messages",
+        "can_edit_messages", "is_anonymous", "can_invite_users",
+        "can_pin_messages", "can_manage_chat", "can_manage_topics",
     ]
     if not privileges:
         return "none"
-    granted = []
-    for field in fields:
-        if getattr(privileges, field, False):
-            granted.append(field.replace("can_", "").replace("_", " "))
+    granted = [
+        f.replace("can_", "").replace("_", " ")
+        for f in fields if getattr(privileges, f, False)
+    ]
     return ", ".join(granted) if granted else "none"
 
+# FIX #5 — UNBAN/UNMUTE/GRANT/REVOKE counted in stats
 def get_moderation_stats() -> dict:
     cases = load(CASE_FILE)
     if not isinstance(cases, dict):
         cases = {}
-
-    counts = {"BAN": 0, "MUTE": 0, "WARN": 0, "KICK": 0, "DELETE": 0}
+    counts: dict[str, int] = {
+        "BAN": 0, "UNBAN": 0, "MUTE": 0, "UNMUTE": 0,
+        "WARN": 0, "KICK": 0, "DELETE": 0,
+    }
     moderator_counts: dict[str, int] = {}
-    moderator_labels: dict[str, str] = {}
-
     for case in cases.values():
         if not isinstance(case, dict):
             continue
-        action = str(case.get("action", "")).upper()
+        action    = str(case.get("action", "")).upper()
         moderator = str(case.get("moderator", "UNKNOWN"))
         if action in counts:
             counts[action] += 1
-        if action in counts:
             moderator_counts[moderator] = moderator_counts.get(moderator, 0) + 1
-            moderator_labels[moderator] = moderator
-
-    top_mods = sorted(moderator_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+    top_mods = sorted(moderator_counts.items(), key=lambda x: (-x[1], x[0]))[:5]
     return {
-        "counts": counts,
-        "top_mods": top_mods,
+        "counts":        counts,
+        "top_mods":      top_mods,
         "total_actions": sum(counts.values()),
     }
 
@@ -962,44 +849,46 @@ def build_moderator_list_text() -> str:
     auth = load(AUTH_FILE)
     if not isinstance(auth, dict):
         auth = {}
-
-    lines = ["👮 **Authorized Moderators**\n"]
-    lines.append("👑 Owner: all permissions\n")
-
+    lines = ["👮 **Authorized Moderators**\n", "👑 Owner: all permissions\n"]
     if not auth:
         lines.append("No authorized moderators found.")
         return "\n".join(lines)
-
-    sorted_mods = sorted(auth.items(), key=lambda item: int(item[0]) if str(item[0]).isdigit() else 10**18)
+    sorted_mods = sorted(
+        auth.items(),
+        key=lambda item: int(item[0]) if str(item[0]).isdigit() else 10**18,
+    )
     for uid_str, mod in sorted_mods:
         if not isinstance(mod, dict):
             continue
-        perms = mod.get("permissions", {}) if isinstance(mod.get("permissions", {}), dict) else {}
+        perms = mod.get("permissions", {}) if isinstance(mod.get("permissions"), dict) else {}
         lines.append(
             f"• `{uid_str}` | {mod.get('mod_id', 'N/A')} | {mod.get('badge', '🛡 Moderator')} | "
             f"{'🔴 Frozen' if mod.get('frozen') else '🟢 Active'} | perms: {format_permission_set(perms)}"
         )
     return "\n".join(lines)
 
+# FIX #5 — display UNBAN/UNMUTE in stats
 def build_stats_text() -> str:
-    stats = get_moderation_stats()
+    stats  = get_moderation_stats()
     counts = stats["counts"]
     top_mods = stats["top_mods"]
     lines = [
         "📊 **Group Moderation Stats**\n",
-        f"🚫 Total bans: `{counts['BAN']}`",
-        f"🔇 Total mutes: `{counts['MUTE']}`",
-        f"⚠️ Total warns: `{counts['WARN']}`",
-        f"👢 Total kicks: `{counts['KICK']}`",
+        f"🚫 Total bans:    `{counts['BAN']}`",
+        f"🔓 Total unbans:  `{counts['UNBAN']}`",
+        f"🔇 Total mutes:   `{counts['MUTE']}`",
+        f"🔊 Total unmutes: `{counts['UNMUTE']}`",
+        f"⚠️ Total warns:   `{counts['WARN']}`",
+        f"👢 Total kicks:   `{counts['KICK']}`",
         f"🗑️ Total deletes: `{counts['DELETE']}`",
-        f"🧮 Total moderation actions: `{stats['total_actions']}`",
+        f"🧮 Total actions: `{stats['total_actions']}`",
         "",
         "👮 **Most Active Moderators**",
     ]
     if top_mods:
         for idx, (moderator, count) in enumerate(top_mods, start=1):
             mod_info = get_mod_info(int(moderator)) if moderator.isdigit() else {}
-            label = mod_info.get("mod_id", moderator) if mod_info else moderator
+            label    = mod_info.get("mod_id", moderator) if mod_info else moderator
             lines.append(f"{idx}. `{label}` — `{count}` actions")
     else:
         lines.append("No moderation activity yet.")
@@ -1008,19 +897,17 @@ def build_stats_text() -> str:
 async def build_admin_list_text(bot: Client, chat_id: int) -> str:
     lines = ["👮 **Group Administrators**\n"]
     try:
-        admin_stream = bot.get_chat_members(chat_id, filter=enums.ChatMembersFilter.ADMINISTRATORS)
-        async for member in admin_stream:
+        async for member in bot.get_chat_members(chat_id, filter=enums.ChatMembersFilter.ADMINISTRATORS):
             user = getattr(member, "user", None)
             if not user:
                 continue
-            title = getattr(member, "rank", None) or getattr(member, "custom_title", None) or "Administrator"
-            status = "owner" if member.status == enums.ChatMemberStatus.OWNER else "admin"
-            username = f"@{user.username}" if getattr(user, "username", None) else "—"
+            title     = getattr(member, "rank", None) or getattr(member, "custom_title", None) or "Administrator"
+            status    = "owner" if member.status == enums.ChatMemberStatus.OWNER else "admin"
+            username  = f"@{user.username}" if getattr(user, "username", None) else "—"
             full_name = (user.first_name or "User") + (f" {user.last_name}" if getattr(user, "last_name", None) else "")
             lines.append(
-                f"• `{user.id}` | {full_name}"
-                f" | {username}"
-                f" | {title} | {status} | perms: {format_admin_privileges(getattr(member, 'privileges', None))}"
+                f"• `{user.id}` | {full_name} | {username} | {title} | {status}"
+                f" | perms: {format_admin_privileges(getattr(member, 'privileges', None))}"
             )
     except Exception as e:
         return f"❌ Could not load admins: {e}"
@@ -1030,7 +917,7 @@ async def build_admin_list_text(bot: Client, chat_id: int) -> str:
 
 async def scan_zombies(bot: Client, chat_id: int) -> tuple[int, int, list[str]]:
     kicked_deleted = 0
-    kicked_bots = 0
+    kicked_bots    = 0
     failures: list[str] = []
     async for member in bot.get_chat_members(chat_id):
         user = getattr(member, "user", None)
@@ -1039,28 +926,26 @@ async def scan_zombies(bot: Client, chat_id: int) -> tuple[int, int, list[str]]:
         if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
             continue
         is_deleted = bool(getattr(user, "is_deleted", False))
-        is_bot = bool(getattr(user, "is_bot", False))
+        is_bot     = bool(getattr(user, "is_bot", False))
         if not is_deleted and not is_bot:
             continue
         ok, err = await api_kick(chat_id, user.id)
         if ok:
-            if is_deleted:
-                kicked_deleted += 1
-            if is_bot:
-                kicked_bots += 1
+            if is_deleted: kicked_deleted += 1
+            if is_bot:     kicked_bots    += 1
         else:
             failures.append(f"{user.id}: {err}")
     return kicked_deleted, kicked_bots, failures
 
-def schedule_temp_action(action_type: str, chat_id: int, target_id: int, until_ts: int, set_by: int, reason: str, case_id: str | None = None):
+def schedule_temp_action(
+    action_type: str, chat_id: int, target_id: int,
+    until_ts: int, set_by: int, reason: str, case_id: str | None = None,
+):
     actions = load_temp_actions()
-    action = {
-        "type": action_type,
-        "chat_id": chat_id,
-        "target_id": target_id,
-        "until_ts": until_ts,
-        "set_by": set_by,
-        "reason": reason,
+    action  = {
+        "type": action_type, "chat_id": chat_id,
+        "target_id": target_id, "until_ts": until_ts,
+        "set_by": set_by, "reason": reason,
     }
     if case_id:
         action["case_id"] = case_id
@@ -1087,6 +972,7 @@ def create_appeal(uid: int, case_id: str, message: str) -> str:
         "message": message, "status": "open",
         "time": str(datetime.now()),
     }
+    # FIX #3 — save done via caller with save_and_backup
     save(APPEALS_FILE, appeals)
     return aid
 
@@ -1107,18 +993,20 @@ def role_help_text(uid: int) -> str:
             "`/hban [user_id] [duration] [reason]` - Ban user\n"
             "`/hkick <user_id> [reason]` - Kick user from group\n"
             "`/hmute [user_id] [duration] [reason]` - Mute user\n"
+            "`/hunban [user_id] [reason]` - Unban a user\n"
+            "`/hunmute [user_id] [reason]` - Unmute a user\n"
             "`/hstats` - Show moderation stats\n"
             "`/hmod list` - List authorized moderators\n"
             "`/hwarn [user_id] [reason]` - Warn user\n"
-            "`/hdel <msg_id>` - Delete message\n"
+            "`/hdel` - Delete replied message\n"
             "`/hcase <case_id>` - View case details\n"
             "`/hmodinfo [user_id]` - View moderator info\n\n"
             "🎮 **Games:**\n"
-            "`/ttt [user_id]` - Start Tic-Tac-Toe (DM plays vs bot)\n"
+            "`/ttt [user_id]` - Start Tic-Tac-Toe\n"
             "`/tttleaderboard` - Show top players\n"
             "`/tttmystats` - Show your game stats\n"
             "`/tttend` - Forfeit active game\n\n"
-            "⏱️ **Duration Format:** 30m, 2h, 1d (for timed actions)\n\n"
+            "⏱️ **Duration Format:** 30m, 2h, 1d\n\n"
             "💡 **Tip:** Reply to a message to target without ID\n\n"
             "📖 **Examples:**\n"
             "`/hban @user 2h spam` - Ban for 2 hours\n"
@@ -1134,9 +1022,11 @@ def role_help_text(uid: int) -> str:
             "`/hban [user_id] [duration] [reason]` - Ban user\n"
             "`/hkick <user_id> [reason]` - Kick user from group\n"
             "`/hmute [user_id] [duration] [reason]` - Mute user\n"
+            "`/hunban [user_id] [reason]` - Unban a user\n"
+            "`/hunmute [user_id] [reason]` - Unmute a user\n"
             "`/hstats` - Show moderation stats\n"
             "`/hwarn [user_id] [reason]` - Warn user\n"
-            "`/hdel <msg_id>` - Delete message\n\n"
+            "`/hdel` - Delete replied message\n\n"
             "📋 **Information Commands:**\n"
             "`/hcase <case_id>` - View case details\n"
             "`/hmod list` - List authorized moderators\n"
@@ -1147,7 +1037,7 @@ def role_help_text(uid: int) -> str:
             "`/tttleaderboard` - Show top players\n"
             "`/tttmystats` - Show your game stats\n"
             "`/tttend` - Forfeit active game\n\n"
-            "⏱️ **Duration Format:** 30m, 2h, 1d (for timed actions)\n\n"
+            "⏱️ **Duration Format:** 30m, 2h, 1d\n\n"
             "💡 **Tip:** Reply to a message to target without ID\n\n"
             "📖 **Examples:**\n"
             "`/hban @user 30m spam` - Ban for 30 minutes\n"
@@ -1161,7 +1051,7 @@ def role_help_text(uid: int) -> str:
         "`/start` - View welcome message\n"
         "`/help` - Show this help message\n"
         "`/hr` - Get user ID & profile info\n"
-        "`/ttt [user_id]` - Play Tic-Tac-Toe (DM plays vs bot)\n"
+        "`/ttt [user_id]` - Play Tic-Tac-Toe\n"
         "`/tttleaderboard` - Show top players\n"
         "`/tttmystats` - Show your game stats\n"
         "`/tttend` - Forfeit active game\n\n"
@@ -1174,17 +1064,10 @@ def role_help_text(uid: int) -> str:
     )
 
 # =========================================================
-# INLINE KEYBOARD BUILDER (Bot API dict format)
+# INLINE KEYBOARD BUILDER
 # =========================================================
 
 def build_markup(*rows) -> dict:
-    """
-    build_markup(
-        [("🔓 Unban", "cb:unban_123")],
-        [("📜 View Case", "cb:case_5")],
-    )
-    Prefix url: with the URL string to create a URL button.
-    """
     keyboard = []
     for row in rows:
         btn_row = []
@@ -1200,9 +1083,9 @@ def build_markup(*rows) -> dict:
 # PYROGRAM CLIENT
 # =========================================================
 
-_bot: Client      = None
-bot_ready: bool   = False
-_temp_worker_task = None
+_bot: Client       = None
+bot_ready: bool    = False
+_temp_worker_task  = None
 _games_worker_task = None
 
 async def get_bot() -> Client:
@@ -1226,72 +1109,60 @@ async def shutdown_bot():
             await _bot.stop()
         except Exception:
             pass
-        _bot = None
+        _bot      = None
         bot_ready = False
 
 # =========================================================
-# ADMIN GROUP AUTO-DETECT
+# LOG GROUP
 # =========================================================
 
 async def detect_admin_groups(bot: Client) -> list[int]:
-    """Bots cannot list dialogs via MTProto; return empty and require explicit LOG_GROUP_ID."""
     _ = bot
     return []
 
 async def resolve_log_group(bot: Client):
-    """Set _log_group_id and _backup_chat_id; auto-detect if LOG_GROUP_ID == 0."""
     global _log_group_id, _backup_chat_id, _tg_backup_enabled
-
     if _log_group_id != 0:
-        # Verify the configured group is accessible
         try:
             chat = await bot.get_chat(_log_group_id)
-            log_msg(f"✅ Log group confirmed: {chat.title} ()", "INFO")
+            log_msg(f"✅ Log group confirmed: {chat.title} ({_log_group_id})", "INFO")
             _tg_backup_enabled = True
             if _backup_chat_id == 0:
                 _backup_chat_id = _log_group_id
             return
         except Exception as e:
-            log_msg(
-                f"⚠️ LOG_GROUP_ID={_log_group_id} is configured but inaccessible: {e}. "
-                "Ensure the bot is a member/admin of that group.",
-                "WARNING",
-            )
-            _tg_backup_enabled = True          # keep trying; bot may be added later
+            log_msg(f"⚠️ LOG_GROUP_ID={_log_group_id} inaccessible: {e}", "WARNING")
+            _tg_backup_enabled = True
             if _backup_chat_id == 0:
                 _backup_chat_id = _log_group_id
             await tg_send(
                 OWNER_ID,
-                f"⚠️ LOG_GROUP_ID `{_log_group_id}` is set but the bot can't access that chat.\n"
-                "Add the bot as an admin to the log group, then restart.",
+                f"⚠️ LOG_GROUP_ID `{_log_group_id}` set but bot can't access that chat.\n"
+                "Add the bot as admin to the log group, then restart.",
             )
-            return                             # ← critical: don't fall through to auto-detect
-
-    # Only reached when LOG_GROUP_ID == 0
+            return
     groups = await detect_admin_groups(bot)
     if not groups:
-        log_msg("⚠️ LOG_GROUP_ID is not set. Set it in Koyeb env vars; log messages will be skipped.", "WARNING")
-        await tg_send(OWNER_ID, "⚠️ Set LOG_GROUP_ID in Koyeb env vars. Auto-detection is not available for bots.")
+        log_msg("⚠️ LOG_GROUP_ID not set. Log messages will be skipped.", "WARNING")
+        await tg_send(OWNER_ID, "⚠️ Set LOG_GROUP_ID in Koyeb env vars. Auto-detection unavailable for bots.")
         return
-
-    _log_group_id = groups[0]
+    _log_group_id   = groups[0]
     if _backup_chat_id == 0:
         _backup_chat_id = _log_group_id
     _tg_backup_enabled = True
-
     try:
         chat = await bot.get_chat(_log_group_id)
         log_msg(f"✅ Auto-detected log group: {chat.title} ({_log_group_id})", "INFO")
         await tg_send(
             OWNER_ID,
             f"ℹ️ Auto-detected log group: **{chat.title}**\n`{_log_group_id}`\n\n"
-            f"Set `LOG_GROUP_ID={_log_group_id}` in env vars to make this permanent."
+            f"Set `LOG_GROUP_ID={_log_group_id}` in env vars to make permanent.",
         )
     except Exception:
         log_msg(f"Auto-detected log group: {_log_group_id}", "INFO")
 
 # =========================================================
-# WEBHOOK MANAGEMENT
+# WEBHOOK
 # =========================================================
 
 async def ensure_webhook(base_url: str = None) -> str:
@@ -1327,28 +1198,22 @@ async def anti_nuke(chat_id: int, reply_to: int, uid: int) -> bool:
         save(AUTH_FILE, auth)
     lg = get_log_group()
     if lg:
-        await tg_send(lg,
+        await tg_send(
+            lg,
             f"🚨 **ANTI-NUKE ACTIVATED**\n\n"
             f"Moderator: `{uid}`\n"
             f"Actions in 60 sec: `{total}`\n"
-            f"Moderator frozen automatically."
+            f"Moderator frozen automatically.",
         )
     await tg_send(chat_id, "🚨 Anti-Nuke triggered — moderator frozen.", reply_to=reply_to)
     return True
 
 # =========================================================
-# ACTION LOG — sends to source group AND log group
+# ACTION LOG
 # =========================================================
 
 async def send_action_log(
-    source_chat: int,
-    reply_to:    int,
-    action:      str,
-    target:      dict,
-    reason:      str,
-    case_id:     str,
-    mod_data:    dict,
-    extra:       str = "",
+    source_chat, reply_to, action, target, reason, case_id, mod_data, extra=""
 ):
     mention   = make_mention(target)
     target_id = target.get("id")
@@ -1378,25 +1243,20 @@ async def send_action_log(
         rows.append([("🔊 Unmute",      f"cb:unmute_{target_id}")])
     elif action == "WARN":
         rows.append([("🗑 Remove Warn", f"cb:removewarn_{target_id}")])
-    elif action == "DELETE":
+    elif action in ("DELETE", "UNBAN", "UNMUTE"):
         rows.append([("👤 Profile",     f"url:tg://user?id={target_id}")])
     rows.append([("📜 View Case",       f"cb:case_{case_id}")])
     markup = build_markup(*rows)
 
-    # Send to the group where the action happened
     resp = await tg_send(source_chat, text, reply_to=reply_to, markup=markup)
     if resp.get("ok") and resp.get("result"):
         msg_id = resp["result"].get("message_id")
         if msg_id:
             schedule_message_delete(source_chat, msg_id, ACTION_LOG_AUTO_DELETE)
 
-    # Send to log group (may differ from source_chat) — do NOT auto-delete in log group
     lg = get_log_group()
     if lg and lg != source_chat:
         await tg_send(lg, text, markup=markup)
-    elif lg == source_chat:
-        # already sent above
-        pass
 
 async def send_grant_log(chat_id, reply_to, granted_by, target, permission, case_id=None):
     case_line = f"\n📜 Case ID: #{case_id}" if case_id else ""
@@ -1430,7 +1290,7 @@ async def process_due_temp_actions(bot: Client):
     now_ts  = int(time.time())
     pending = []
     for action in actions:
-        until_ts = int(action.get("until_ts", 0))
+        until_ts  = int(action.get("until_ts", 0))
         if until_ts > now_ts:
             pending.append(action)
             continue
@@ -1441,10 +1301,7 @@ async def process_due_temp_actions(bot: Client):
             if atype == "mute":
                 ok, err = await api_unmute(chat_id, target_id)
                 if ok:
-                    msg_text = (
-                        f"🔊 Temporary mute ended for `{target_id}`"
-                        f"\n⏰ Expired: {format_timestamp(until_ts)}"
-                    )
+                    msg_text = f"🔊 Temporary mute ended for `{target_id}`\n⏰ Expired: {format_timestamp(until_ts)}"
                     if action.get("case_id"):
                         msg_text += f"\n📜 Case #{action['case_id']}"
                     if action.get("reason"):
@@ -1460,10 +1317,7 @@ async def process_due_temp_actions(bot: Client):
             elif atype == "ban":
                 ok, err = await api_unban(chat_id, target_id)
                 if ok:
-                    msg_text = (
-                        f"🔓 Temporary ban ended for `{target_id}`"
-                        f"\n⏰ Expired: {format_timestamp(until_ts)}"
-                    )
+                    msg_text = f"🔓 Temporary ban ended for `{target_id}`\n⏰ Expired: {format_timestamp(until_ts)}"
                     if action.get("case_id"):
                         msg_text += f"\n📜 Case #{action['case_id']}"
                     if action.get("reason"):
@@ -1486,7 +1340,7 @@ async def process_due_temp_actions(bot: Client):
                         pending.append(action)
                         log_msg(f"auto-delete failed for msg {target_id} (retry {retry_count + 1}): {del_err}", "WARNING")
                     else:
-                        log_msg(f"auto-delete failed for msg {target_id} after 3 retries: {del_err}", "WARNING")
+                        log_msg(f"auto-delete gave up for msg {target_id}: {del_err}", "WARNING")
         except Exception as e:
             log_msg(f"temp action error {action}: {e}", "ERROR")
             pending.append(action)
@@ -1510,13 +1364,12 @@ async def temp_action_worker():
 
 app = FastAPI(title="Moderation Bot")
 
-# ── Root endpoint ──────────────────
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {
         "service":   "Telegram Moderation Bot",
         "status":    "running" if bot_ready else "starting",
-        "endpoints": ["/health", "/api/status", "", "/api/webhook"],
+        "endpoints": ["/health", "/api/status", "/api/webhook"],
     }
 
 @app.get("/health")
@@ -1536,18 +1389,15 @@ async def bot_status():
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
 @app.get("/api/setup_webhook")
 async def setup_webhook_endpoint():
-    webhook_result = await ensure_webhook()
-    cmds = await sync_commands()
-    info = await tg_api("getWebhookInfo")
-
     return {
-        "set_webhook": webhook_result,
-        "commands": cmds,
-        "info": info
+        "set_webhook": await ensure_webhook(),
+        "commands":    await sync_commands(),
+        "info":        await tg_api("getWebhookInfo"),
     }
-# ── Webhook ──────────────────────────────────────────────
+
 @app.post("/api/webhook")
 async def webhook(request: Request):
     try:
@@ -1573,10 +1423,10 @@ async def handle_message(bot: Client, msg: dict):
         if not text.startswith("/"):
             return
 
-        chat_id  = msg["chat"]["id"]
-        msg_id   = msg["message_id"]
+        chat_id              = msg["chat"]["id"]
+        msg_id               = msg["message_id"]
         uid, err, is_anon_admin = extract_actor_user_id(msg)
-        reply    = msg.get("reply_to_message") or {}
+        reply                = msg.get("reply_to_message") or {}
 
         parts   = text.split(None, 1)
         raw_cmd = parts[0].split("@")[0].lstrip("/").lower()
@@ -1585,15 +1435,17 @@ async def handle_message(bot: Client, msg: dict):
         actor_label = f"anon_admin:{chat_id}" if is_anon_admin else str(uid)
         log_msg(f"/{raw_cmd} from actor={actor_label} chat={chat_id}", "INFO")
 
+        is_private = msg.get("chat", {}).get("type") == "private"
+
         async def reply_text(t: str):
             sent = await tg_send(chat_id, t, reply_to=msg_id)
-            if msg.get("chat", {}).get("type") != "private" and sent.get("ok"):
-                result = sent.get("result", {})
-                reply_message_id = result.get("message_id")
-                if reply_message_id:
-                    schedule_message_delete(chat_id, reply_message_id)
+            if not is_private and sent.get("ok"):
+                rmid = sent.get("result", {}).get("message_id")
+                if rmid:
+                    schedule_message_delete(chat_id, rmid)
 
-        if msg.get("chat", {}).get("type") != "private":
+        # Auto-delete commands in groups
+        if not is_private:
             schedule_message_delete(chat_id, msg_id)
 
         if err:
@@ -1603,6 +1455,7 @@ async def handle_message(bot: Client, msg: dict):
         if OWNER_DEBUG_NOTIFICATIONS and raw_cmd not in ("start", "help"):
             await notify_owner(f"📨 /{raw_cmd}\nActor: `{actor_label}`\nChat: `{chat_id}`")
 
+        # ── Actor helpers ─────────────────────────────────
         def is_owner_actor() -> bool:
             return (not is_anon_admin) and is_owner(uid)
 
@@ -1637,7 +1490,7 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /start ────────────────────────────────────────
         if raw_cmd == "start":
-            start_msg = (
+            await reply_text(
                 "🤖 **HR Group Bot**\n\n"
                 "Fast moderation + utility tools for your group.\n\n"
                 "**Quick Commands**\n"
@@ -1647,129 +1500,115 @@ async def handle_message(bot: Client, msg: dict):
                 "• `/happeal` - Appeal in DM\n\n"
                 "✅ Online and ready."
             )
-            await reply_text(start_msg)
             return
 
         # ── /help ─────────────────────────────────────────
         if raw_cmd == "help":
             if is_anon_admin:
+                # FIX #11 — hunban/hunmute listed for anon admins
                 await reply_text(
                     "🎭 **Anonymous Admin Mode**\n\n"
                     "You can use moderation commands while posting anonymously:\n"
-                    "`/hban`, `/hkick`, `/hmute`, `/hstats`, `/hwarn`, `/hdel`, `/hcase`, `/hmod list`, `/hmodinfo`, `/hr`, `/pin`, `/unpin`, `/adminlist`, `/zombies`\n\n"
-                    "Owner-only commands (`/hauth`, `/hgrant`, `/hrevoke`, `/hprotect`) require a normal account identity."
+                    "`/hban`, `/hkick`, `/hmute`, `/hunban`, `/hunmute`, `/hstats`, "
+                    "`/hwarn`, `/hdel`, `/hcase`, `/hmod list`, `/hmodinfo`, `/hr`, "
+                    "`/pin`, `/unpin`, `/adminlist`, `/zombies`\n\n"
+                    "Owner-only commands (`/hauth`, `/hgrant`, `/hrevoke`, `/hprotect`) "
+                    "require a normal account identity."
                 )
             else:
                 await reply_text(role_help_text(uid))
             return
 
-        # ── /hr (/id legacy alias) ────────────────────────
+        # ── /hr ───────────────────────────────────────────
+        # FIX #2 — removed all inner `bot = await get_bot()` assignments;
+        #           the outer `bot` parameter is used directly throughout.
         if raw_cmd in ("hr", "id"):
             try:
-                target_id = None
+                target_id   = None
                 target_user = None
-                
-                # Mode 1: /hr me
+
                 if args and args[0].lower() == "me":
                     if is_anon_admin:
-                        return await reply_text("❌ `me` is unavailable in anonymous mode. Use reply/@username/user_id.")
+                        return await reply_text("❌ `me` unavailable in anonymous mode.")
                     target_id = uid
-                
-                # Mode 2: /hr @username
+
                 elif args and args[0].startswith("@"):
-                    username = args[0][1:]  # Remove @
+                    username = args[0][1:]
                     try:
-                        bot = await get_bot()
                         target_user = await bot.get_user(username)
-                        target_id = target_user.id
+                        target_id   = target_user.id
                     except Exception as e:
-                        return await reply_text(f"❌ User @{username} not found: {str(e)}")
-                
-                # Mode 3: /hr <raw_id>
+                        return await reply_text(f"❌ User @{username} not found: {e}")
+
                 elif args and args[0].isdigit():
                     parsed_id = parse_positive_user_id(args[0])
                     if parsed_id:
                         target_id = parsed_id
                         try:
-                            bot = await get_bot()
                             target_user = await bot.get_user(target_id)
                         except Exception as e:
-                            return await reply_text(f"❌ User ID {target_id} not found: {str(e)}")
+                            return await reply_text(f"❌ User ID {target_id} not found: {e}")
                     else:
                         return await reply_text("❌ Invalid user ID.")
-                
-                # Mode 4: /hr (reply to message)
+
                 elif reply:
-                    target_dict, tid, err = resolve_target(reply, [], 0)
+                    target_dict, tid, terr = resolve_target(reply, [], 0)
                     if tid:
                         target_id = tid
                         try:
-                            bot = await get_bot()
                             target_user = await bot.get_user(target_id)
                         except Exception:
-                            # Fallback if get_user fails
                             pass
                     else:
                         return await reply_text("❌ Reply to a user or use /hr @username, /hr me, or /hr <user_id>")
                 else:
                     return await reply_text("❌ Reply to a user or use /hr @username, /hr me, or /hr <user_id>")
-                
-                # Build profile card
+
                 if target_id is None:
                     return await reply_text("❌ Could not determine target user.")
-                
+
                 first_name = target_user.first_name if target_user and target_user.first_name else "User"
-                last_name = target_user.last_name if target_user and target_user.last_name else ""
-                username = target_user.username if target_user and target_user.username else None
-                
-                # Format the response
-                response = f"👤 **User Profile**\n\n"
-                response += f"🆔 ID: `{target_id}`\n"
-                response += f"📝 Name: {first_name}"
+                last_name  = target_user.last_name  if target_user and target_user.last_name  else ""
+                uname      = target_user.username   if target_user and target_user.username   else None
+
+                response  = f"👤 **User Profile**\n\n🆔 ID: `{target_id}`\n📝 Name: {first_name}"
                 if last_name:
                     response += f" {last_name}"
-                response += f"\n"
-                if username:
-                    response += f"🔗 Username: @{username}\n"
-                    response += f"📌 Link: [Profile](tg://user?id={target_id})"
-                else:
-                    response += f"🔗 Link: [Profile](tg://user?id={target_id})"
-                
-                # Send to owner's DM if owner uses /hr in a group, otherwise reply in chat
-                is_group = msg.get("chat", {}).get("type") != "private"
-                if is_owner_actor() and is_group:
+                response += "\n"
+                if uname:
+                    response += f"🔗 Username: @{uname}\n"
+                response += f"📌 Link: [Profile](tg://user?id={target_id})"
+
+                if is_owner_actor() and not is_private:
                     await notify_owner(response)
                 else:
                     await reply_text(response)
                 return
             except Exception as e:
-                log_msg(f"Error in /hr command: {e}\n{traceback.format_exc()}", "ERROR")
-                return await reply_text(f"❌ Error: {str(e)}")
+                log_msg(f"Error in /hr: {e}\n{traceback.format_exc()}", "ERROR")
+                return await reply_text(f"❌ Error: {e}")
 
-        # ── /ttt commands (all users) ───────────────────
+        # ── /ttt commands ─────────────────────────────────
         if raw_cmd in ("ttt", "ttt_game"):
             await handle_ttt_command(bot, msg, args, reply, uid, chat_id, msg_id)
             return
-
         if raw_cmd == "tttleaderboard":
             await handle_ttt_leaderboard(chat_id, msg_id)
             return
-
         if raw_cmd == "tttmystats":
             await handle_ttt_mystats(uid, chat_id, msg_id)
             return
-
         if raw_cmd == "tttend":
             await handle_ttt_end(uid, chat_id, msg_id, is_owner=is_owner_actor())
             return
 
         # ── /happeal ──────────────────────────────────────
         if raw_cmd == "happeal":
-            if msg.get("chat", {}).get("type") != "private":
+            if not is_private:
                 return await reply_text("❌ Use /happeal in bot DM only.")
             if len(args) < 2:
                 return await reply_text("Usage: /happeal <case_id> <message>")
-            case_id = args[0]
+            case_id    = args[0]
             appeal_msg = " ".join(args[1:]).strip()
             if not appeal_msg:
                 return await reply_text("❌ Appeal message is required.")
@@ -1779,10 +1618,10 @@ async def handle_message(bot: Client, msg: dict):
             if int(cases[case_id].get("target", 0)) != uid and not is_owner_actor():
                 return await reply_text("❌ You can only appeal your own case.")
             aid = create_appeal(uid, case_id, appeal_msg)
+            # FIX #3 — backup appeals after creation
+            asyncio.create_task(upload_backup("appeals", load(APPEALS_FILE)))
             await reply_text(f"✅ Appeal submitted. Appeal ID: #{aid}")
-            await notify_owner(
-                f"📨 New appeal #{aid}\nCase: #{case_id}\nUser: `{uid}`\n{appeal_msg}"
-            )
+            await notify_owner(f"📨 New appeal #{aid}\nCase: #{case_id}\nUser: `{uid}`\n{appeal_msg}")
             return
 
         # ── /hauth ────────────────────────────────────────
@@ -1824,7 +1663,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"❌ Invalid permission. Valid: {', '.join(sorted(VALID_PERMISSIONS))}")
             target, tid, terr = resolve_target(reply, args, 1)
             if not tid:
-                return await reply_text(f"{terr}")
+                return await reply_text(terr)
             data = load(AUTH_FILE)
             if str(tid) not in data:
                 return await reply_text("❌ User not authorized. Run /hauth first.")
@@ -1845,7 +1684,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"❌ Invalid. Valid: {', '.join(sorted(VALID_PERMISSIONS))}")
             target, tid, terr = resolve_target(reply, args, 1)
             if not tid:
-                return await reply_text(f"{terr}")
+                return await reply_text(terr)
             data = load(AUTH_FILE)
             if str(tid) not in data:
                 return await reply_text("❌ User is not a moderator.")
@@ -1858,10 +1697,8 @@ async def handle_message(bot: Client, msg: dict):
                 await tg_send(
                     lg,
                     f"📝 Permission Revoked\n\n"
-                    f"👤 {make_mention(target)}\n"
-                    f"🔐 `{perm}`\n"
-                    f"🛡 By: `{uid}`\n"
-                    f"📜 Case #{case_id}",
+                    f"👤 {make_mention(target)}\n🔐 `{perm}`\n"
+                    f"🛡 By: `{uid}`\n📜 Case #{case_id}",
                 )
             return
 
@@ -1871,9 +1708,7 @@ async def handle_message(bot: Client, msg: dict):
                 return
             target, tid, terr = resolve_target(reply, args, 0)
             if not tid:
-                return await reply_text(
-                    f"{terr}\nUsage: /hban <user_id> [duration] [reason]"
-                )
+                return await reply_text(f"{terr}\nUsage: /hban <user_id> [duration] [reason]")
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
             if is_protected(tid):
@@ -1881,36 +1716,26 @@ async def handle_message(bot: Client, msg: dict):
             if await anti_nuke(chat_id, msg_id, uid):
                 return
             until_ts = int(time.time()) + dur if dur else None
-            ok, err = await api_ban(chat_id, tid, until_date=until_ts)
+            ok, err  = await api_ban(chat_id, tid, until_date=until_ts)
             if not ok:
                 return await reply_text(f"❌ Ban failed: {err}")
             if dur:
                 reason = f"{reason} | Duration: {format_duration(dur)}"
-            case_id = create_case(
-                "BAN",
-                uid,
-                tid,
-                reason,
-                extra={
-                    "temporary": bool(dur),
-                    "duration": dur,
-                    "expires_at": until_ts,
-                },
-            )
+            case_id = create_case("BAN", uid, tid, reason, extra={
+                "temporary": bool(dur), "duration": dur, "expires_at": until_ts,
+            })
             if dur:
                 schedule_temp_action("ban", chat_id, tid, until_ts, uid, reason, case_id=case_id)
             await send_action_log(chat_id, msg_id, "BAN", target, reason, case_id, actor_mod_info())
             return
 
-        # ── /hkick ───────────────────────────────────────
+        # ── /hkick ────────────────────────────────────────
         if raw_cmd in ("hkick", "hk"):
             if not await check_mod("kick"):
                 return
             target, tid, terr = resolve_target(reply, args, 0)
             if not tid:
-                return await reply_text(
-                    f"{terr}\nUsage: /hkick <user_id> [reason]"
-                )
+                return await reply_text(f"{terr}\nUsage: /hkick <user_id> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No Reason")
             if is_protected(tid):
@@ -1924,10 +1749,73 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "KICK", target, reason, case_id, actor_mod_info())
             return
 
-        # ── /pin ─────────────────────────────────────────
+        # ── /hmute ────────────────────────────────────────
+        if raw_cmd in ("hmute", "hm"):
+            if not await check_mod("mute"):
+                return
+            target, tid, terr = resolve_target(reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hmute <user_id> [duration] [reason]")
+            rs = 0 if reply else 1
+            dur, reason = parse_duration_and_reason(args, rs)
+            if is_protected(tid):
+                return await reply_text("🛡 That user is protected.")
+            if await anti_nuke(chat_id, msg_id, uid):
+                return
+            until_ts = int(time.time()) + dur if dur else None
+            ok, err  = await api_mute(chat_id, tid, until_date=until_ts)
+            if not ok:
+                return await reply_text(f"❌ Mute failed: {err}")
+            if dur:
+                reason = f"{reason} | Duration: {format_duration(dur)}"
+            case_id = create_case("MUTE", uid, tid, reason, extra={
+                "temporary": bool(dur), "duration": dur, "expires_at": until_ts,
+            })
+            if dur:
+                schedule_temp_action("mute", chat_id, tid, until_ts, uid, reason, case_id=case_id)
+            await send_action_log(chat_id, msg_id, "MUTE", target, reason, case_id, actor_mod_info())
+            return
+
+        # ── /hunban ───────────────────────────────────────
+        if raw_cmd in ("hunban", "hub"):
+            if not await check_mod("unban"):
+                return
+            target, tid, terr = resolve_target(reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hunban <user_id> [reason]")
+            rs = 0 if reply else 1
+            reason = extract_reason(args, rs, "No reason given")
+            ok, err = await api_unban(chat_id, tid)
+            if not ok:
+                return await reply_text(f"❌ Unban failed: {err}")
+            # FIX #6 — cancel any pending temp ban
+            cancel_temp_action("ban", chat_id, tid)
+            case_id = create_case("UNBAN", uid, tid, reason)
+            await send_action_log(chat_id, msg_id, "UNBAN", target, reason, case_id, actor_mod_info())
+            return
+
+        # ── /hunmute ──────────────────────────────────────
+        if raw_cmd in ("hunmute", "hum"):
+            if not await check_mod("unmute"):
+                return
+            target, tid, terr = resolve_target(reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hunmute <user_id> [reason]")
+            rs = 0 if reply else 1
+            reason = extract_reason(args, rs, "No reason given")
+            ok, err = await api_unmute(chat_id, tid)
+            if not ok:
+                return await reply_text(f"❌ Unmute failed: {err}")
+            # FIX #6 — cancel any pending temp mute
+            cancel_temp_action("mute", chat_id, tid)
+            case_id = create_case("UNMUTE", uid, tid, reason)
+            await send_action_log(chat_id, msg_id, "UNMUTE", target, reason, case_id, actor_mod_info())
+            return
+
+        # ── /pin ──────────────────────────────────────────
         if raw_cmd == "pin":
             if not await check_mod("pin"):
-                return await reply_text("❌ Moderator access required.")
+                return
             if not reply:
                 return await reply_text("❌ Reply to the message you want to pin.")
             reply_msg_id = reply.get("message_id")
@@ -1939,24 +1827,24 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text("📌 Message pinned.")
             return
 
-        # ── /unpin ───────────────────────────────────────
+        # ── /unpin ────────────────────────────────────────
         if raw_cmd == "unpin":
             if not await check_mod("pin"):
-                return await reply_text("❌ Moderator access required.")
+                return
             ok, err = await api_unpin(chat_id)
             if not ok:
                 return await reply_text(f"❌ Unpin failed: {err}")
             await reply_text("📍 Pinned message removed.")
             return
 
-        # ── /adminlist ───────────────────────────────────
+        # ── /adminlist ────────────────────────────────────
         if raw_cmd == "adminlist":
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
             await reply_text(await build_admin_list_text(bot, chat_id))
             return
 
-        # ── /zombies ─────────────────────────────────────
+        # ── /zombies ──────────────────────────────────────
         if raw_cmd == "zombies":
             if not await check_mod("kick"):
                 return
@@ -1974,43 +1862,6 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(summary)
             return
 
-        # ── /hmute ────────────────────────────────────────
-        if raw_cmd in ("hmute", "hm"):
-            if not await check_mod("mute"):
-                return
-            target, tid, terr = resolve_target(reply, args, 0)
-            if not tid:
-                return await reply_text(
-                    f"{terr}\nUsage: /hmute <user_id> [duration] [reason]"
-                )
-            rs = 0 if reply else 1
-            dur, reason = parse_duration_and_reason(args, rs)
-            if is_protected(tid):
-                return await reply_text("🛡 That user is protected.")
-            if await anti_nuke(chat_id, msg_id, uid):
-                return
-            until_ts = int(time.time()) + dur if dur else None
-            ok, err = await api_mute(chat_id, tid, until_date=until_ts)
-            if not ok:
-                return await reply_text(f"❌ Mute failed: {err}")
-            if dur:
-                reason = f"{reason} | Duration: {format_duration(dur)}"
-            case_id = create_case(
-                "MUTE",
-                uid,
-                tid,
-                reason,
-                extra={
-                    "temporary": bool(dur),
-                    "duration": dur,
-                    "expires_at": until_ts,
-                },
-            )
-            if dur:
-                schedule_temp_action("mute", chat_id, tid, until_ts, uid, reason, case_id=case_id)
-            await send_action_log(chat_id, msg_id, "MUTE", target, reason, case_id, actor_mod_info())
-            return
-
         # ── /hstats ───────────────────────────────────────
         if raw_cmd == "hstats":
             if not is_authorized_actor():
@@ -2018,7 +1869,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(build_stats_text())
             return
 
-        # ── /hmod list ───────────────────────────────────
+        # ── /hmod ─────────────────────────────────────────
         if raw_cmd == "hmod":
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
@@ -2036,37 +1887,75 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hwarn <user_id> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
-            warns  = load(WARN_FILE)
-            key    = str(tid)
+            if is_protected(tid):
+                return await reply_text("🛡 That user is protected.")
+            if await anti_nuke(chat_id, msg_id, uid):
+                return
+            warns = load(WARN_FILE)
+            key   = str(tid)
             warns.setdefault(key, 0)
             warns[key] += 1
-            save(WARN_FILE, warns)
+            await save_and_backup(WARN_FILE, warns)
+            warn_config = get_warn_config()
+            threshold   = warn_config.get("threshold", 3)
+            auto_action = warn_config.get("action", "mute")
+            duration    = warn_config.get("duration", 3600)
             case_id = create_case("WARN", uid, tid, reason)
             await send_action_log(
                 chat_id, msg_id, "WARN", target, reason, case_id, actor_mod_info(),
                 extra=f"📊 Total Warns: {warns[key]}",
             )
+            # FIX #7 — safe defaults before branching
+            if warns[key] >= threshold:
+                ok           = False
+                action_label = "MUTE"
+                until_ts     = int(time.time()) + duration
+                if auto_action == "ban":
+                    ok, err  = await api_ban(chat_id, tid, until_date=until_ts)
+                    action_label = "BAN"
+                elif auto_action == "kick":
+                    ok, err  = await api_kick(chat_id, tid)
+                    action_label = "KICK"
+                else:
+                    ok, err  = await api_mute(chat_id, tid, until_date=until_ts)
+                    action_label = "MUTE"
+                if ok:
+                    auto_reason = f"Warn threshold ({threshold}) reached"
+                    auto_case   = create_case(action_label, uid, tid, auto_reason)
+                    await send_action_log(
+                        chat_id, msg_id, action_label, target,
+                        auto_reason, auto_case, actor_mod_info(),
+                        extra=f"⚡ Auto-action on {warns[key]} warns",
+                    )
+                    if auto_action in ("ban", "mute"):
+                        schedule_temp_action(
+                            auto_action, chat_id, tid, until_ts,
+                            uid, auto_reason, case_id=auto_case,
+                        )
             return
 
         # ── /hdel ─────────────────────────────────────────
+        # FIX #1 — correct indentation aligned with all other blocks
         if raw_cmd in ("hdel", "hd"):
             if not await check_mod("delete"):
                 return
             if not reply:
-                return await reply_text("❌ Reply to the message you want to delete.")
+                return  # command msg already scheduled for delete at top
             target, tid = extract_reply_user(reply)
             if not tid:
-                return await reply_text("❌ Reply to a normal user message.")
+                return
+            if is_protected(tid):
+                return await reply_text("🛡 That user is protected.")
+            if await anti_nuke(chat_id, msg_id, uid):
+                return
             reply_msg_id = reply.get("message_id")
-            deleted_text = reply.get("text") or "[Media]"
             ok, err = await api_delete_msg(chat_id, reply_msg_id)
             if not ok:
-                return await reply_text(f"❌ Could not delete: {err}")
+                return await reply_text(f"❌ Delete failed: {err}")
             case_id = create_case("DELETE", uid, tid, "Message Deleted")
             await send_action_log(
-                chat_id, msg_id, "DELETE", target, "Message Deleted",
-                case_id, actor_mod_info(),
-                extra=f"💬 Content: {deleted_text[:200]}",
+                chat_id, msg_id, "DELETE", target,
+                "Message Deleted", case_id, actor_mod_info(),
             )
             return
 
@@ -2082,14 +1971,16 @@ async def handle_message(bot: Client, msg: dict):
             if key in data:
                 return await reply_text(f"ℹ️ {make_mention(target)} is already protected.")
             data[key] = True
-            save(PROTECT_FILE, data)
+            # FIX #4 — protect file backed up
+            await save_and_backup(PROTECT_FILE, data)
             await reply_text(f"🛡 {make_mention(target)} is now protected.")
             return
 
         # ── /hcase ────────────────────────────────────────
+        # FIX #9 — proper error reply for unauthorised
         if raw_cmd in ("hcase", "hc"):
             if not is_authorized_actor():
-                return
+                return await reply_text("❌ Moderator access required.")
             if not args:
                 return await reply_text("Usage: /hcase <case_id>")
             cases = load(CASE_FILE)
@@ -2103,25 +1994,21 @@ async def handle_message(bot: Client, msg: dict):
                 f"👮 Moderator: `{case['moderator']}`\n"
                 f"📝 Reason: {case['reason']}\n"
                 f"⏰ Time: {case['time']}"
-                + (f"\n⏳ Expires: {format_timestamp(case.get('expires_at'))}" if case.get('temporary') else "")
+                + (f"\n⏳ Expires: {format_timestamp(case.get('expires_at'))}" if case.get("temporary") else "")
             )
             return
 
         # ── /hmodinfo ─────────────────────────────────────
+        # FIX #9 — proper error reply for unauthorised
         if raw_cmd in ("hmodinfo", "hmi"):
             if not is_authorized_actor():
-                return
+                return await reply_text("❌ Moderator access required.")
             if is_anon_admin and not reply and not args:
                 await reply_text(
                     "👮 **Moderator Info**\n\n"
                     f"🆔 Mod ID: `ANON-{abs(chat_id)}`\n"
-                    "🎭 Anonymous Admin\n"
-                    "Status: 🟢 Active\n\n"
-                    "**Permissions:**\n"
-                    "  ✅ ban\n"
-                    "  ✅ mute\n"
-                    "  ✅ warn\n"
-                    "  ✅ delete"
+                    "🎭 Anonymous Admin\nStatus: 🟢 Active\n\n"
+                    "**Permissions:**\n  ✅ ban\n  ✅ mute\n  ✅ warn\n  ✅ delete"
                 )
                 return
             lookup = uid
@@ -2137,7 +2024,7 @@ async def handle_message(bot: Client, msg: dict):
             mod = get_mod_info(lookup)
             if not mod:
                 return await reply_text("❌ That user is not a moderator.")
-            perms = mod.get("permissions", {})
+            perms     = mod.get("permissions", {})
             perm_list = "\n".join(
                 f"  {'✅' if v else '❌'} {k}" for k, v in perms.items()
             ) or "  No permissions set"
@@ -2179,9 +2066,11 @@ async def handle_callback(bot: Client, cb: dict):
         if data.startswith("unban_"):
             if not has_permission(uid, "unban"):
                 return await tg_answer_cb(cb_id, "❌ No unban permission.", alert=True)
-            tid = int(data.split("_", 1)[1])
+            tid     = int(data.split("_", 1)[1])
             ok, err = await api_unban(chat_id, tid)
             if ok:
+                # FIX #6 — cancel pending temp ban from inline button
+                cancel_temp_action("ban", chat_id, tid)
                 await tg_answer_cb(cb_id, "✅ User unbanned.")
             else:
                 await tg_answer_cb(cb_id, f"❌ {err}", alert=True)
@@ -2189,9 +2078,11 @@ async def handle_callback(bot: Client, cb: dict):
         elif data.startswith("unmute_"):
             if not has_permission(uid, "unmute"):
                 return await tg_answer_cb(cb_id, "❌ No unmute permission.", alert=True)
-            tid = int(data.split("_", 1)[1])
+            tid     = int(data.split("_", 1)[1])
             ok, err = await api_unmute(chat_id, tid)
             if ok:
+                # FIX #6 — cancel pending temp mute from inline button
+                cancel_temp_action("mute", chat_id, tid)
                 await tg_answer_cb(cb_id, "✅ User unmuted.")
             else:
                 await tg_answer_cb(cb_id, f"❌ {err}", alert=True)
@@ -2212,12 +2103,10 @@ async def handle_callback(bot: Client, cb: dict):
             cases   = load(CASE_FILE)
             case    = cases.get(case_id)
             if case:
-                expiry_line = ""
-                if case.get("temporary"):
-                    expiry_line = f"\n⏳ Expires: {format_timestamp(case.get('expires_at'))}"
+                expiry = f"\n⏳ Expires: {format_timestamp(case.get('expires_at'))}" if case.get("temporary") else ""
                 await tg_answer_cb(
                     cb_id,
-                    f"Case #{case_id}\n{case['action']} — {case['reason']}\n{case['time']}{expiry_line}",
+                    f"Case #{case_id}\n{case['action']} — {case['reason']}\n{case['time']}{expiry}",
                     alert=True,
                 )
             else:
@@ -2240,30 +2129,23 @@ async def startup_event():
         bot = await get_bot()
 
         init_games(
-            save_fn=save,
-            load_fn=load,
-            scores_file=TTT_SCORES_FILE,
-            bot_token=BOT_TOKEN,
+            save_fn=save, load_fn=load,
+            scores_file=TTT_SCORES_FILE, bot_token=BOT_TOKEN,
         )
 
-        # 1. Resolve / auto-detect the log group
         await resolve_log_group(bot)
 
-        
-        # 2. Restore data from Telegram backup (survives ephemeral FS)
-        restored = 0                           # ← must be initialised before the branch
+        restored = 0
         if _tg_backup_enabled and get_backup_chat() != 0:
             restored = await restore_from_telegram_pyrogram(bot)
             if restored:
                 log_msg(f"✅ Restored {restored} file(s) from Telegram backup", "INFO")
         else:
-            log_msg("Telegram backup restore skipped: LOG_GROUP_ID/BACKUP_CHAT_ID not configured or inaccessible.", "INFO")
+            log_msg("Telegram backup restore skipped: log group not configured.", "INFO")
 
-        # 3. Webhook + commands
         wh_status  = await ensure_webhook()
         cmd_status = await sync_commands()
 
-        # 4. Start temp-action worker
         if _temp_worker_task is None or _temp_worker_task.done():
             _temp_worker_task = asyncio.create_task(temp_action_worker())
         if _games_worker_task is None or _games_worker_task.done():
@@ -2291,18 +2173,13 @@ async def startup_event():
 async def shutdown_event():
     global _temp_worker_task, _games_worker_task, _http_client
     log_msg("🛑 Shutting down...", "INFO")
-    if _temp_worker_task and not _temp_worker_task.done():
-        _temp_worker_task.cancel()
-        try:
-            await _temp_worker_task
-        except asyncio.CancelledError:
-            pass
-    if _games_worker_task and not _games_worker_task.done():
-        _games_worker_task.cancel()
-        try:
-            await _games_worker_task
-        except asyncio.CancelledError:
-            pass
+    for task in (_temp_worker_task, _games_worker_task):
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     await shutdown_bot()
     await shutdown_games()
     if _http_client:
