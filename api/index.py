@@ -108,6 +108,7 @@ BOT_COMMANDS = [
 ]
 
 VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
+ACTION_LOG_AUTO_DELETE = 60  # Auto-delete action log messages after 60 seconds (1 minute)
 
 # =========================================================
 # LOGGING
@@ -1316,17 +1317,16 @@ async def send_action_log(
     time_now  = datetime.now().strftime("%d %b %Y • %I:%M %p")
 
     text = (
-        f"╭━━━〔 🚨 MODERATION ACTION 〕━━━╮\n\n"
-        f"👤 User: {mention}\n"
-        f"🆔 User ID: `{target_id}`\n\n"
-        f"⚔ Action: {action}\n"
-        f"📝 Reason: {reason}\n\n"
-        f"👮 Moderator:\n"
-        f"{badge} | {mod_uid}\n\n"
-        f"⏰ Time: {time_now}\n"
-        f"📜 Case ID: #{case_id}\n"
+        f"╭━━〔 🚨 MOD ACTION 〕━━╮\n"
+        f"👤 {mention}\n"
+        f"🆔 `{target_id}`\n"
+        f"⚔ {action}\n"
+        f"📝 {reason}\n"
+        f"👮 {badge} | {mod_uid}\n"
+        f"⏰ {time_now}\n"
+        f"📜 #{case_id}\n"
         f"{extra}\n"
-        f"╰━━━━━━━━━━━━━━━━━━━━━━╯"
+        f"╰━━━━━━━━━━━━━━╯"
     )
 
     rows = []
@@ -1344,9 +1344,13 @@ async def send_action_log(
     markup = build_markup(*rows)
 
     # Send to the group where the action happened
-    await tg_send(source_chat, text, reply_to=reply_to, markup=markup)
+    resp = await tg_send(source_chat, text, reply_to=reply_to, markup=markup)
+    if resp.get("ok") and resp.get("result"):
+        msg_id = resp["result"].get("message_id")
+        if msg_id:
+            schedule_message_delete(source_chat, msg_id, ACTION_LOG_AUTO_DELETE)
 
-    # Send to log group (may differ from source_chat)
+    # Send to log group (may differ from source_chat) — do NOT auto-delete in log group
     lg = get_log_group()
     if lg and lg != source_chat:
         await tg_send(lg, text, markup=markup)
@@ -1362,7 +1366,11 @@ async def send_grant_log(chat_id, reply_to, granted_by, target, permission, case
         f"🔐 Permission: `{permission}`\n"
         f"🛡 Granted by: `{granted_by}`{case_line}"
     )
-    await tg_send(chat_id, text, reply_to=reply_to)
+    resp = await tg_send(chat_id, text, reply_to=reply_to)
+    if resp.get("ok") and resp.get("result"):
+        msg_id = resp["result"].get("message_id")
+        if msg_id:
+            schedule_message_delete(chat_id, msg_id, ACTION_LOG_AUTO_DELETE)
     lg = get_log_group()
     if lg and lg != chat_id:
         await tg_send(lg, f"📝 Grant logged\n\n{text}")
@@ -1429,11 +1437,16 @@ async def process_due_temp_actions(bot: Client):
                     log_msg(f"auto-unban failed for {target_id}: {err}", "WARNING")
                     continue
             elif atype == "delete":
+                retry_count = action.get("retry_count", 0)
                 try:
                     await tg_delete(chat_id, target_id)
-                except Exception:
-                    pending.append(action)
-                    continue
+                except Exception as del_err:
+                    if retry_count < 3:
+                        action["retry_count"] = retry_count + 1
+                        pending.append(action)
+                        log_msg(f"auto-delete failed for msg {target_id} (retry {retry_count + 1}): {del_err}", "WARNING")
+                    else:
+                        log_msg(f"auto-delete failed for msg {target_id} after 3 retries: {del_err}", "WARNING")
         except Exception as e:
             log_msg(f"temp action error {action}: {e}", "ERROR")
             pending.append(action)
