@@ -69,7 +69,12 @@ https://<your-app>.koyeb.app/api/setup_webhook
 | `/hgrant <perm>` | Grant permission | Owner |
 | `/hrevoke <perm>` | Revoke permission | Owner |
 | `/hban` | Ban user (reply) | Moderator |
+| `/hkick` | Kick user (reply) | Moderator |
 | `/hmute` | Mute user (reply) | Moderator |
+| `/pin` | Pin replied message | Moderator |
+| `/unpin` | Unpin current message | Moderator |
+| `/adminlist` | Show all group admins | Authorized |
+| `/zombies` | Scan and kick deleted/bot accounts | Moderator |
 | `/hwarn` | Warn user (reply) | Moderator |
 | `/hdel` | Delete message (reply) | Moderator |
 | `/hprotect` | Protect user (reply) | Owner |

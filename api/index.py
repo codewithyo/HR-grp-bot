@@ -34,7 +34,7 @@ from typing import Dict, Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 
-from pyrogram import Client
+from pyrogram import Client, enums
 from db import mongo_db
 
 # =========================================================
@@ -92,7 +92,14 @@ BOT_COMMANDS = [
     {"command": "hgrant",   "description": "✅ Grant permission to moderator (Owner)"},
     {"command": "hrevoke",  "description": "❌ Revoke permission from moderator (Owner)"},
     {"command": "hban",     "description": "🚫 Ban a user from group"},
+    {"command": "hkick",    "description": "👢 Kick a user from group"},
     {"command": "hmute",    "description": "🔇 Mute a user in group"},
+    {"command": "hstats",   "description": "📊 Show group moderation stats"},
+    {"command": "hmod",     "description": "👮 List authorized moderators"},
+    {"command": "pin",      "description": "📌 Pin replied message"},
+    {"command": "unpin",    "description": "📍 Unpin current message"},
+    {"command": "adminlist", "description": "👮 Show all group admins"},
+    {"command": "zombies",  "description": "🧟 Scan and kick deleted/bot accounts"},
     {"command": "hwarn",    "description": "⚠️ Issue warning to user"},
     {"command": "hdel",     "description": "🗑️ Delete a message"},
     {"command": "hprotect", "description": "🛡️ Protect user from moderation"},
@@ -507,6 +514,23 @@ async def api_unmute(chat_id: int, user_id: int) -> tuple[bool, str]:
     })
     return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
 
+async def api_pin(chat_id: int, message_id: int) -> tuple[bool, str]:
+    r = await tg_api("pinChatMessage", json={"chat_id": chat_id, "message_id": message_id})
+    return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
+
+async def api_unpin(chat_id: int) -> tuple[bool, str]:
+    r = await tg_api("unpinChatMessage", json={"chat_id": chat_id})
+    return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
+
+async def api_kick(chat_id: int, user_id: int) -> tuple[bool, str]:
+    banned, err = await api_ban(chat_id, user_id)
+    if not banned:
+        return False, err
+    unbanned, err = await api_unban(chat_id, user_id)
+    if not unbanned:
+        return False, err
+    return True, ""
+
 async def api_delete_msg(chat_id: int, message_id: int) -> tuple[bool, str]:
     r = await tg_api("deleteMessage", json={"chat_id": chat_id, "message_id": message_id})
     return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
@@ -763,7 +787,7 @@ def resolve_target(reply, args, idx) -> tuple[dict, int | None, str | None]:
 def extract_reason(args, start, default="No Reason") -> str:
     return " ".join(args[start:]).strip() or default if len(args) > start else default
 
-def create_case(action, moderator, target, reason) -> str:
+def create_case(action, moderator, target, reason, extra: dict | None = None) -> str:
     cases = load(CASE_FILE)
     cid   = str(len(cases) + 1)
     cases[cid] = {
@@ -771,6 +795,8 @@ def create_case(action, moderator, target, reason) -> str:
         "target": target, "reason": reason,
         "time": str(datetime.now()),
     }
+    if extra:
+        cases[cid].update(extra)
     save(CASE_FILE, cases)
     return cid
 
@@ -847,6 +873,174 @@ def format_duration(secs: int) -> str:
             return f"{secs // divisor}{suffix}"
     return f"{secs}s"
 
+def format_timestamp(ts: int | None) -> str:
+    if not ts:
+        return "N/A"
+    return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def format_permission_set(perms: dict) -> str:
+    granted = [perm for perm, enabled in sorted(perms.items()) if enabled]
+    return ", ".join(granted) if granted else "none"
+
+def format_admin_privileges(privileges) -> str:
+    fields = [
+        "can_change_info",
+        "can_delete_messages",
+        "can_restrict_members",
+        "can_promote_members",
+        "can_manage_video_chats",
+        "can_post_messages",
+        "can_edit_messages",
+        "is_anonymous",
+        "can_invite_users",
+        "can_pin_messages",
+        "can_manage_chat",
+        "can_manage_topics",
+    ]
+    if not privileges:
+        return "none"
+    granted = []
+    for field in fields:
+        if getattr(privileges, field, False):
+            granted.append(field.replace("can_", "").replace("_", " "))
+    return ", ".join(granted) if granted else "none"
+
+def get_moderation_stats() -> dict:
+    cases = load(CASE_FILE)
+    if not isinstance(cases, dict):
+        cases = {}
+
+    counts = {"BAN": 0, "MUTE": 0, "WARN": 0, "KICK": 0, "DELETE": 0}
+    moderator_counts: dict[str, int] = {}
+    moderator_labels: dict[str, str] = {}
+
+    for case in cases.values():
+        if not isinstance(case, dict):
+            continue
+        action = str(case.get("action", "")).upper()
+        moderator = str(case.get("moderator", "UNKNOWN"))
+        if action in counts:
+            counts[action] += 1
+        if action in counts:
+            moderator_counts[moderator] = moderator_counts.get(moderator, 0) + 1
+            moderator_labels[moderator] = moderator
+
+    top_mods = sorted(moderator_counts.items(), key=lambda item: (-item[1], item[0]))[:5]
+    return {
+        "counts": counts,
+        "top_mods": top_mods,
+        "total_actions": sum(counts.values()),
+    }
+
+def build_moderator_list_text() -> str:
+    auth = load(AUTH_FILE)
+    if not isinstance(auth, dict):
+        auth = {}
+
+    lines = ["👮 **Authorized Moderators**\n"]
+    lines.append("👑 Owner: all permissions\n")
+
+    if not auth:
+        lines.append("No authorized moderators found.")
+        return "\n".join(lines)
+
+    sorted_mods = sorted(auth.items(), key=lambda item: int(item[0]) if str(item[0]).isdigit() else 10**18)
+    for uid_str, mod in sorted_mods:
+        if not isinstance(mod, dict):
+            continue
+        perms = mod.get("permissions", {}) if isinstance(mod.get("permissions", {}), dict) else {}
+        lines.append(
+            f"• `{uid_str}` | {mod.get('mod_id', 'N/A')} | {mod.get('badge', '🛡 Moderator')} | "
+            f"{'🔴 Frozen' if mod.get('frozen') else '🟢 Active'} | perms: {format_permission_set(perms)}"
+        )
+    return "\n".join(lines)
+
+def build_stats_text() -> str:
+    stats = get_moderation_stats()
+    counts = stats["counts"]
+    top_mods = stats["top_mods"]
+    lines = [
+        "📊 **Group Moderation Stats**\n",
+        f"🚫 Total bans: `{counts['BAN']}`",
+        f"🔇 Total mutes: `{counts['MUTE']}`",
+        f"⚠️ Total warns: `{counts['WARN']}`",
+        f"👢 Total kicks: `{counts['KICK']}`",
+        f"🗑️ Total deletes: `{counts['DELETE']}`",
+        f"🧮 Total moderation actions: `{stats['total_actions']}`",
+        "",
+        "👮 **Most Active Moderators**",
+    ]
+    if top_mods:
+        for idx, (moderator, count) in enumerate(top_mods, start=1):
+            mod_info = get_mod_info(int(moderator)) if moderator.isdigit() else {}
+            label = mod_info.get("mod_id", moderator) if mod_info else moderator
+            lines.append(f"{idx}. `{label}` — `{count}` actions")
+    else:
+        lines.append("No moderation activity yet.")
+    return "\n".join(lines)
+
+async def build_admin_list_text(bot: Client, chat_id: int) -> str:
+    lines = ["👮 **Group Administrators**\n"]
+    try:
+        admin_stream = bot.get_chat_members(chat_id, filter=enums.ChatMembersFilter.ADMINISTRATORS)
+        async for member in admin_stream:
+            user = getattr(member, "user", None)
+            if not user:
+                continue
+            title = getattr(member, "rank", None) or getattr(member, "custom_title", None) or "Administrator"
+            status = "owner" if member.status == enums.ChatMemberStatus.OWNER else "admin"
+            username = f"@{user.username}" if getattr(user, "username", None) else "—"
+            full_name = (user.first_name or "User") + (f" {user.last_name}" if getattr(user, "last_name", None) else "")
+            lines.append(
+                f"• `{user.id}` | {full_name}"
+                f" | {username}"
+                f" | {title} | {status} | perms: {format_admin_privileges(getattr(member, 'privileges', None))}"
+            )
+    except Exception as e:
+        return f"❌ Could not load admins: {e}"
+    if len(lines) == 1:
+        lines.append("No administrators found.")
+    return "\n".join(lines)
+
+async def scan_zombies(bot: Client, chat_id: int) -> tuple[int, int, list[str]]:
+    kicked_deleted = 0
+    kicked_bots = 0
+    failures: list[str] = []
+    async for member in bot.get_chat_members(chat_id):
+        user = getattr(member, "user", None)
+        if not user:
+            continue
+        if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
+            continue
+        is_deleted = bool(getattr(user, "is_deleted", False))
+        is_bot = bool(getattr(user, "is_bot", False))
+        if not is_deleted and not is_bot:
+            continue
+        ok, err = await api_kick(chat_id, user.id)
+        if ok:
+            if is_deleted:
+                kicked_deleted += 1
+            if is_bot:
+                kicked_bots += 1
+        else:
+            failures.append(f"{user.id}: {err}")
+    return kicked_deleted, kicked_bots, failures
+
+def schedule_temp_action(action_type: str, chat_id: int, target_id: int, until_ts: int, set_by: int, reason: str, case_id: str | None = None):
+    actions = load_temp_actions()
+    action = {
+        "type": action_type,
+        "chat_id": chat_id,
+        "target_id": target_id,
+        "until_ts": until_ts,
+        "set_by": set_by,
+        "reason": reason,
+    }
+    if case_id:
+        action["case_id"] = case_id
+    actions.append(action)
+    save_temp_actions(actions)
+
 def track_action(uid: int) -> int:
     data = load(ABUSE_FILE)
     key  = str(uid)
@@ -885,7 +1079,10 @@ def role_help_text(uid: int) -> str:
             "`/hprotect <user_id>` - Protect user from moderation\n\n"
             "📋 **Moderation Commands:**\n"
             "`/hban [user_id] [duration] [reason]` - Ban user\n"
+            "`/hkick <user_id> [reason]` - Kick user from group\n"
             "`/hmute [user_id] [duration] [reason]` - Mute user\n"
+            "`/hstats` - Show moderation stats\n"
+            "`/hmod list` - List authorized moderators\n"
             "`/hwarn [user_id] [reason]` - Warn user\n"
             "`/hdel <msg_id>` - Delete message\n"
             "`/hcase <case_id>` - View case details\n"
@@ -904,11 +1101,14 @@ def role_help_text(uid: int) -> str:
             "╚════════════════════════════════════════╝\n\n"
             "🚫 **Moderation Commands:**\n"
             "`/hban [user_id] [duration] [reason]` - Ban user\n"
+            "`/hkick <user_id> [reason]` - Kick user from group\n"
             "`/hmute [user_id] [duration] [reason]` - Mute user\n"
+            "`/hstats` - Show moderation stats\n"
             "`/hwarn [user_id] [reason]` - Warn user\n"
             "`/hdel <msg_id>` - Delete message\n\n"
             "📋 **Information Commands:**\n"
             "`/hcase <case_id>` - View case details\n"
+            "`/hmod list` - List authorized moderators\n"
             "`/hmodinfo` - View your moderator info\n"
             "`/hr` - Get user information\n\n"
             "⏱️ **Duration Format:** 30m, 2h, 1d (for timed actions)\n\n"
@@ -1132,6 +1332,8 @@ async def send_action_log(
     rows = []
     if action == "BAN":
         rows.append([("🔓 Unban",       f"cb:unban_{target_id}")])
+    elif action == "KICK":
+        rows.append([("👤 Profile",     f"url:tg://user?id={target_id}")])
     elif action == "MUTE":
         rows.append([("🔊 Unmute",      f"cb:unmute_{target_id}")])
     elif action == "WARN":
@@ -1180,7 +1382,8 @@ async def process_due_temp_actions(bot: Client):
     now_ts  = int(time.time())
     pending = []
     for action in actions:
-        if int(action.get("until_ts", 0)) > now_ts:
+        until_ts = int(action.get("until_ts", 0))
+        if until_ts > now_ts:
             pending.append(action)
             continue
         chat_id   = action["chat_id"]
@@ -1189,14 +1392,48 @@ async def process_due_temp_actions(bot: Client):
         try:
             if atype == "mute":
                 ok, err = await api_unmute(chat_id, target_id)
-                msg_text = f"🔊 Temporary mute ended for `{target_id}`" if ok else f"⚠️ Auto-unmute failed for `{target_id}`: {err}"
-                await tg_send(chat_id, msg_text)
+                if ok:
+                    msg_text = (
+                        f"🔊 Temporary mute ended for `{target_id}`"
+                        f"\n⏰ Expired: {format_timestamp(until_ts)}"
+                    )
+                    if action.get("case_id"):
+                        msg_text += f"\n📜 Case #{action['case_id']}"
+                    if action.get("reason"):
+                        msg_text += f"\n📝 Reason: {action['reason']}"
+                    try:
+                        await tg_send(chat_id, msg_text)
+                    except Exception as send_err:
+                        log_msg(f"temp mute update failed for {target_id}: {send_err}", "WARNING")
+                else:
+                    pending.append(action)
+                    log_msg(f"auto-unmute failed for {target_id}: {err}", "WARNING")
+                    continue
             elif atype == "ban":
                 ok, err = await api_unban(chat_id, target_id)
-                msg_text = f"🔓 Temporary ban ended for `{target_id}`" if ok else f"⚠️ Auto-unban failed for `{target_id}`: {err}"
-                await tg_send(chat_id, msg_text)
+                if ok:
+                    msg_text = (
+                        f"🔓 Temporary ban ended for `{target_id}`"
+                        f"\n⏰ Expired: {format_timestamp(until_ts)}"
+                    )
+                    if action.get("case_id"):
+                        msg_text += f"\n📜 Case #{action['case_id']}"
+                    if action.get("reason"):
+                        msg_text += f"\n📝 Reason: {action['reason']}"
+                    try:
+                        await tg_send(chat_id, msg_text)
+                    except Exception as send_err:
+                        log_msg(f"temp ban update failed for {target_id}: {send_err}", "WARNING")
+                else:
+                    pending.append(action)
+                    log_msg(f"auto-unban failed for {target_id}: {err}", "WARNING")
+                    continue
             elif atype == "delete":
-                await tg_delete(chat_id, target_id)
+                try:
+                    await tg_delete(chat_id, target_id)
+                except Exception:
+                    pending.append(action)
+                    continue
         except Exception as e:
             log_msg(f"temp action error {action}: {e}", "ERROR")
             pending.append(action)
@@ -1405,7 +1642,7 @@ async def handle_message(bot: Client, msg: dict):
                 await reply_text(
                     "🎭 **Anonymous Admin Mode**\n\n"
                     "You can use moderation commands while posting anonymously:\n"
-                    "`/hban`, `/hmute`, `/hwarn`, `/hdel`, `/hcase`, `/hmodinfo`, `/hr`\n\n"
+                    "`/hban`, `/hkick`, `/hmute`, `/hstats`, `/hwarn`, `/hdel`, `/hcase`, `/hmod list`, `/hmodinfo`, `/hr`, `/pin`, `/unpin`, `/adminlist`, `/zombies`\n\n"
                     "Owner-only commands (`/hauth`, `/hgrant`, `/hrevoke`, `/hprotect`) require a normal account identity."
                 )
             else:
@@ -1617,13 +1854,93 @@ async def handle_message(bot: Client, msg: dict):
             if not ok:
                 return await reply_text(f"❌ Ban failed: {err}")
             if dur:
-                actions = load_temp_actions()
-                actions.append({"type": "ban", "chat_id": chat_id, "target_id": tid,
-                                 "until_ts": until_ts, "set_by": uid, "reason": reason})
-                save_temp_actions(actions)
                 reason = f"{reason} | Duration: {format_duration(dur)}"
-            case_id = create_case("BAN", uid, tid, reason)
+            case_id = create_case(
+                "BAN",
+                uid,
+                tid,
+                reason,
+                extra={
+                    "temporary": bool(dur),
+                    "duration": dur,
+                    "expires_at": until_ts,
+                },
+            )
+            if dur:
+                schedule_temp_action("ban", chat_id, tid, until_ts, uid, reason, case_id=case_id)
             await send_action_log(chat_id, msg_id, "BAN", target, reason, case_id, actor_mod_info())
+            return
+
+        # ── /hkick ───────────────────────────────────────
+        if raw_cmd in ("hkick", "hk"):
+            if not await check_mod("ban"):
+                return
+            target, tid, terr = resolve_target(reply, args, 0)
+            if not tid:
+                return await reply_text(
+                    f"{terr}\nUsage: /hkick <user_id> [reason]"
+                )
+            rs = 0 if reply else 1
+            reason = extract_reason(args, rs, "No Reason")
+            if is_protected(tid):
+                return await reply_text("🛡 That user is protected.")
+            if await anti_nuke(chat_id, msg_id, uid):
+                return
+            ok, err = await api_kick(chat_id, tid)
+            if not ok:
+                return await reply_text(f"❌ Kick failed: {err}")
+            case_id = create_case("KICK", uid, tid, reason)
+            await send_action_log(chat_id, msg_id, "KICK", target, reason, case_id, actor_mod_info())
+            return
+
+        # ── /pin ─────────────────────────────────────────
+        if raw_cmd == "pin":
+            if not is_authorized_actor():
+                return await reply_text("❌ Moderator access required.")
+            if not reply:
+                return await reply_text("❌ Reply to the message you want to pin.")
+            reply_msg_id = reply.get("message_id")
+            if not reply_msg_id:
+                return await reply_text("❌ Could not determine the replied message.")
+            ok, err = await api_pin(chat_id, reply_msg_id)
+            if not ok:
+                return await reply_text(f"❌ Pin failed: {err}")
+            await reply_text("📌 Message pinned.")
+            return
+
+        # ── /unpin ───────────────────────────────────────
+        if raw_cmd == "unpin":
+            if not is_authorized_actor():
+                return await reply_text("❌ Moderator access required.")
+            ok, err = await api_unpin(chat_id)
+            if not ok:
+                return await reply_text(f"❌ Unpin failed: {err}")
+            await reply_text("📍 Pinned message removed.")
+            return
+
+        # ── /adminlist ───────────────────────────────────
+        if raw_cmd == "adminlist":
+            if not is_authorized_actor():
+                return await reply_text("❌ Moderator access required.")
+            await reply_text(await build_admin_list_text(bot, chat_id))
+            return
+
+        # ── /zombies ─────────────────────────────────────
+        if raw_cmd == "zombies":
+            if not await check_mod("ban"):
+                return
+            if await anti_nuke(chat_id, msg_id, uid):
+                return
+            await reply_text("🔎 Scanning for deleted/bot accounts...")
+            kicked_deleted, kicked_bots, failures = await scan_zombies(bot, chat_id)
+            summary = (
+                f"🧟 Zombie scan complete\n"
+                f"• Deleted accounts kicked: `{kicked_deleted}`\n"
+                f"• Bot accounts kicked: `{kicked_bots}`"
+            )
+            if failures:
+                summary += f"\n• Failures: `{len(failures)}`"
+            await reply_text(summary)
             return
 
         # ── /hmute ────────────────────────────────────────
@@ -1646,13 +1963,37 @@ async def handle_message(bot: Client, msg: dict):
             if not ok:
                 return await reply_text(f"❌ Mute failed: {err}")
             if dur:
-                actions = load_temp_actions()
-                actions.append({"type": "mute", "chat_id": chat_id, "target_id": tid,
-                                 "until_ts": until_ts, "set_by": uid, "reason": reason})
-                save_temp_actions(actions)
                 reason = f"{reason} | Duration: {format_duration(dur)}"
-            case_id = create_case("MUTE", uid, tid, reason)
+            case_id = create_case(
+                "MUTE",
+                uid,
+                tid,
+                reason,
+                extra={
+                    "temporary": bool(dur),
+                    "duration": dur,
+                    "expires_at": until_ts,
+                },
+            )
+            if dur:
+                schedule_temp_action("mute", chat_id, tid, until_ts, uid, reason, case_id=case_id)
             await send_action_log(chat_id, msg_id, "MUTE", target, reason, case_id, actor_mod_info())
+            return
+
+        # ── /hstats ───────────────────────────────────────
+        if raw_cmd == "hstats":
+            if not is_authorized_actor():
+                return await reply_text("❌ Moderator access required.")
+            await reply_text(build_stats_text())
+            return
+
+        # ── /hmod list ───────────────────────────────────
+        if raw_cmd == "hmod":
+            if not is_authorized_actor():
+                return await reply_text("❌ Moderator access required.")
+            if not args or args[0].lower() != "list":
+                return await reply_text("Usage: /hmod list")
+            await reply_text(build_moderator_list_text())
             return
 
         # ── /hwarn ────────────────────────────────────────
@@ -1731,6 +2072,7 @@ async def handle_message(bot: Client, msg: dict):
                 f"👮 Moderator: `{case['moderator']}`\n"
                 f"📝 Reason: {case['reason']}\n"
                 f"⏰ Time: {case['time']}"
+                + (f"\n⏳ Expires: {format_timestamp(case.get('expires_at'))}" if case.get('temporary') else "")
             )
             return
 
@@ -1834,9 +2176,12 @@ async def handle_callback(bot: Client, cb: dict):
             cases   = load(CASE_FILE)
             case    = cases.get(case_id)
             if case:
+                expiry_line = ""
+                if case.get("temporary"):
+                    expiry_line = f"\n⏳ Expires: {format_timestamp(case.get('expires_at'))}"
                 await tg_answer_cb(
                     cb_id,
-                    f"Case #{case_id}\n{case['action']} — {case['reason']}\n{case['time']}",
+                    f"Case #{case_id}\n{case['action']} — {case['reason']}\n{case['time']}{expiry_line}",
                     alert=True,
                 )
             else:

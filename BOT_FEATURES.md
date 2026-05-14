@@ -13,11 +13,21 @@
 | Command | Description | Usage |
 |---------|-------------|-------|
 | `/hban` | Ban user from group | `/hban @user [duration] [reason]` |
+| `/hkick` | Kick user from group | `/hkick @user [reason]` |
 | `/hmute` | Mute user in group | `/hmute @user [duration] [reason]` |
+| `/pin` | Pin replied message | `/pin` (reply only) |
+| `/unpin` | Unpin current pinned message | `/unpin` |
+| `/adminlist` | Show all group admins | `/adminlist` |
+| `/zombies` | Scan and kick deleted/bot accounts | `/zombies` |
 | `/hwarn` | Issue warning | `/hwarn @user [reason]` |
 | `/hdel` | Delete message | `/hdel <message_id>` |
 | `/hcase` | View case details | `/hcase <case_id>` |
 | `/hmodinfo` | View moderator info | `/hmodinfo [@user]` |
+| `/hkick` | Kick user from group | `/hkick @user [reason]` |
+| `/pin` | Pin replied message | `/pin` (reply only) |
+| `/unpin` | Unpin current pinned message | `/unpin` |
+| `/adminlist` | Show all group admins | `/adminlist` |
+| `/zombies` | Scan and kick deleted/bot accounts | `/zombies` |
 
 ### Owner Commands (Administrator Only)
 | Command | Description | Usage |
