@@ -478,13 +478,83 @@ async def tg_send(
     reply_to: int = None,
     markup: dict = None,
     parse_mode: str = "Markdown",
+    entities: list = None,
 ) -> dict:
-    payload: dict = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    payload: dict = {"chat_id": chat_id, "text": text}
     if reply_to:
         payload["reply_to_message_id"] = reply_to
     if markup:
         payload["reply_markup"] = markup
+    # Only include parse_mode if explicitly provided (not None)
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
+    # Include message entities (to preserve clickable links/formatting)
+    if entities is not None:
+        payload["entities"] = entities
     return await tg_api("sendMessage", json=payload)
+
+
+async def tg_send_media(chat_id: int, note: dict, reply_to: int = None):
+    """Send a saved media note (photo, document, video, audio, voice, sticker, animation).
+    note: dict containing keys `type`, `file_id`, `content` (caption), and optional `entities`.
+    """
+    ntype = note.get("type", "text")
+    fid   = note.get("file_id")
+    caption = note.get("content") or ""
+    entities = note.get("entities")
+    payload = {"chat_id": chat_id}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    try:
+        if ntype == "photo" and fid:
+            payload["photo"] = fid
+            if caption:
+                payload["caption"] = caption
+                if entities is not None:
+                    payload["caption_entities"] = entities
+            return await tg_api("sendPhoto", json=payload)
+        if ntype == "document" and fid:
+            payload["document"] = fid
+            if caption:
+                payload["caption"] = caption
+                if entities is not None:
+                    payload["caption_entities"] = entities
+            return await tg_api("sendDocument", json=payload)
+        if ntype == "video" and fid:
+            payload["video"] = fid
+            if caption:
+                payload["caption"] = caption
+                if entities is not None:
+                    payload["caption_entities"] = entities
+            return await tg_api("sendVideo", json=payload)
+        if ntype == "audio" and fid:
+            payload["audio"] = fid
+            if caption:
+                payload["caption"] = caption
+                if entities is not None:
+                    payload["caption_entities"] = entities
+            return await tg_api("sendAudio", json=payload)
+        if ntype == "voice" and fid:
+            payload["voice"] = fid
+            return await tg_api("sendVoice", json=payload)
+        if ntype == "sticker" and fid:
+            payload["sticker"] = fid
+            return await tg_api("sendSticker", json=payload)
+        if ntype == "animation" and fid:
+            payload["animation"] = fid
+            if caption:
+                payload["caption"] = caption
+                if entities is not None:
+                    payload["caption_entities"] = entities
+            return await tg_api("sendAnimation", json=payload)
+    except Exception as e:
+        log_msg(f"tg_send_media error: {e}", "ERROR")
+    # Fallback to text send
+    if caption:
+        if entities is not None:
+            return await tg_send(chat_id, caption, reply_to=reply_to, parse_mode=None, entities=entities)
+        return await tg_send(chat_id, caption, reply_to=reply_to, parse_mode=None)
+    return {"ok": False, "description": "No media to send."}
 
 async def tg_answer_cb(cb_id: str, text: str, alert: bool = False):
     await tg_api("answerCallbackQuery", json={
@@ -973,6 +1043,7 @@ def note_save(
     chat_id: int, name: str, content: str,
     note_type: str = "text", file_id: str = None,
     created_by: int = None,
+    entities: list = None,
 ):
     notes = _notes_for_chat(chat_id)
     notes[name.lower().strip()] = {
@@ -980,6 +1051,7 @@ def note_save(
         "type":       note_type,
         "file_id":    file_id,
         "created_by": created_by,
+        "entities":   entities,
         "updated_at": str(datetime.now()),
     }
     _save_notes_for_chat(chat_id, notes)
@@ -1981,7 +2053,18 @@ async def handle_message(bot: Client, msg: dict):
                 for tag in hashtags:
                     note = note_get(chat_id, tag.lower())
                     if note:
-                        await tg_send(chat_id, note["content"], reply_to=msg_id, parse_mode=None)
+                        content = note.get("content", "")
+                        # Prefer sending stored entities to preserve clickable links
+                        if note.get("entities"):
+                            await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None, entities=note.get("entities"))
+                        else:
+                            # Detect simple markdown or HTML links and set parse_mode accordingly
+                            if re.search(r"\[.+?\]\(https?://[^\s)]+\)", content):
+                                await tg_send(chat_id, content, reply_to=msg_id, parse_mode="Markdown")
+                            elif "<a " in content:
+                                await tg_send(chat_id, content, reply_to=msg_id, parse_mode="HTML")
+                            else:
+                                await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None)
                         return  # only respond to the first matching note
 
                 # 2) Check filters
@@ -2196,6 +2279,9 @@ async def handle_message(bot: Client, msg: dict):
         # ── /hr ───────────────────────────────────────────────────────────
         if raw_cmd in ("hr", "id"):
             try:
+                # If invoked in a group with no args/reply, return the group ID
+                if not args and not reply and not is_private:
+                    return await reply_text(f"📌 Group ID: `{chat_id}`")
                 target_id   = None
                 target_user = None
 
@@ -2318,19 +2404,48 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("❌ Note name too long (max 64 chars).")
 
             # Content from args or from replied message
+            entities = None
+            note_type = "text"
+            file_id = None
             if len(args) > 1:
                 content = " ".join(args[1:]).strip()
             elif reply:
-                content = reply.get("text") or reply.get("caption") or ""
-                if not content:
-                    return await reply_text("❌ Replied message has no text to save.")
+                # Prefer caption for media, else text
+                content = reply.get("caption") or reply.get("text") or ""
+                if not content and not any(k in reply for k in ("photo","document","video","audio","voice","sticker","animation")):
+                    return await reply_text("❌ Replied message has no text or media to save.")
+                # Capture entities (text/caption entities) to preserve clickable links
+                entities = reply.get("caption_entities") or reply.get("entities")
+                # Detect media and extract file_id and type
+                if "photo" in reply and isinstance(reply.get("photo"), list) and reply["photo"]:
+                    note_type = "photo"
+                    # use largest size
+                    file_id = reply["photo"][-1].get("file_id")
+                elif "document" in reply and isinstance(reply.get("document"), dict):
+                    note_type = "document"
+                    file_id = reply["document"].get("file_id")
+                elif "video" in reply and isinstance(reply.get("video"), dict):
+                    note_type = "video"
+                    file_id = reply["video"].get("file_id")
+                elif "audio" in reply and isinstance(reply.get("audio"), dict):
+                    note_type = "audio"
+                    file_id = reply["audio"].get("file_id")
+                elif "voice" in reply and isinstance(reply.get("voice"), dict):
+                    note_type = "voice"
+                    file_id = reply["voice"].get("file_id")
+                elif "sticker" in reply and isinstance(reply.get("sticker"), dict):
+                    note_type = "sticker"
+                    file_id = reply["sticker"].get("file_id")
+                elif "animation" in reply and isinstance(reply.get("animation"), dict):
+                    note_type = "animation"
+                    file_id = reply["animation"].get("file_id")
             else:
                 return await reply_text(
                     "❌ Provide content after the name, or reply to a message.\n"
                     "Example: `/save rules No spamming!`"
                 )
-
-            note_save(action_chat_id, note_name, content, created_by=uid)
+            # Pass entities and file info if present so the note preserves clickable links/media
+            note_save(action_chat_id, note_name, content, note_type, file_id, created_by=uid, entities=entities if reply else None)
             await reply_text(f"📋 Note `{note_name}` saved! Get it with `/get {note_name}` or `#{note_name}`.")
             return
 
@@ -2342,7 +2457,24 @@ async def handle_message(bot: Client, msg: dict):
             note = note_get(action_chat_id, note_name)
             if not note:
                 return await reply_text(f"❌ Note `{note_name}` not found.\nUse `/notes` to see all saved notes.")
-            await tg_send(chat_id, note["content"], reply_to=msg_id, parse_mode=None)
+            # If this is media, send via media API
+            if note.get("type") and note.get("type") != "text" and note.get("file_id"):
+                await tg_send_media(chat_id, note, reply_to=msg_id)
+            else:
+                # If this is media, send via media API
+                if note.get("type") and note.get("type") != "text" and note.get("file_id"):
+                    await tg_send_media(chat_id, note, reply_to=msg_id)
+                else:
+                    content = note.get("content", "")
+                    if note.get("entities"):
+                        await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None, entities=note.get("entities"))
+                    else:
+                        if re.search(r"\[.+?\]\(https?://[^\s)]+\)", content):
+                            await tg_send(chat_id, content, reply_to=msg_id, parse_mode="Markdown")
+                        elif "<a " in content:
+                            await tg_send(chat_id, content, reply_to=msg_id, parse_mode="HTML")
+                        else:
+                            await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None)
             return
 
         # ── /clear <name> ───────────────────────────────────────────────
@@ -3157,7 +3289,16 @@ async def handle_callback(bot: Client, cb: dict):
             note_name = data.split("_", 1)[1]
             note      = note_get(chat_id, note_name)
             if note:
-                await tg_send(chat_id, note["content"], parse_mode=None)
+                content = note.get("content", "")
+                if note.get("entities"):
+                    await tg_send(chat_id, content, parse_mode=None, entities=note.get("entities"))
+                else:
+                    if re.search(r"\[.+?\]\(https?://[^\s)]+\)", content):
+                        await tg_send(chat_id, content, parse_mode="Markdown")
+                    elif "<a " in content:
+                        await tg_send(chat_id, content, parse_mode="HTML")
+                    else:
+                        await tg_send(chat_id, content, parse_mode=None)
                 await tg_answer_cb(cb_id, f"📋 Note: #{note_name}")
             else:
                 await tg_answer_cb(cb_id, "❌ Note not found.", alert=True)
