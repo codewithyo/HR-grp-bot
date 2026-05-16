@@ -859,7 +859,7 @@ async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
     user    = msg.get("from", {})
     user_id = user.get("id")
     if chat.get("type") != "private":
-        return "Usage limited to PMs only!"
+        return "Use this in PM to connect a chat by ID."
     if not user_id:
         return "Invalid user!"
     if len(args) < 1:
@@ -868,17 +868,23 @@ async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
         connect_id = int(args[0])
     except ValueError:
         return "Invalid Chat ID provided!"
+    message = await connect_user_to_chat(bot, user_id, connect_id)
+    return message or "Connection failed!"
+
+async def connect_user_to_chat(bot: Client, user_id: int, connect_id: int) -> str | None:
     try:
         member = await bot.get_chat_member(connect_id, user_id)
     except UserNotParticipant:
         return "Connections to this chat not allowed!"
     except BadRequest:
         return "Invalid Chat ID provided!"
+
     allowed = member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
     if not allowed:
         allowed = allow_connect_to_chat(connect_id) and member.status == enums.ChatMemberStatus.MEMBER
     if not allowed:
         return "Connections to this chat not allowed!"
+
     try:
         target_chat = await bot.get_chat(connect_id)
         add_user_connection(user_id, connect_id)
@@ -893,12 +899,32 @@ async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
     except Exception:
         return "Connection failed!"
 
+async def disconnect_user_from_chat(bot: Client, user_id: int, disconnect_id: int) -> str | None:
+    chats = get_connected_chats(user_id)
+    if disconnect_id not in chats:
+        return "❌ You were not connected to that group."
+
+    removed = remove_user_connection(user_id, disconnect_id)
+    if not removed:
+        return "❌ You were not connected to that group."
+
+    remaining = get_connected_chats(user_id)
+    if remaining:
+        new_active = get_active_connection(user_id)
+        try:
+            chat_obj = await bot.get_chat(new_active)
+            return f"✅ Disconnected. Active group switched to *{chat_obj.title}*."
+        except Exception:
+            return f"✅ Disconnected. Active group: `{new_active}`."
+
+    return "✅ Disconnected from active group."
+
 async def disconnect_chat(bot: Client, msg: dict, args: list[str]) -> str:
     chat    = msg.get("chat", {})
     user    = msg.get("from", {})
     user_id = user.get("id")
     if chat.get("type") != "private":
-        return "Usage restricted to PMs only"
+        return "Use this in PM to disconnect a chat by ID."
     if not user_id:
         return "Invalid user!"
     # /disconnect all
@@ -909,24 +935,15 @@ async def disconnect_chat(bot: Client, msg: dict, args: list[str]) -> str:
     if args:
         try:
             cid = int(args[0])
-            if remove_user_connection(user_id, cid):
-                return f"✅ Disconnected from `{cid}`."
-            return "❌ You were not connected to that group."
+            message = await disconnect_user_from_chat(bot, user_id, cid)
+            return message or "❌ You were not connected to that group."
         except ValueError:
             return "❌ Invalid chat ID."
     # /disconnect — remove active
     active = get_active_connection(user_id)
     if active:
-        remove_user_connection(user_id, active)
-        remaining = get_connected_chats(user_id)
-        if remaining:
-            new_active = get_active_connection(user_id)
-            try:
-                chat_obj = await bot.get_chat(new_active)
-                return f"✅ Disconnected. Active group switched to *{chat_obj.title}*."
-            except Exception:
-                return f"✅ Disconnected. Active group: `{new_active}`."
-        return "✅ Disconnected from active group."
+        message = await disconnect_user_from_chat(bot, user_id, active)
+        return message or "✅ Disconnected from active group."
     return "You are not connected to any group."
 
 # =========================================================
@@ -2051,16 +2068,42 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /connect ──────────────────────────────────────────────────────
         if raw_cmd == "connect":
-            message = await connect_chat(bot, msg, args)
-            if message:
-                await reply_text(message)
+            if is_private:
+                message = await connect_chat(bot, msg, args)
+                if message:
+                    await reply_text(message)
+            else:
+                try:
+                    me = await bot.get_me()
+                    pm_link = f"https://t.me/{me.username}?start=connect_{chat_id}"
+                    await tg_send(
+                        chat_id,
+                        "🔗 Tap the button below to connect this group in PM.",
+                        reply_to=msg_id,
+                        markup=build_markup([("Connect to PM", f"url:{pm_link}")]),
+                    )
+                except Exception:
+                    await reply_text("❌ Could not create the PM connect link.")
             return
 
         # ── /disconnect ───────────────────────────────────────────────────
         if raw_cmd == "disconnect":
-            message = await disconnect_chat(bot, msg, args)
-            if message:
-                await reply_text(message)
+            if is_private:
+                message = await disconnect_chat(bot, msg, args)
+                if message:
+                    await reply_text(message)
+            else:
+                try:
+                    me = await bot.get_me()
+                    pm_link = f"https://t.me/{me.username}?start=disconnect_{chat_id}"
+                    await tg_send(
+                        chat_id,
+                        "🔗 Tap the button below to disconnect this group in PM.",
+                        reply_to=msg_id,
+                        markup=build_markup([("Disconnect from PM", f"url:{pm_link}")]),
+                    )
+                except Exception:
+                    await reply_text("❌ Could not create the PM disconnect link.")
             return
 
         # ── /connections — list all connected groups ───────────────────────
@@ -2098,6 +2141,24 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /start ────────────────────────────────────────────────────────
         if raw_cmd == "start":
+            if args and args[0].startswith("connect_"):
+                try:
+                    connect_id = int(args[0].split("_", 1)[1])
+                except ValueError:
+                    return await reply_text("❌ Invalid connection link.")
+                message = await connect_user_to_chat(bot, uid, connect_id)
+                if message:
+                    await reply_text(message)
+                return
+            if args and args[0].startswith("disconnect_"):
+                try:
+                    disconnect_id = int(args[0].split("_", 1)[1])
+                except ValueError:
+                    return await reply_text("❌ Invalid disconnect link.")
+                message = await disconnect_user_from_chat(bot, uid, disconnect_id)
+                if message:
+                    await reply_text(message)
+                return
             await reply_text(
                 "🛡️ **SentriX Prime**\n\n"
                 "Elite moderation + advanced utility tools for your group.\n\n"
