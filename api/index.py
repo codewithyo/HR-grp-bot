@@ -1780,8 +1780,8 @@ async def handle_message(bot: Client, msg: dict):
                 "• `/hr` - User insights\n"
                 "• `/ttt` - Tic-Tac-Toe battle\n"
                 "• `/happeal` - Appeal in DM\n\n"
-                "👨‍💻 Developed by @dreamm_ca\n"
-                "⚙️ Sudo Dev: @developer_hr\n\n"
+                "👨‍💻 Developed by @dreamm\_ca\n"
+                "⚙️ Sudo Dev: @developer\_hr\n\n"
                 "⚡ Active. Secure. Ready."
             )
             return
