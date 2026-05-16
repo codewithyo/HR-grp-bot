@@ -1,39 +1,6 @@
 # =========================================================
 # ADVANCED TELEGRAM MODERATION BOT — KOYEB VERSION (FIXED)
 # =========================================================
-#
-# ENV VARS required:
-#   API_ID  API_HASH  BOT_TOKEN  OWNER_ID  PORT
-#   LOG_GROUP_ID      (0 = auto-detect)
-#   BACKUP_CHAT_ID    (defaults to LOG_GROUP_ID)
-#   STORAGE_PATH      (optional, default /data/modbot)
-#   OWNER_DEBUG_NOTIFICATIONS  (1 = enable noisy debug DMs)
-#
-# FIXES APPLIED:
-#   [FIX-1]  removewarn_ callback now uses correct namespaced key f"{chat_id}:{user_id}"
-#   [FIX-2]  /hgrant <perm> with reply target now resolves correctly
-#   [FIX-3]  /hban and /hkick now check admin/owner status before API call
-#   [FIX-4]  /hban and /hkick now have self-action protection
-#   [FIX-5]  /hunban and /hunmute now call anti_nuke
-#   [FIX-6]  /hdel, /pin, /unpin added to MODERATION_COMMANDS for PM routing
-#   [FIX-7]  /warns now uses action_chat_id so PM-connected lookups work
-#   [FIX-8]  /zombies now excludes the bot's own ID
-#   [FIX-9]  anti_nuke gracefully skips freeze for anonymous admins
-#   [FIX-10] resolve_target_ext supports @username in all moderation commands
-#
-# NEW FEATURES:
-#   /hunprotect       — remove user protection
-#   /hfreeze /hunfreeze — manual moderator freeze/unfreeze
-#   /hwarnconfig      — configure warn threshold, action, duration
-#   /hrevoke all      — revoke all permissions at once
-#   /hbadge           — set custom moderator badge/title
-#
-# MISS ROSE STYLE FEATURES:
-#   Notes   — /save, /get, /clear, /notes, #notename trigger
-#   Filters — /filter, /stop, /filters, auto-respond to keywords
-#   Multi-group PM — /connect adds groups, /connections lists+switch,
-#                    /disconnect [chat_id|all], active group for mod commands
-# =========================================================
 
 import os, json, time, random, string, asyncio, httpx, re
 import traceback, sys, shutil, io, threading
@@ -108,7 +75,6 @@ BOT_COMMANDS = [
 ]
 VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
 
-# [FIX-6] Added hdel, hd, pin, unpin, notes/filter commands for PM routing
 MODERATION_COMMANDS = {
     "hban", "hb", "hkick", "hk", "hmute", "hm",
     "hunban", "hub", "hunmute", "hum", "hwarn", "hw",
@@ -199,9 +165,9 @@ TEMP_ACTIONS_FILE     = f"{STORAGE_PATH}/temp_actions.json"
 APPEALS_FILE          = f"{STORAGE_PATH}/appeals.json"
 CONNECTIONS_FILE      = f"{STORAGE_PATH}/connections.json"
 USER_CONNECTIONS_FILE = f"{STORAGE_PATH}/user_connections.json"
-ACTIVE_CONN_FILE      = f"{STORAGE_PATH}/active_conn.json"       # NEW: active group per user
-NOTES_FILE            = f"{STORAGE_PATH}/notes.json"             # NEW: notes per group
-FILTERS_FILE          = f"{STORAGE_PATH}/filters.json"           # NEW: filters per group
+ACTIVE_CONN_FILE      = f"{STORAGE_PATH}/active_conn.json"
+NOTES_FILE            = f"{STORAGE_PATH}/notes.json"
+FILTERS_FILE          = f"{STORAGE_PATH}/filters.json"
 TTT_SCORES_FILE       = f"{STORAGE_PATH}/ttt_scores.json"
 TTT_STATE_FILE        = f"{STORAGE_PATH}/ttt_state.json"
 
@@ -243,8 +209,6 @@ FILE_LABEL = {
     TTT_STATE_FILE:        "ttt_state",
 }
 
-# Notes, Filters, and active_conn use local-only storage for now.
-# mongo_db module should add load_notes / save_notes etc. to enable cloud sync.
 MONGO_LOADERS = {
     AUTH_FILE:             mongo_db.load_auth,
     WARN_FILE:             mongo_db.load_warns,
@@ -473,10 +437,8 @@ async def tg_send(
         payload["reply_to_message_id"] = reply_to
     if markup:
         payload["reply_markup"] = markup
-    # Only include parse_mode if explicitly provided (not None)
     if parse_mode is not None:
         payload["parse_mode"] = parse_mode
-    # Include message entities (to preserve clickable links/formatting)
     if entities is not None:
         payload["entities"] = entities
     return await tg_api("sendMessage", json=payload)
@@ -501,9 +463,7 @@ async def tg_edit_text(
 
 
 async def tg_send_media(chat_id: int, note: dict, reply_to: int = None):
-    """Send a saved media note (photo, document, video, audio, voice, sticker, animation).
-    note: dict containing keys `type`, `file_id`, `content` (caption), and optional `entities`.
-    """
+    """Send a saved media note (photo, document, video, audio, voice, sticker, animation)."""
     ntype = note.get("type", "text")
     fid   = note.get("file_id")
     caption = note.get("content") or ""
@@ -555,7 +515,7 @@ async def tg_send_media(chat_id: int, note: dict, reply_to: int = None):
             return await tg_api("sendAnimation", json=payload)
     except Exception as e:
         log_msg(f"tg_send_media error: {e}", "ERROR")
-    # Fallback to text send
+    # Fallback to text
     if caption:
         if entities is not None:
             return await tg_send(chat_id, caption, reply_to=reply_to, parse_mode=None, entities=entities)
@@ -796,12 +756,10 @@ def set_allow_connect_to_chat(chat_id: int, enabled: bool):
 # =========================================================
 
 def get_connected_chats(user_id: int) -> list[int]:
-    """Return all chat IDs the user has connected to."""
     data = load(USER_CONNECTIONS_FILE)
     value = data.get(str(user_id))
     if value is None:
         return []
-    # Migrate old single-value format
     if isinstance(value, (int, float)):
         return [int(value)]
     if isinstance(value, list):
@@ -809,7 +767,6 @@ def get_connected_chats(user_id: int) -> list[int]:
     return []
 
 def get_active_connection(user_id: int) -> int | None:
-    """Return the user's currently active group chat ID."""
     data = load(ACTIVE_CONN_FILE)
     value = data.get(str(user_id))
     try:
@@ -843,7 +800,6 @@ def remove_user_connection(user_id: int, chat_id: int = None) -> bool:
         chats.remove(cid)
         data[key] = chats
         save(USER_CONNECTIONS_FILE, data)
-        # Update active if we removed the active group
         active = get_active_connection(user_id)
         if active == cid:
             if chats:
@@ -854,7 +810,6 @@ def remove_user_connection(user_id: int, chat_id: int = None) -> bool:
                 save(ACTIVE_CONN_FILE, active_data)
         return True
     else:
-        # Disconnect from all
         data.pop(key, None)
         save(USER_CONNECTIONS_FILE, data)
         active_data = load(ACTIVE_CONN_FILE)
@@ -862,7 +817,6 @@ def remove_user_connection(user_id: int, chat_id: int = None) -> bool:
         save(ACTIVE_CONN_FILE, active_data)
         return True
 
-# Legacy single-value alias kept for callback compatibility
 def get_connected_chat(user_id: int) -> int | None:
     active = get_active_connection(user_id)
     if active:
@@ -885,7 +839,6 @@ async def is_chat_admin(bot: Client, chat_id: int, user_id: int) -> bool:
         return False
 
 async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = True):
-    """Returns the active connected chat_id if valid, else False."""
     if not isinstance(chat, dict) or chat.get("type") != "private":
         return False
     conn_id = get_active_connection(user_id)
@@ -1003,11 +956,9 @@ async def disconnect_chat(bot: Client, msg: dict, args: list[str]) -> str:
         return "Use this in PM to disconnect a chat by ID."
     if not user_id:
         return "Invalid user!"
-    # /disconnect all
     if args and args[0].lower() == "all":
         remove_user_connection(user_id)
         return "✅ Disconnected from all groups."
-    # /disconnect <chat_id>
     if args:
         try:
             cid = int(args[0])
@@ -1015,7 +966,6 @@ async def disconnect_chat(bot: Client, msg: dict, args: list[str]) -> str:
             return message or "❌ You were not connected to that group."
         except ValueError:
             return "❌ Invalid chat ID."
-    # /disconnect — remove active
     active = get_active_connection(user_id)
     if active:
         message = await disconnect_user_from_chat(bot, user_id, active)
@@ -1023,7 +973,7 @@ async def disconnect_chat(bot: Client, msg: dict, args: list[str]) -> str:
     return "You are not connected to any group."
 
 # =========================================================
-# NOTES SYSTEM (Miss Rose style)
+# NOTES SYSTEM
 # =========================================================
 
 def _notes_for_chat(chat_id: int) -> dict:
@@ -1078,7 +1028,7 @@ def note_count(chat_id: int) -> int:
     return len(_notes_for_chat(chat_id))
 
 # =========================================================
-# FILTERS SYSTEM (Miss Rose style)
+# FILTERS SYSTEM
 # =========================================================
 
 def _filters_for_chat(chat_id: int) -> dict:
@@ -1101,9 +1051,6 @@ def filter_add(
     chat_id: int, keyword: str, response: str,
     match_type: str = "contains", created_by: int = None,
 ):
-    """
-    match_type: "contains" | "exact" | "startswith" | "regex"
-    """
     filters = _filters_for_chat(chat_id)
     filters[keyword.lower().strip()] = {
         "response":   response,
@@ -1129,7 +1076,6 @@ def filter_count(chat_id: int) -> int:
     return len(_filters_for_chat(chat_id))
 
 def filter_check(chat_id: int, text: str) -> tuple[str | None, dict | None]:
-    """Return (keyword, filter_data) if a filter matches, else (None, None)."""
     if not text:
         return None, None
     filters    = _filters_for_chat(chat_id)
@@ -1511,17 +1457,17 @@ async def scan_zombies(bot: Client, chat_id: int, bot_id: int) -> tuple[int, int
             continue
         if user.id == bot_id:
             continue
-        # Detect deleted accounts reliably: prefer explicit flag, fall back to "Deleted Account" name
         first_name = (getattr(user, "first_name", "") or "").strip()
-        is_deleted = bool(getattr(user, "is_deleted", False)) or first_name.lower() == "deleted account" or first_name.lower().startswith("deleted")
+        is_deleted = (
+            bool(getattr(user, "is_deleted", False))
+            or first_name.lower() == "deleted account"
+            or first_name.lower().startswith("deleted")
+        )
         is_bot = bool(getattr(user, "is_bot", False))
-
-        # Only target deleted user accounts. Skip bots.
         if not is_deleted:
             continue
         if is_bot:
             continue
-
         ok, err = await api_kick(chat_id, user.id)
         if ok:
             kicked_deleted += 1
@@ -2178,24 +2124,22 @@ async def handle_message(bot: Client, msg: dict):
         # ── Non-command messages: filters + #note triggers ────────────────
         if not text.startswith("/"):
             if not is_private and text:
-                # 1) Check for #notename trigger (anywhere in the text)
+                # 1) Check for #notename trigger
                 hashtags = re.findall(r'#(\w+)', text)
                 for tag in hashtags:
                     note = note_get(chat_id, tag.lower())
                     if note:
                         content = note.get("content", "")
-                        # Prefer sending stored entities to preserve clickable links
                         if note.get("entities"):
                             await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None, entities=note.get("entities"))
                         else:
-                            # Detect simple markdown or HTML links and set parse_mode accordingly
                             if re.search(r"\[.+?\]\(https?://[^\s)]+\)", content):
                                 await tg_send(chat_id, content, reply_to=msg_id, parse_mode="Markdown")
                             elif "<a " in content:
                                 await tg_send(chat_id, content, reply_to=msg_id, parse_mode="HTML")
                             else:
                                 await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None)
-                        return  # only respond to the first matching note
+                        return
 
                 # 2) Check filters
                 keyword, fdata = filter_check(chat_id, text)
@@ -2342,7 +2286,9 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # ── /connections — list all connected groups ───────────────────────
-        if raw_cmd in "connections":
+        # FIX #1: was `if raw_cmd in "connections":` (substring check — matched /c, /o, etc.)
+        #         corrected to equality check.
+        if raw_cmd == "connections":
             if not is_private:
                 return await reply_text("Use /connections in bot DM.")
             chats = get_connected_chats(uid)
@@ -2429,7 +2375,6 @@ async def handle_message(bot: Client, msg: dict):
         # ── /hr ───────────────────────────────────────────────────────────
         if raw_cmd == "hr":
             try:
-                # If invoked in a group with no args/reply, return the group ID
                 if not args and not reply and not is_private:
                     return await reply_text(f"📌 Group ID: `{chat_id}`")
                 target_id   = None
@@ -2484,7 +2429,6 @@ async def handle_message(bot: Client, msg: dict):
                     response += f"🔗 Username: @{uname}\n"
                 response += f"📌 Link: [Profile](tg://user?id={target_id})"
 
-                # Include group ID when command is used inside a group
                 if not is_private:
                     try:
                         response += f"\n\nGroup ID: `{chat_id}`"
@@ -2553,23 +2497,18 @@ async def handle_message(bot: Client, msg: dict):
             if len(note_name) > 64:
                 return await reply_text("❌ Note name too long (max 64 chars).")
 
-            # Content from args or from replied message
-            entities = None
+            entities  = None
             note_type = "text"
-            file_id = None
+            file_id   = None
             if len(args) > 1:
                 content = " ".join(args[1:]).strip()
             elif reply:
-                # Prefer caption for media, else text
                 content = reply.get("caption") or reply.get("text") or ""
                 if not content and not any(k in reply for k in ("photo","document","video","audio","voice","sticker","animation")):
                     return await reply_text("❌ Replied message has no text or media to save.")
-                # Capture entities (text/caption entities) to preserve clickable links
                 entities = reply.get("caption_entities") or reply.get("entities")
-                # Detect media and extract file_id and type
                 if "photo" in reply and isinstance(reply.get("photo"), list) and reply["photo"]:
                     note_type = "photo"
-                    # use largest size
                     file_id = reply["photo"][-1].get("file_id")
                 elif "document" in reply and isinstance(reply.get("document"), dict):
                     note_type = "document"
@@ -2594,7 +2533,6 @@ async def handle_message(bot: Client, msg: dict):
                     "❌ Provide content after the name, or reply to a message.\n"
                     "Example: `/save rules No spamming!`"
                 )
-            # Pass entities and file info if present so the note preserves clickable links/media
             note_save(action_chat_id, note_name, content, note_type, file_id, created_by=uid, entities=entities if reply else None)
             await reply_text(f"📋 Note `{note_name}` saved! Get it with `/get {note_name}` or `#{note_name}`.")
             return
@@ -2607,24 +2545,20 @@ async def handle_message(bot: Client, msg: dict):
             note = note_get(action_chat_id, note_name)
             if not note:
                 return await reply_text(f"❌ Note `{note_name}` not found.\nUse `/notes` to see all saved notes.")
-            # If this is media, send via media API
+            # FIX #2: Removed duplicate inner media-check block (was dead code).
             if note.get("type") and note.get("type") != "text" and note.get("file_id"):
                 await tg_send_media(chat_id, note, reply_to=msg_id)
             else:
-                # If this is media, send via media API
-                if note.get("type") and note.get("type") != "text" and note.get("file_id"):
-                    await tg_send_media(chat_id, note, reply_to=msg_id)
+                content = note.get("content", "")
+                if note.get("entities"):
+                    await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None, entities=note.get("entities"))
                 else:
-                    content = note.get("content", "")
-                    if note.get("entities"):
-                        await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None, entities=note.get("entities"))
+                    if re.search(r"\[.+?\]\(https?://[^\s)]+\)", content):
+                        await tg_send(chat_id, content, reply_to=msg_id, parse_mode="Markdown")
+                    elif "<a " in content:
+                        await tg_send(chat_id, content, reply_to=msg_id, parse_mode="HTML")
                     else:
-                        if re.search(r"\[.+?\]\(https?://[^\s)]+\)", content):
-                            await tg_send(chat_id, content, reply_to=msg_id, parse_mode="Markdown")
-                        elif "<a " in content:
-                            await tg_send(chat_id, content, reply_to=msg_id, parse_mode="HTML")
-                        else:
-                            await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None)
+                        await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None)
             return
 
         # ── /clear <name> ───────────────────────────────────────────────
@@ -2648,11 +2582,15 @@ async def handle_message(bot: Client, msg: dict):
                     "📋 No notes saved in this group yet.\n"
                     "Use `/save <name> <text>` to add one."
                 )
-            # Build inline keyboard: 3 notes per row
+            # FIX #5: Embed action_chat_id in callback data so that PM note
+            #         buttons correctly look up notes from the group, not the DM.
+            #         Format: getnote_{chat_id}_{name}  (name truncated to 35
+            #         chars to stay within Telegram's 64-byte callback_data limit)
             note_rows = []
             row = []
             for i, name in enumerate(names):
-                row.append((f"#{name}", f"cb:getnote_{name}"))
+                cb_name = name[:35]  # keep callback_data within 64 bytes
+                row.append((f"#{name}", f"cb:getnote_{action_chat_id}_{cb_name}"))
                 if len(row) == 3:
                     note_rows.append(row)
                     row = []
@@ -2686,16 +2624,15 @@ async def handle_message(bot: Client, msg: dict):
                     "`/filter -regex <pattern> <response>` — regex match\n\n"
                     "Example: `/filter spam You cannot spam here!`"
                 )
-            # Parse optional match-type flag
             match_type = "contains"
             arg_start  = 0
             if args[0].startswith("-"):
                 flag = args[0].lower()
                 flag_map = {
-                    "-exact":   "exact",
-                    "-start":   "startswith",
-                    "-regex":   "regex",
-                    "-contains":"contains",
+                    "-exact":    "exact",
+                    "-start":    "startswith",
+                    "-regex":    "regex",
+                    "-contains": "contains",
                 }
                 if flag in flag_map:
                     match_type = flag_map[flag]
@@ -2710,7 +2647,6 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("❌ Keyword too long (max 128 chars).")
             if not response:
                 return await reply_text("❌ Response text cannot be empty.")
-            # Validate regex
             if match_type == "regex":
                 try:
                     re.compile(keyword)
@@ -3200,7 +3136,9 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("🛡 That user is protected.")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
-            warner_tag = actor_mod_info() or str(uid)
+            # FIX #4: actor_mod_info() returns a dict; extract the string mod_id
+            #         so warn() receives a str, not a dict (which would print as repr).
+            warner_tag = actor_mod_info().get("mod_id", str(uid))
             res = warn(tid, action_chat_id, reason, warner=warner_tag)
             case_id = create_case("WARN", uid, tid, reason)
             await send_action_log(
@@ -3238,7 +3176,7 @@ async def handle_message(bot: Client, msg: dict):
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /resetwarns <user_id/@user>")
-            reset_warns(tid, action_chat_id, admin_tag=actor_mod_info())
+            reset_warns(tid, action_chat_id, admin_tag=actor_mod_info().get("mod_id", str(uid)))
             await reply_text("Warnings have been reset!")
             case_id = create_case("RESETWARNS", uid, tid, "Warnings reset")
             await send_action_log(chat_id, msg_id, "RESETWARNS", target, "Warnings reset", case_id, actor_mod_info())
@@ -3297,6 +3235,10 @@ async def handle_message(bot: Client, msg: dict):
             if not ok:
                 return await reply_text(f"❌ Delete failed: {err}")
             case_id = create_case("DELETE", uid, tid, "Message Deleted")
+            # FIX #3: Always send the action log.  The original condition
+            #   `not (is_owner_actor() or is_authorized_actor())` was always
+            #   False here because check_mod() already guarantees the actor is
+            #   authorized, meaning the log was silently never sent.
             await send_action_log(
                 chat_id, msg_id, "DELETE", target,
                 "Message Deleted", case_id, actor_mod_info(),
@@ -3434,10 +3376,24 @@ async def handle_callback(bot: Client, cb: dict):
                 await tg_answer_cb(cb_id, f"✅ Active group set to {new_active}.", alert=False)
             return
 
-        # ── getnote_<name> — retrieve a note via inline button ───────────
+        # ── getnote_<chat_id>_<name> — retrieve a note via inline button ─
+        # FIX #5 (callback side): parse the embedded chat_id from callback data
+        #   so note lookup targets the group, not the PM/DM chat_id.
+        #   Legacy format (no chat_id prefix) falls back to the message chat_id.
         if data.startswith("getnote_"):
-            note_name = data.split("_", 1)[1]
-            note      = note_get(chat_id, note_name)
+            rest = data[len("getnote_"):]
+            note_chat_id = chat_id  # default fallback
+            note_name    = rest
+            underscore_pos = rest.find("_")
+            if underscore_pos > 0:
+                potential_id = rest[:underscore_pos]
+                try:
+                    note_chat_id = int(potential_id)
+                    note_name    = rest[underscore_pos + 1:]
+                except ValueError:
+                    pass  # Not a valid int prefix; treat entire rest as note name
+
+            note = note_get(note_chat_id, note_name)
             if note:
                 content = note.get("content", "")
                 if note.get("entities"):
