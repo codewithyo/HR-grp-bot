@@ -1,22 +1,37 @@
-# Advanced Telegram Moderation Bot — Koyeb Version
+# Advanced Telegram Moderation Bot — Latest
 
-A production-ready Telegram moderation bot deployed on **Koyeb** with 24/7 uptime, no cold starts, and persistent storage.
+A production-ready Telegram moderation bot with inline help navigation, moderation tools, notes, filters, connection management, and persistent storage.
 
 ## ✨ Features
 
 ✅ **Complete Moderation System**
 - Ban users from group
+- Kick users from group
 - Mute users (restrict permissions)
 - Warn system with history
 - Delete messages
 - User protection (prevent bans)
+- Temporary bans and mutes
 
 ✅ **Advanced Administration**
 - Authorize moderators
-- Grant/revoke permissions (ban, mute, warn, delete, kick)
+- Grant/revoke permissions (ban, unban, mute, unmute, kick, warn, delete, pin)
+- Freeze/unfreeze moderators
+- Custom moderator badges
 - Anti-nuke protection (freeze moderator after 10 actions/min)
 - Case management & history
 - Comprehensive logging
+
+✅ **User Utilities**
+- Notes system with save/get/clear/list
+- Filters with exact, regex, and prefix matching
+- PM connection management for multi-group moderation
+- Appeals from bot DM
+
+✅ **Inline Help Menu**
+- Category buttons for Ban, Mute, Kick, Protect, Notes, Filters, Connections, Stats, and Authorization
+- Back button navigation
+- Help pages update the same message instead of sending new ones
 
 ✅ **24/7 Uptime**
 - Deployed on Koyeb (no cold starts)
@@ -64,22 +79,43 @@ https://<your-app>.koyeb.app/api/setup_webhook
 
 | Command | Description | Permission |
 |---------|-------------|-----------|
-| `/start` | Start bot | Anyone |
+| `/start` | Start bot and view welcome message | Anyone |
+| `/help` | Show inline help categories | Anyone |
+| `/hr` or `/id` | Get user ID and profile info | Anyone |
 | `/hauth` | Authorize moderator | Owner |
 | `/hgrant <perm>` | Grant permission | Owner |
 | `/hrevoke <perm>` | Revoke permission | Owner |
-| `/hban` | Ban user (reply) | Moderator |
-| `/hkick` | Kick user (reply) | Moderator |
-| `/hmute` | Mute user (reply) | Moderator |
-| `/pin` | Pin replied message | Moderator |
-| `/unpin` | Unpin current message | Moderator |
+| `/hfreeze` | Freeze a moderator | Owner |
+| `/hunfreeze` | Unfreeze a moderator | Owner |
+| `/hbadge` | Set moderator badge | Owner |
+| `/hwarnconfig` | Configure warn threshold/action/duration | Owner |
+| `/hban` | Ban user | Moderator |
+| `/hkick` | Kick user | Moderator |
+| `/hmute` | Mute user | Moderator |
+| `/hunban` | Unban user | Moderator |
+| `/hunmute` | Unmute user | Moderator |
+| `/hwarn` | Warn user | Moderator |
+| `/hdel` | Delete replied message | Moderator |
+| `/hstats` | Show moderation stats | Authorized |
+| `/hmod list` | List authorized moderators | Authorized |
+| `/hmodinfo` | Moderator info | Authorized |
+| `/hcase <id>` | View case details | Authorized |
+| `/hprotect` | Protect user | Owner |
+| `/hunprotect` | Remove user protection | Owner |
+| `/notes` | List saved notes | Authorized |
+| `/save` | Save a note | Authorized |
+| `/get` | Retrieve a note | Everyone in group |
+| `/clear` | Delete a note | Authorized |
+| `/filter` | Add a filter | Authorized |
+| `/stop` | Remove a filter | Authorized |
+| `/filters` | List filters | Everyone in group |
+| `/connect` | Connect PM to a group | Anyone in DM |
+| `/connections` | View or switch connected groups | Anyone in DM |
+| `/disconnect` | Disconnect a group | Anyone in DM |
+| `/allowconnections` | Allow or block PM connections | Moderator |
 | `/adminlist` | Show all group admins | Authorized |
 | `/zombies` | Scan and kick deleted/bot accounts | Moderator |
-| `/hwarn` | Warn user (reply) | Moderator |
-| `/hdel` | Delete message (reply) | Moderator |
-| `/hprotect` | Protect user (reply) | Owner |
-| `/hcase <id>` | View case | Authorized |
-| `/hmodinfo` | Moderator info | Authorized |
+| `/happeal` | Appeal moderation case in DM | Anyone |
 
 ## 🔗 API Endpoints
 
@@ -132,6 +168,9 @@ See [KOYEB_DEPLOYMENT.md](KOYEB_DEPLOYMENT.md) for:
 ✅ User management
 ✅ Audit logging
 ✅ Permission-based access control
+✅ Saved notes and auto-replies
+✅ PM-to-group connections for multi-group moderation
+✅ Appeal handling in bot DM
 
 ## 🔐 Security
 
@@ -140,6 +179,8 @@ See [KOYEB_DEPLOYMENT.md](KOYEB_DEPLOYMENT.md) for:
 - Permission-based access control
 - Anti-nuke automatic moderator freeze
 - Comprehensive logging & auditing
+- Protected user whitelist for trusted accounts
+- Role-based command checks with anonymous admin support
 
 ## 🛠 Tech Stack
 

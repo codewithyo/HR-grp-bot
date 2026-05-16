@@ -105,19 +105,7 @@ BOT_COMMANDS = [
     {"command": "start",          "description": "🚀 Start the bot & view welcome message"},
     {"command": "help",           "description": "📖 Display available commands for your role"},
     {"command": "hr",             "description": "🆔 Get user ID & profile information"},
-    {"command": "hmodinfo",       "description": "👮 View moderator information"},
-    {"command": "notes",          "description": "📋 List all saved notes in this group"},
-    {"command": "save",           "description": "💾 Save a note: /save <name> <text>"},
-    {"command": "get",            "description": "📖 Get a note: /get <name>"},
-    {"command": "clear",          "description": "🗑️ Delete a note: /clear <name>"},
-    {"command": "filters",        "description": "🔍 List all active filters in this group"},
-    {"command": "filter",         "description": "➕ Add a filter: /filter <keyword> <response>"},
-    {"command": "stop",           "description": "➖ Remove a filter: /stop <keyword>"},
-    {"command": "connections",    "description": "🔗 View & switch your connected groups"},
-    {"command": "connect",        "description": "🔗 Connect PM to a group"},
-    {"command": "disconnect",     "description": "❌ Disconnect from a group"},
 ]
-
 VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
 
 # [FIX-6] Added hdel, hd, pin, unpin, notes/filter commands for PM routing
