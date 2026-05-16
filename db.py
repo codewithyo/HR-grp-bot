@@ -29,6 +29,8 @@ class MongoDBHandler:
             "abuse": "abuse_tracking",
             "temp_actions": "temporary_actions",
             "appeals": "user_appeals",
+            "connections": "chat_connections",
+            "user_connections": "user_connections",
             "ttt_scores": "ttt_scores",
             "ttt_state": "ttt_state",
         }
@@ -183,6 +185,22 @@ class MongoDBHandler:
     def save_appeals(self, data: Dict[str, Any]) -> bool:
         """Save appeals data."""
         return self._save_collection_data("appeals", data)
+
+    def load_connections(self) -> Dict[str, Any]:
+        """Load group connection settings."""
+        return self._load_collection_data("connections", {})
+
+    def save_connections(self, data: Dict[str, Any]) -> bool:
+        """Save group connection settings."""
+        return self._save_collection_data("connections", data)
+
+    def load_user_connections(self) -> Dict[str, Any]:
+        """Load user-to-group connection mappings."""
+        return self._load_collection_data("user_connections", {})
+
+    def save_user_connections(self, data: Dict[str, Any]) -> bool:
+        """Save user-to-group connection mappings."""
+        return self._save_collection_data("user_connections", data)
 
     def load_ttt_scores(self) -> Dict[str, Any]:
         """Load Tic-Tac-Toe scores."""

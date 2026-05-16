@@ -5,10 +5,28 @@
 # ENV VARS required:
 #   API_ID  API_HASH  BOT_TOKEN  OWNER_ID  PORT
 #   LOG_GROUP_ID      (0 = auto-detect)
-#   BACKUP_CHAT_ID    (defaults to LOG_GROUP_ID; must be a
-#                      chat the bot can send documents to)
+#   BACKUP_CHAT_ID    (defaults to LOG_GROUP_ID)
 #   STORAGE_PATH      (optional, default /data/modbot)
 #   OWNER_DEBUG_NOTIFICATIONS  (1 = enable noisy debug DMs)
+#
+# FIXES APPLIED:
+#   [FIX-1]  removewarn_ callback now uses correct namespaced key f"{chat_id}:{user_id}"
+#   [FIX-2]  /hgrant <perm> with reply target now resolves correctly
+#   [FIX-3]  /hban and /hkick now check admin/owner status before API call
+#   [FIX-4]  /hban and /hkick now have self-action protection
+#   [FIX-5]  /hunban and /hunmute now call anti_nuke
+#   [FIX-6]  /hdel, /pin, /unpin added to MODERATION_COMMANDS for PM routing
+#   [FIX-7]  /warns now uses action_chat_id so PM-connected lookups work
+#   [FIX-8]  /zombies now excludes the bot's own ID
+#   [FIX-9]  anti_nuke gracefully skips freeze for anonymous admins
+#   [FIX-10] resolve_target_ext supports @username in all moderation commands
+#
+# NEW FEATURES:
+#   /hunprotect — remove user protection
+#   /hfreeze / /hunfreeze — manual moderator freeze/unfreeze
+#   /hwarnconfig — configure warn threshold, action, duration
+#   /hrevoke all — revoke all permissions at once
+#   /hbadge — set custom moderator badge/title
 # =========================================================
 
 import os, json, time, random, string, asyncio, httpx
@@ -21,6 +39,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from pyrogram import Client, enums
+from pyrogram.errors import BadRequest, UserNotParticipant
 from db import mongo_db
 from games import (
     init_games,
@@ -77,36 +96,53 @@ _cache = DataCache(ttl_seconds=60)
 # =========================================================
 
 BOT_COMMANDS = [
-    {"command": "start",         "description": "🚀 Start the bot & view welcome message"},
-    {"command": "help",          "description": "📖 Display available commands for your role"},
-    {"command": "hr",            "description": "🆔 Get user ID & profile information"},
-    {"command": "ttt",           "description": "🎮 Play Tic-Tac-Toe"},
-    {"command": "tttleaderboard","description": "📊 Tic-Tac-Toe leaderboard"},
-    {"command": "tttmystats",    "description": "📈 Your Tic-Tac-Toe stats"},
-    {"command": "tttend",        "description": "🏳️ End your Tic-Tac-Toe game"},
-    {"command": "happeal",       "description": "📢 Appeal a moderation case (DM only)"},
-    {"command": "hauth",         "description": "🔐 Authorize a moderator (Owner)"},
-    {"command": "hgrant",        "description": "✅ Grant permission to moderator (Owner)"},
-    {"command": "hrevoke",       "description": "❌ Revoke permission from moderator (Owner)"},
-    {"command": "hban",          "description": "🚫 Ban a user from group"},
-    {"command": "hkick",         "description": "👢 Kick a user from group"},
-    {"command": "hmute",         "description": "🔇 Mute a user in group"},
-    {"command": "hunban",        "description": "🔓 Unban a user from group"},
-    {"command": "hunmute",       "description": "🔊 Unmute a user in group"},
-    {"command": "hstats",        "description": "📊 Show group moderation stats"},
-    {"command": "hmod",          "description": "👮 List authorized moderators"},
-    {"command": "pin",           "description": "📌 Pin replied message"},
-    {"command": "unpin",         "description": "📍 Unpin current message"},
-    {"command": "adminlist",     "description": "👮 Show all group admins"},
-    {"command": "zombies",       "description": "🧟 Scan and kick deleted/bot accounts"},
-    {"command": "hwarn",         "description": "⚠️ Issue warning to user"},
-    {"command": "hdel",          "description": "🗑️ Delete a message"},
-    {"command": "hprotect",      "description": "🛡️ Protect user from moderation"},
-    {"command": "hcase",         "description": "📋 View moderation case details"},
-    {"command": "hmodinfo",      "description": "👮 View moderator information"},
+    {"command": "start",          "description": "🚀 Start the bot & view welcome message"},
+    {"command": "help",           "description": "📖 Display available commands for your role"},
+    {"command": "hr",             "description": "🆔 Get user ID & profile information"},
+    {"command": "ttt",            "description": "🎮 Play Tic-Tac-Toe"},
+    {"command": "tttleaderboard", "description": "📊 Tic-Tac-Toe leaderboard"},
+    {"command": "tttmystats",     "description": "📈 Your Tic-Tac-Toe stats"},
+    {"command": "tttend",         "description": "🏳️ End your Tic-Tac-Toe game"},
+    {"command": "happeal",        "description": "📢 Appeal a moderation case (DM only)"},
+    {"command": "hauth",          "description": "🔐 Authorize a moderator (Owner)"},
+    {"command": "hgrant",         "description": "✅ Grant permission to moderator (Owner)"},
+    {"command": "hrevoke",        "description": "❌ Revoke permission from moderator (Owner)"},
+    {"command": "hfreeze",        "description": "🧊 Freeze a moderator account (Owner)"},
+    {"command": "hunfreeze",      "description": "🔥 Unfreeze a moderator account (Owner)"},
+    {"command": "hbadge",         "description": "🏷️ Set custom badge for a moderator (Owner)"},
+    {"command": "hwarnconfig",    "description": "⚙️ Configure warn threshold/action (Owner)"},
+    {"command": "allowconnections","description": "🔗 Allow or block PM connections for this group"},
+    {"command": "connect",        "description": "🔗 Connect this PM to a group"},
+    {"command": "disconnect",     "description": "🔌 Disconnect this PM from a group"},
+    {"command": "hban",           "description": "🚫 Ban a user from group"},
+    {"command": "hkick",          "description": "👢 Kick a user from group"},
+    {"command": "hmute",          "description": "🔇 Mute a user in group"},
+    {"command": "hunban",         "description": "🔓 Unban a user from group"},
+    {"command": "hunmute",        "description": "🔊 Unmute a user in group"},
+    {"command": "hstats",         "description": "📊 Show group moderation stats"},
+    {"command": "hmod",           "description": "👮 List authorized moderators"},
+    {"command": "pin",            "description": "📌 Pin replied message"},
+    {"command": "unpin",          "description": "📍 Unpin current message"},
+    {"command": "adminlist",      "description": "👮 Show all group admins"},
+    {"command": "zombies",        "description": "🧟 Scan and kick deleted/bot accounts"},
+    {"command": "hwarn",          "description": "⚠️ Issue warning to user"},
+    {"command": "warns",          "description": "⚠️ Show user's warnings"},
+    {"command": "resetwarns",     "description": "♻️ Reset a user's warnings (mods)"},
+    {"command": "hdel",           "description": "🗑️ Delete a message"},
+    {"command": "hprotect",       "description": "🛡️ Protect user from moderation"},
+    {"command": "hunprotect",     "description": "🔓 Remove user protection (Owner)"},
+    {"command": "hcase",          "description": "📋 View moderation case details"},
+    {"command": "hmodinfo",       "description": "👮 View moderator information"},
 ]
 
 VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
+
+# [FIX-6] Added hdel, hd, pin, unpin so PM-connected sessions route correctly
+MODERATION_COMMANDS = {
+    "hban", "hb", "hkick", "hk", "hmute", "hm",
+    "hunban", "hub", "hunmute", "hum", "hwarn", "hw",
+    "resetwarns", "hdel", "hd", "pin", "unpin",
+}
 ACTION_LOG_AUTO_DELETE = 60  # seconds
 
 # =========================================================
@@ -129,7 +165,7 @@ LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", "0"))
 PORT         = int(os.environ.get("PORT", "8000"))
 OWNER_DEBUG_NOTIFICATIONS = os.environ.get("OWNER_DEBUG_NOTIFICATIONS", "0") == "1"
 
-_log_group_id: int  = LOG_GROUP_ID
+_log_group_id: int   = LOG_GROUP_ID
 _backup_chat_id: int = int(os.environ.get("BACKUP_CHAT_ID", str(LOG_GROUP_ID)))
 
 def get_log_group() -> int:
@@ -180,70 +216,79 @@ log_msg(f"CONFIG: API_ID={API_ID} OWNER_ID={OWNER_ID} PORT={PORT} LOG_GROUP={LOG
 
 Path(STORAGE_PATH).mkdir(parents=True, exist_ok=True)
 
-AUTH_FILE         = f"{STORAGE_PATH}/auth.json"
-WARN_FILE         = f"{STORAGE_PATH}/warns.json"
-CASE_FILE         = f"{STORAGE_PATH}/cases.json"
-WARN_CONFIG_FILE  = f"{STORAGE_PATH}/warn_config.json"
-PROTECT_FILE      = f"{STORAGE_PATH}/protected.json"
-ABUSE_FILE        = f"{STORAGE_PATH}/abuse.json"
-TEMP_ACTIONS_FILE = f"{STORAGE_PATH}/temp_actions.json"
-APPEALS_FILE      = f"{STORAGE_PATH}/appeals.json"
-TTT_SCORES_FILE   = f"{STORAGE_PATH}/ttt_scores.json"
-TTT_STATE_FILE    = f"{STORAGE_PATH}/ttt_state.json"
+AUTH_FILE             = f"{STORAGE_PATH}/auth.json"
+WARN_FILE             = f"{STORAGE_PATH}/warns.json"
+CASE_FILE             = f"{STORAGE_PATH}/cases.json"
+WARN_CONFIG_FILE      = f"{STORAGE_PATH}/warn_config.json"
+PROTECT_FILE          = f"{STORAGE_PATH}/protected.json"
+ABUSE_FILE            = f"{STORAGE_PATH}/abuse.json"
+TEMP_ACTIONS_FILE     = f"{STORAGE_PATH}/temp_actions.json"
+APPEALS_FILE          = f"{STORAGE_PATH}/appeals.json"
+CONNECTIONS_FILE      = f"{STORAGE_PATH}/connections.json"
+USER_CONNECTIONS_FILE = f"{STORAGE_PATH}/user_connections.json"
+TTT_SCORES_FILE       = f"{STORAGE_PATH}/ttt_scores.json"
+TTT_STATE_FILE        = f"{STORAGE_PATH}/ttt_state.json"
 
 FALLBACK_FILE_MAP = {
-    AUTH_FILE:         f"{FALLBACK_STORAGE_PATH}/auth.json",
-    WARN_FILE:         f"{FALLBACK_STORAGE_PATH}/warns.json",
-    CASE_FILE:         f"{FALLBACK_STORAGE_PATH}/cases.json",
-    WARN_CONFIG_FILE:  f"{FALLBACK_STORAGE_PATH}/warn_config.json",
-    PROTECT_FILE:      f"{FALLBACK_STORAGE_PATH}/protected.json",
-    ABUSE_FILE:        f"{FALLBACK_STORAGE_PATH}/abuse.json",
-    TEMP_ACTIONS_FILE: f"{FALLBACK_STORAGE_PATH}/temp_actions.json",
-    APPEALS_FILE:      f"{FALLBACK_STORAGE_PATH}/appeals.json",
-    TTT_SCORES_FILE:   f"{FALLBACK_STORAGE_PATH}/ttt_scores.json",
-    TTT_STATE_FILE:    f"{FALLBACK_STORAGE_PATH}/ttt_state.json",
+    AUTH_FILE:             f"{FALLBACK_STORAGE_PATH}/auth.json",
+    WARN_FILE:             f"{FALLBACK_STORAGE_PATH}/warns.json",
+    CASE_FILE:             f"{FALLBACK_STORAGE_PATH}/cases.json",
+    WARN_CONFIG_FILE:      f"{FALLBACK_STORAGE_PATH}/warn_config.json",
+    PROTECT_FILE:          f"{FALLBACK_STORAGE_PATH}/protected.json",
+    ABUSE_FILE:            f"{FALLBACK_STORAGE_PATH}/abuse.json",
+    TEMP_ACTIONS_FILE:     f"{FALLBACK_STORAGE_PATH}/temp_actions.json",
+    APPEALS_FILE:          f"{FALLBACK_STORAGE_PATH}/appeals.json",
+    CONNECTIONS_FILE:      f"{FALLBACK_STORAGE_PATH}/connections.json",
+    USER_CONNECTIONS_FILE: f"{FALLBACK_STORAGE_PATH}/user_connections.json",
+    TTT_SCORES_FILE:       f"{FALLBACK_STORAGE_PATH}/ttt_scores.json",
+    TTT_STATE_FILE:        f"{FALLBACK_STORAGE_PATH}/ttt_state.json",
 }
 
 ALL_FILES = list(FALLBACK_FILE_MAP.keys())
 
-# FIX #12 — ABUSE_FILE added to FILE_LABEL
 FILE_LABEL = {
-    AUTH_FILE:         "auth",
-    WARN_FILE:         "warns",
-    CASE_FILE:         "cases",
-    WARN_CONFIG_FILE:  "warn_config",
-    PROTECT_FILE:      "protected",
-    ABUSE_FILE:        "abuse",
-    TEMP_ACTIONS_FILE: "temp_actions",
-    APPEALS_FILE:      "appeals",
-    TTT_SCORES_FILE:   "ttt_scores",
-    TTT_STATE_FILE:    "ttt_state",
+    AUTH_FILE:             "auth",
+    WARN_FILE:             "warns",
+    CASE_FILE:             "cases",
+    WARN_CONFIG_FILE:      "warn_config",
+    PROTECT_FILE:          "protected",
+    ABUSE_FILE:            "abuse",
+    TEMP_ACTIONS_FILE:     "temp_actions",
+    APPEALS_FILE:          "appeals",
+    CONNECTIONS_FILE:      "connections",
+    USER_CONNECTIONS_FILE: "user_connections",
+    TTT_SCORES_FILE:       "ttt_scores",
+    TTT_STATE_FILE:        "ttt_state",
 }
 
 MONGO_LOADERS = {
-    AUTH_FILE:         mongo_db.load_auth,
-    WARN_FILE:         mongo_db.load_warns,
-    CASE_FILE:         mongo_db.load_cases,
-    WARN_CONFIG_FILE:  mongo_db.load_warn_config,
-    PROTECT_FILE:      mongo_db.load_protected,
-    ABUSE_FILE:        mongo_db.load_abuse,
-    TEMP_ACTIONS_FILE: mongo_db.load_temp_actions,
-    APPEALS_FILE:      mongo_db.load_appeals,
-    TTT_SCORES_FILE:   mongo_db.load_ttt_scores,
-    TTT_STATE_FILE:    mongo_db.load_ttt_state,
+    AUTH_FILE:             mongo_db.load_auth,
+    WARN_FILE:             mongo_db.load_warns,
+    CASE_FILE:             mongo_db.load_cases,
+    WARN_CONFIG_FILE:      mongo_db.load_warn_config,
+    PROTECT_FILE:          mongo_db.load_protected,
+    ABUSE_FILE:            mongo_db.load_abuse,
+    TEMP_ACTIONS_FILE:     mongo_db.load_temp_actions,
+    APPEALS_FILE:          mongo_db.load_appeals,
+    CONNECTIONS_FILE:      mongo_db.load_connections,
+    USER_CONNECTIONS_FILE: mongo_db.load_user_connections,
+    TTT_SCORES_FILE:       mongo_db.load_ttt_scores,
+    TTT_STATE_FILE:        mongo_db.load_ttt_state,
 }
 
 MONGO_SAVERS = {
-    AUTH_FILE:         mongo_db.save_auth,
-    WARN_FILE:         mongo_db.save_warns,
-    CASE_FILE:         mongo_db.save_cases,
-    WARN_CONFIG_FILE:  mongo_db.save_warn_config,
-    PROTECT_FILE:      mongo_db.save_protected,
-    ABUSE_FILE:        mongo_db.save_abuse,
-    TEMP_ACTIONS_FILE: mongo_db.save_temp_actions,
-    APPEALS_FILE:      mongo_db.save_appeals,
-    TTT_SCORES_FILE:   mongo_db.save_ttt_scores,
-    TTT_STATE_FILE:    mongo_db.save_ttt_state,
+    AUTH_FILE:             mongo_db.save_auth,
+    WARN_FILE:             mongo_db.save_warns,
+    CASE_FILE:             mongo_db.save_cases,
+    WARN_CONFIG_FILE:      mongo_db.save_warn_config,
+    PROTECT_FILE:          mongo_db.save_protected,
+    ABUSE_FILE:            mongo_db.save_abuse,
+    TEMP_ACTIONS_FILE:     mongo_db.save_temp_actions,
+    APPEALS_FILE:          mongo_db.save_appeals,
+    CONNECTIONS_FILE:      mongo_db.save_connections,
+    USER_CONNECTIONS_FILE: mongo_db.save_user_connections,
+    TTT_SCORES_FILE:       mongo_db.save_ttt_scores,
+    TTT_STATE_FILE:        mongo_db.save_ttt_state,
 }
 
 # =========================================================
@@ -542,8 +587,10 @@ async def upload_backup(label: str, data) -> bool:
         log_msg(f"Backup upload failed ({label}): {e}", "WARNING")
         return False
 
-# FIX #3/#4 — all critical files go through save_and_backup
-_BACKUP_LABELS = {"auth", "warns", "cases", "protected", "abuse", "temp_actions", "appeals"}
+_BACKUP_LABELS = {
+    "auth", "warns", "cases", "protected", "abuse",
+    "temp_actions", "appeals", "connections", "user_connections",
+}
 
 async def save_and_backup(file: str, data):
     save(file, data)
@@ -649,6 +696,142 @@ def generate_mod_id() -> str:
 def get_mod_info(uid: int) -> dict:
     return load(AUTH_FILE).get(str(uid), {})
 
+def load_connections() -> dict:
+    data = load(CONNECTIONS_FILE)
+    return data if isinstance(data, dict) else {}
+
+def save_connections(data: dict):
+    save(CONNECTIONS_FILE, data)
+
+def load_user_connections() -> dict:
+    data = load(USER_CONNECTIONS_FILE)
+    return data if isinstance(data, dict) else {}
+
+def save_user_connections(data: dict):
+    save(USER_CONNECTIONS_FILE, data)
+
+def allow_connect_to_chat(chat_id: int) -> bool:
+    return bool(load_connections().get(str(chat_id), False))
+
+def set_allow_connect_to_chat(chat_id: int, enabled: bool):
+    data = load_connections()
+    data[str(chat_id)] = bool(enabled)
+    save_connections(data)
+
+def get_connected_chat(user_id: int) -> int | None:
+    data = load_user_connections()
+    value = data.get(str(user_id))
+    try:
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+def connect_user(user_id: int, chat_id: int) -> bool:
+    data = load_user_connections()
+    data[str(user_id)] = int(chat_id)
+    save_user_connections(data)
+    return True
+
+def disconnect_user(user_id: int) -> bool:
+    data = load_user_connections()
+    if str(user_id) not in data:
+        return False
+    data.pop(str(user_id), None)
+    save_user_connections(data)
+    return True
+
+async def is_chat_admin(bot: Client, chat_id: int, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
+    except Exception:
+        return False
+
+async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = True):
+    if not isinstance(chat, dict) or chat.get("type") != "private":
+        return False
+    conn_id = get_connected_chat(user_id)
+    if not conn_id:
+        return False
+    try:
+        member = await bot.get_chat_member(conn_id, user_id)
+    except Exception:
+        disconnect_user(user_id)
+        return False
+    allowed = member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
+    if not allowed and not (allow_connect_to_chat(conn_id) and member.status == enums.ChatMemberStatus.MEMBER):
+        disconnect_user(user_id)
+        return False
+    if need_admin and not allowed:
+        return False
+    return conn_id
+
+async def allow_connections(bot: Client, msg: dict, args: list[str]) -> str:
+    chat = msg.get("chat", {})
+    if chat.get("type") == "private":
+        return "Please enter on/yes/off/no in group!"
+    user = msg.get("from", {})
+    user_id = user.get("id")
+    if not user_id:
+        return "Please enter on/yes/off/no in group!"
+    if not (await is_chat_admin(bot, chat["id"], user_id) or user_id == OWNER_ID):
+        return "Only group admins can change this setting."
+    if len(args) < 1:
+        return "Please enter on/yes/off/no in group!"
+    var = args[0].lower()
+    if var in ("no", "off"):
+        set_allow_connect_to_chat(chat["id"], False)
+        return "Disabled connections to this chat for users"
+    if var in ("yes", "on"):
+        set_allow_connect_to_chat(chat["id"], True)
+        return "Enabled connections to this chat for users"
+    return "Please enter on/yes/off/no in group!"
+
+async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
+    chat = msg.get("chat", {})
+    user = msg.get("from", {})
+    user_id = user.get("id")
+    if chat.get("type") != "private":
+        return "Usage limited to PMs only!"
+    if not user_id:
+        return "Invalid user!"
+    if len(args) < 1:
+        return "Input chat ID to connect!"
+    try:
+        connect_id = int(args[0])
+    except ValueError:
+        return "Invalid Chat ID provided!"
+    try:
+        member = await bot.get_chat_member(connect_id, user_id)
+    except UserNotParticipant:
+        return "Connections to this chat not allowed!"
+    except BadRequest:
+        return "Invalid Chat ID provided!"
+
+    allowed = member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
+    if not allowed:
+        allowed = allow_connect_to_chat(connect_id) and member.status == enums.ChatMemberStatus.MEMBER
+    if not allowed:
+        return "Connections to this chat not allowed!"
+    try:
+        target_chat = await bot.get_chat(connect_id)
+        connect_user(user_id, connect_id)
+        return f"Successfully connected to *{target_chat.title}*"
+    except Exception:
+        return "Connection failed!"
+
+async def disconnect_chat(bot: Client, msg: dict) -> str:
+    chat = msg.get("chat", {})
+    user = msg.get("from", {})
+    user_id = user.get("id")
+    if chat.get("type") != "private":
+        return "Usage restricted to PMs only"
+    if not user_id:
+        return "Invalid user!"
+    if disconnect_user(user_id):
+        return "Disconnected from chat!"
+    return "Disconnection unsuccessful!"
+
 def is_protected(uid: int) -> bool:
     cache_key = f"protected:{uid}"
     cached = _cache.get(cache_key)
@@ -703,6 +886,7 @@ def parse_positive_user_id(value: str) -> int | None:
         return None
 
 def resolve_target(reply, args, idx) -> tuple[dict, int | None, str | None]:
+    """Sync resolver: handles reply or numeric user ID only."""
     target, tid = extract_reply_user(reply)
     if tid:
         return target, tid, None
@@ -712,6 +896,34 @@ def resolve_target(reply, args, idx) -> tuple[dict, int | None, str | None]:
             return {"id": uid, "first_name": "User"}, uid, None
         return {}, None, "❌ Invalid user ID."
     return {}, None, "❌ Reply to a user or pass their user ID."
+
+# [FIX-10] Async resolver that also handles @username arguments
+async def resolve_target_ext(
+    bot: Client, reply, args, idx
+) -> tuple[dict, int | None, str | None]:
+    """Async resolver: handles reply, @username, or numeric user ID."""
+    target, tid = extract_reply_user(reply)
+    if tid:
+        return target, tid, None
+    if len(args) > idx:
+        val = args[idx]
+        if val.startswith("@"):
+            username = val[1:]
+            try:
+                user = await bot.get_user(username)
+                return (
+                    {"id": user.id, "first_name": user.first_name or "User",
+                     "last_name": user.last_name or ""},
+                    user.id,
+                    None,
+                )
+            except Exception as e:
+                return {}, None, f"❌ User {val} not found: {e}"
+        uid = parse_positive_user_id(val)
+        if uid:
+            return {"id": uid, "first_name": "User"}, uid, None
+        return {}, None, "❌ Invalid user ID or username."
+    return {}, None, "❌ Reply to a user or pass their user ID / @username."
 
 def extract_reason(args, start, default="No Reason") -> str:
     return " ".join(args[start:]).strip() or default if len(args) > start else default
@@ -736,7 +948,6 @@ def load_temp_actions() -> list:
 def save_temp_actions(actions: list):
     save(TEMP_ACTIONS_FILE, actions)
 
-# FIX #6 — shared helper to cancel pending temp actions
 def cancel_temp_action(action_type: str, chat_id: int, target_id: int):
     actions  = load_temp_actions()
     filtered = [
@@ -759,16 +970,69 @@ def get_warn_config() -> dict:
     config.setdefault("duration", 3600)
     return config
 
+def warn(user_id: int, chat_id: int, reason: str, warner: str | None = None) -> dict:
+    warns = load(WARN_FILE)
+    key = f"{chat_id}:{user_id}"
+    if key not in warns and str(user_id) in warns:
+        warns[key] = warns.pop(str(user_id))
+    warns.setdefault(key, 0)
+    warns[key] += 1
+    save(WARN_FILE, warns)
+
+    cfg = get_warn_config()
+    threshold   = int(cfg.get("threshold", 3))
+    auto_action = cfg.get("action", "mute")
+    moderator_tag = warner or "Automated warn filter"
+    num = warns[key]
+
+    if num >= threshold:
+        warns[key] = 0
+        save(WARN_FILE, warns)
+        action = auto_action
+        reply  = f"{threshold} warnings — auto-{action}!"
+        log    = (
+            f"#WARN_BAN\nAdmin: {moderator_tag}\nUser: {user_id}\n"
+            f"Reason: {reason}\nCounts: {num}/{threshold}"
+        )
+        return {"action": action, "reply": reply, "log": log, "num_warns": 0, "threshold": threshold}
+    else:
+        reply = f"User {user_id} has {num}/{threshold} warnings."
+        if reason:
+            reply += f" Reason: {reason}"
+        log = (
+            f"#WARN\nAdmin: {moderator_tag}\nUser: {user_id}\n"
+            f"Reason: {reason}\nCounts: {num}/{threshold}"
+        )
+        return {"action": None, "reply": reply, "log": log, "num_warns": num, "threshold": threshold}
+
+def reset_warns(user_id: int, chat_id: int, admin_tag: str | None = None) -> str:
+    warns = load(WARN_FILE)
+    key = f"{chat_id}:{user_id}"
+    if key not in warns and str(user_id) in warns:
+        warns[key] = warns.pop(str(user_id))
+    warns.pop(key, None)
+    save(WARN_FILE, warns)
+    actor = admin_tag or "system"
+    return f"#RESETWARNS\nAdmin: {actor}\nUser: {user_id}"
+
+def warns_for(user_id: int, chat_id: int) -> dict:
+    warns = load(WARN_FILE)
+    key = f"{chat_id}:{user_id}"
+    if key not in warns and str(user_id) in warns:
+        warns[key] = warns.get(str(user_id), 0)
+    num = int(warns.get(key, 0))
+    return {"num_warns": num, "reasons": []}
+
 def save_warn_config(config: dict):
     save(WARN_CONFIG_FILE, config)
 
 def schedule_message_delete(chat_id: int, message_id: int, delay: int = 60):
     actions = load_temp_actions()
     actions.append({
-        "type":     "delete",
-        "chat_id":  chat_id,
+        "type":      "delete",
+        "chat_id":   chat_id,
         "target_id": message_id,
-        "until_ts": int(time.time()) + delay,
+        "until_ts":  int(time.time()) + delay,
     })
     save_temp_actions(actions)
 
@@ -820,7 +1084,9 @@ def format_admin_privileges(privileges) -> str:
     ]
     return ", ".join(granted) if granted else "none"
 
-# FIX #5 — UNBAN/UNMUTE/GRANT/REVOKE counted in stats
+def grant_all_permissions() -> dict:
+    return {perm: True for perm in sorted(VALID_PERMISSIONS)}
+
 def get_moderation_stats() -> dict:
     cases = load(CASE_FILE)
     if not isinstance(cases, dict):
@@ -867,7 +1133,6 @@ def build_moderator_list_text() -> str:
         )
     return "\n".join(lines)
 
-# FIX #5 — display UNBAN/UNMUTE in stats
 def build_stats_text() -> str:
     stats  = get_moderation_stats()
     counts = stats["counts"]
@@ -915,7 +1180,8 @@ async def build_admin_list_text(bot: Client, chat_id: int) -> str:
         lines.append("No administrators found.")
     return "\n".join(lines)
 
-async def scan_zombies(bot: Client, chat_id: int) -> tuple[int, int, list[str]]:
+# [FIX-8] Excludes the bot itself and accepts bot_id parameter
+async def scan_zombies(bot: Client, chat_id: int, bot_id: int) -> tuple[int, int, list[str]]:
     kicked_deleted = 0
     kicked_bots    = 0
     failures: list[str] = []
@@ -924,6 +1190,9 @@ async def scan_zombies(bot: Client, chat_id: int) -> tuple[int, int, list[str]]:
         if not user:
             continue
         if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
+            continue
+        # [FIX-8] Never kick the bot itself
+        if user.id == bot_id:
             continue
         is_deleted = bool(getattr(user, "is_deleted", False))
         is_bot     = bool(getattr(user, "is_bot", False))
@@ -972,7 +1241,6 @@ def create_appeal(uid: int, case_id: str, message: str) -> str:
         "message": message, "status": "open",
         "time": str(datetime.now()),
     }
-    # FIX #3 — save done via caller with save_and_backup
     save(APPEALS_FILE, appeals)
     return aid
 
@@ -984,23 +1252,37 @@ def role_help_text(uid: int) -> str:
             "╚════════════════════════════════════════╝\n\n"
             "🔐 **Authorization Commands:**\n"
             "`/hauth <user_id>` - Authorize a moderator\n"
-            "`/hrevoke <perm> <user_id>` - Remove permission\n"
-            "`/hgrant <perm> <user_id>` - Grant permission\n"
+            "`/hrevoke <perm|all> <user_id>` - Remove permission(s)\n"
+            "`/hgrant <user_id>` - Grant all permissions\n"
+            "`/hgrant <perm> <user_id>` - Grant one permission\n"
+            "`/hfreeze <user_id>` - Freeze moderator account\n"
+            "`/hunfreeze <user_id>` - Unfreeze moderator account\n"
+            "`/hbadge <user_id> <badge text>` - Set mod badge/title\n"
             "Permissions: ban, unban, mute, unmute, kick, warn, delete, pin\n\n"
+            "⚙️ **Warn Configuration:**\n"
+            "`/hwarnconfig threshold <n>` - Set warn threshold\n"
+            "`/hwarnconfig action <ban|mute|kick>` - Set auto-action\n"
+            "`/hwarnconfig duration <e.g. 1h>` - Set auto-action duration\n"
+            "`/hwarnconfig show` - Show current config\n\n"
             "🛡️ **Protection Commands:**\n"
-            "`/hprotect <user_id>` - Protect user from moderation\n\n"
+            "`/hprotect <user_id>` - Protect user from moderation\n"
+            "`/hunprotect <user_id>` - Remove user protection\n\n"
             "📋 **Moderation Commands:**\n"
-            "`/hban [user_id] [duration] [reason]` - Ban user\n"
-            "`/hkick <user_id> [reason]` - Kick user from group\n"
-            "`/hmute [user_id] [duration] [reason]` - Mute user\n"
-            "`/hunban [user_id] [reason]` - Unban a user\n"
-            "`/hunmute [user_id] [reason]` - Unmute a user\n"
+            "`/hban [user_id/@user] [duration] [reason]` - Ban user\n"
+            "`/hkick <user_id/@user> [reason]` - Kick user from group\n"
+            "`/hmute [user_id/@user] [duration] [reason]` - Mute user\n"
+            "`/hunban [user_id/@user] [reason]` - Unban a user\n"
+            "`/hunmute [user_id/@user] [reason]` - Unmute a user\n"
             "`/hstats` - Show moderation stats\n"
             "`/hmod list` - List authorized moderators\n"
-            "`/hwarn [user_id] [reason]` - Warn user\n"
+            "`/hwarn [user_id/@user] [reason]` - Warn user\n"
             "`/hdel` - Delete replied message\n"
             "`/hcase <case_id>` - View case details\n"
             "`/hmodinfo [user_id]` - View moderator info\n\n"
+            "🔗 **Connections:**\n"
+            "`/allowconnections yes|no` - Allow PM connection to this group\n"
+            "`/connect <chat_id>` - Connect this PM to a group\n"
+            "`/disconnect` - Disconnect this PM from the current group\n\n"
             "🎮 **Games:**\n"
             "`/ttt [user_id]` - Start Tic-Tac-Toe\n"
             "`/tttleaderboard` - Show top players\n"
@@ -1011,7 +1293,7 @@ def role_help_text(uid: int) -> str:
             "📖 **Examples:**\n"
             "`/hban @user 2h spam` - Ban for 2 hours\n"
             "`/hmute 123456789 30m abuse` - Mute for 30 mins\n"
-            "`/hwarn @user off-topic` - Issue warning\n"
+            "`/hrevoke all 123456789` - Revoke all permissions\n"
         )
     if is_authorized(uid):
         return (
@@ -1019,13 +1301,13 @@ def role_help_text(uid: int) -> str:
             "║  👮 MODERATOR COMMAND REFERENCE       ║\n"
             "╚════════════════════════════════════════╝\n\n"
             "🚫 **Moderation Commands:**\n"
-            "`/hban [user_id] [duration] [reason]` - Ban user\n"
-            "`/hkick <user_id> [reason]` - Kick user from group\n"
-            "`/hmute [user_id] [duration] [reason]` - Mute user\n"
-            "`/hunban [user_id] [reason]` - Unban a user\n"
-            "`/hunmute [user_id] [reason]` - Unmute a user\n"
+            "`/hban [user_id/@user] [duration] [reason]` - Ban user\n"
+            "`/hkick <user_id/@user> [reason]` - Kick user from group\n"
+            "`/hmute [user_id/@user] [duration] [reason]` - Mute user\n"
+            "`/hunban [user_id/@user] [reason]` - Unban a user\n"
+            "`/hunmute [user_id/@user] [reason]` - Unmute a user\n"
             "`/hstats` - Show moderation stats\n"
-            "`/hwarn [user_id] [reason]` - Warn user\n"
+            "`/hwarn [user_id/@user] [reason]` - Warn user\n"
             "`/hdel` - Delete replied message\n\n"
             "📋 **Information Commands:**\n"
             "`/hcase <case_id>` - View case details\n"
@@ -1038,7 +1320,7 @@ def role_help_text(uid: int) -> str:
             "`/tttmystats` - Show your game stats\n"
             "`/tttend` - Forfeit active game\n\n"
             "⏱️ **Duration Format:** 30m, 2h, 1d\n\n"
-            "💡 **Tip:** Reply to a message to target without ID\n\n"
+            "💡 **Tip:** Reply to a message or use @username / user ID\n\n"
             "📖 **Examples:**\n"
             "`/hban @user 30m spam` - Ban for 30 minutes\n"
             "`/hwarn 123456789 off-topic` - Issue warning\n"
@@ -1084,12 +1366,13 @@ def build_markup(*rows) -> dict:
 # =========================================================
 
 _bot: Client       = None
+_bot_id: int       = 0   # cached at startup
 bot_ready: bool    = False
 _temp_worker_task  = None
 _games_worker_task = None
 
 async def get_bot() -> Client:
-    global _bot, bot_ready
+    global _bot, bot_ready, _bot_id
     if _bot is None or not _bot.is_connected:
         log_msg("Initializing Pyrogram client...", "INFO")
         _bot = Client(
@@ -1099,7 +1382,8 @@ async def get_bot() -> Client:
         await _bot.start()
         bot_ready = True
         me = await _bot.get_me()
-        log_msg(f"✅ Authenticated as @{me.username}", "INFO")
+        _bot_id = me.id
+        log_msg(f"✅ Authenticated as @{me.username} (id={_bot_id})", "INFO")
     return _bot
 
 async def shutdown_bot():
@@ -1188,22 +1472,25 @@ async def sync_commands() -> str:
 # ANTI-NUKE
 # =========================================================
 
-async def anti_nuke(chat_id: int, reply_to: int, uid: int) -> bool:
+async def anti_nuke(chat_id: int, reply_to: int, uid: int, is_anon: bool = False) -> bool:
     total = track_action(uid)
     if total < 10:
         return False
-    auth = load(AUTH_FILE)
-    if str(uid) in auth:
-        auth[str(uid)]["frozen"] = True
-        save(AUTH_FILE, auth)
+    # [FIX-9] Only try to freeze if this is a real mod (not anon admin)
+    if not is_anon:
+        auth = load(AUTH_FILE)
+        if str(uid) in auth:
+            auth[str(uid)]["frozen"] = True
+            save(AUTH_FILE, auth)
     lg = get_log_group()
+    actor_label = f"Anon Admin (chat {chat_id})" if is_anon else f"`{uid}`"
     if lg:
         await tg_send(
             lg,
             f"🚨 **ANTI-NUKE ACTIVATED**\n\n"
-            f"Moderator: `{uid}`\n"
+            f"Actor: {actor_label}\n"
             f"Actions in 60 sec: `{total}`\n"
-            f"Moderator frozen automatically.",
+            f"{'⚠️ Anonymous admin — cannot freeze' if is_anon else 'Moderator frozen automatically.'}",
         )
     await tg_send(chat_id, "🚨 Anti-Nuke triggered — moderator frozen.", reply_to=reply_to)
     return True
@@ -1455,6 +1742,13 @@ async def handle_message(bot: Client, msg: dict):
         if OWNER_DEBUG_NOTIFICATIONS and raw_cmd not in ("start", "help"):
             await notify_owner(f"📨 /{raw_cmd}\nActor: `{actor_label}`\nChat: `{chat_id}`")
 
+        action_chat_id = chat_id
+        if is_private and raw_cmd in MODERATION_COMMANDS:
+            resolved = await connected(bot, msg.get("chat", {}), uid, need_admin=False)
+            if not resolved:
+                return await reply_text("You are not connected to any group. Use /connect <chat_id> in PM.")
+            action_chat_id = resolved
+
         # ── Actor helpers ─────────────────────────────────
         def is_owner_actor() -> bool:
             return (not is_anon_admin) and is_owner(uid)
@@ -1488,31 +1782,54 @@ async def handle_message(bot: Client, msg: dict):
                 return False
             return True
 
+        # ── /allowconnections ─────────────────────────────
+        if raw_cmd == "allowconnections":
+            message = await allow_connections(bot, msg, args)
+            if message:
+                await reply_text(message)
+            return
+
+        # ── /connect ─────────────────────────────────────
+        if raw_cmd == "connect":
+            message = await connect_chat(bot, msg, args)
+            if message:
+                await reply_text(message)
+            return
+
+        # ── /disconnect ──────────────────────────────────
+        if raw_cmd == "disconnect":
+            message = await disconnect_chat(bot, msg)
+            if message:
+                await reply_text(message)
+            return
+
         # ── /start ────────────────────────────────────────
         if raw_cmd == "start":
             await reply_text(
-                "🤖 **HR Group Bot**\n\n"
-                "Fast moderation + utility tools for your group.\n\n"
+                "🛡️ **SentriX Prime**\n\n"
+                "Elite moderation + advanced utility tools for your group.\n\n"
                 "**Quick Commands**\n"
-                "• `/help` - Commands by your role\n"
-                "• `/hr` - User info\n"
-                "• `/ttt` - Play Tic-Tac-Toe\n"
+                "• `/help` - Role-based commands\n"
+                "• `/hr` - User insights\n"
+                "• `/ttt` - Tic-Tac-Toe battle\n"
                 "• `/happeal` - Appeal in DM\n\n"
-                "✅ Online and ready."
+                "👨‍💻 Developed by @dreamm_ca\n"
+                "⚙️ Sudo Dev: @developer_hr\n\n"
+                "⚡ Active. Secure. Ready."
             )
             return
 
         # ── /help ─────────────────────────────────────────
         if raw_cmd == "help":
             if is_anon_admin:
-                # FIX #11 — hunban/hunmute listed for anon admins
                 await reply_text(
                     "🎭 **Anonymous Admin Mode**\n\n"
                     "You can use moderation commands while posting anonymously:\n"
                     "`/hban`, `/hkick`, `/hmute`, `/hunban`, `/hunmute`, `/hstats`, "
                     "`/hwarn`, `/hdel`, `/hcase`, `/hmod list`, `/hmodinfo`, `/hr`, "
                     "`/pin`, `/unpin`, `/adminlist`, `/zombies`\n\n"
-                    "Owner-only commands (`/hauth`, `/hgrant`, `/hrevoke`, `/hprotect`) "
+                    "Owner-only commands (`/hauth`, `/hgrant`, `/hrevoke`, `/hprotect`, "
+                    "`/hunprotect`, `/hfreeze`, `/hunfreeze`, `/hbadge`, `/hwarnconfig`) "
                     "require a normal account identity."
                 )
             else:
@@ -1520,8 +1837,6 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # ── /hr ───────────────────────────────────────────
-        # FIX #2 — removed all inner `bot = await get_bot()` assignments;
-        #           the outer `bot` parameter is used directly throughout.
         if raw_cmd in ("hr", "id"):
             try:
                 target_id   = None
@@ -1618,7 +1933,6 @@ async def handle_message(bot: Client, msg: dict):
             if int(cases[case_id].get("target", 0)) != uid and not is_owner_actor():
                 return await reply_text("❌ You can only appeal your own case.")
             aid = create_appeal(uid, case_id, appeal_msg)
-            # FIX #3 — backup appeals after creation
             asyncio.create_task(upload_backup("appeals", load(APPEALS_FILE)))
             await reply_text(f"✅ Appeal submitted. Appeal ID: #{aid}")
             await notify_owner(f"📨 New appeal #{aid}\nCase: #{case_id}\nUser: `{uid}`\n{appeal_msg}")
@@ -1628,7 +1942,7 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hauth", "ha"):
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
-            target, tid, terr = resolve_target(reply, args, 0)
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /hauth <user_id>")
             data = load(AUTH_FILE)
@@ -1650,24 +1964,44 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # ── /hgrant ───────────────────────────────────────
+        # [FIX-2] Fixed perm+reply resolution logic
         if raw_cmd in ("hgrant", "hg"):
             if not is_owner_actor():
                 return
             if not args:
                 return await reply_text(
-                    f"Usage: /hgrant <permission> <user_id>\n"
+                    f"Usage: /hgrant <user_id> | /hgrant <permission> <user_id>\n"
                     f"Valid: {', '.join(sorted(VALID_PERMISSIONS))}"
                 )
-            perm = args[0].lower()
-            if perm not in VALID_PERMISSIONS:
-                return await reply_text(f"❌ Invalid permission. Valid: {', '.join(sorted(VALID_PERMISSIONS))}")
-            target, tid, terr = resolve_target(reply, args, 1)
-            if not tid:
-                return await reply_text(terr)
+            perm   = None
+            target = {}
+            tid    = None
+            terr   = None
+
+            if args[0].lower() in VALID_PERMISSIONS:
+                # /hgrant <perm> — target is reply or args[1]
+                perm = args[0].lower()
+                target, tid, terr = await resolve_target_ext(bot, reply, args, 1)
+                if not tid:
+                    return await reply_text(terr or "❌ Reply to a user or pass their user ID.")
+            else:
+                # /hgrant <user_id> — grant all
+                target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
+                if not tid:
+                    return await reply_text(terr)
+                if len(args) > 1 and args[1].lower() not in VALID_PERMISSIONS:
+                    return await reply_text(
+                        f"❌ Invalid permission. Valid: {', '.join(sorted(VALID_PERMISSIONS))}"
+                    )
+                perm = "all"
+
             data = load(AUTH_FILE)
             if str(tid) not in data:
                 return await reply_text("❌ User not authorized. Run /hauth first.")
-            data[str(tid)]["permissions"][perm] = True
+            if perm == "all":
+                data[str(tid)]["permissions"] = grant_all_permissions()
+            else:
+                data[str(tid)]["permissions"][perm] = True
             await save_and_backup(AUTH_FILE, data)
             case_id = create_case("GRANT", uid, tid, f"Granted: {perm}")
             await send_grant_log(chat_id, msg_id, uid, target, perm, case_id)
@@ -1678,17 +2012,25 @@ async def handle_message(bot: Client, msg: dict):
             if not is_owner_actor():
                 return
             if not args:
-                return await reply_text("Usage: /hrevoke <permission> <user_id>")
+                return await reply_text(
+                    f"Usage: /hrevoke <permission|all> <user_id>\n"
+                    f"Valid: {', '.join(sorted(VALID_PERMISSIONS))}, all"
+                )
             perm = args[0].lower()
-            if perm not in VALID_PERMISSIONS:
-                return await reply_text(f"❌ Invalid. Valid: {', '.join(sorted(VALID_PERMISSIONS))}")
-            target, tid, terr = resolve_target(reply, args, 1)
+            if perm not in VALID_PERMISSIONS and perm != "all":
+                return await reply_text(
+                    f"❌ Invalid. Valid: {', '.join(sorted(VALID_PERMISSIONS))}, all"
+                )
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 1)
             if not tid:
                 return await reply_text(terr)
             data = load(AUTH_FILE)
             if str(tid) not in data:
                 return await reply_text("❌ User is not a moderator.")
-            data[str(tid)]["permissions"][perm] = False
+            if perm == "all":
+                data[str(tid)]["permissions"] = {p: False for p in VALID_PERMISSIONS}
+            else:
+                data[str(tid)]["permissions"][perm] = False
             await save_and_backup(AUTH_FILE, data)
             case_id = create_case("REVOKE", uid, tid, f"Revoked: {perm}")
             await reply_text(f"✅ Revoked `{perm}` from {make_mention(target)}")
@@ -1702,21 +2044,134 @@ async def handle_message(bot: Client, msg: dict):
                 )
             return
 
+        # ── /hfreeze ──────────────────────────────────────
+        if raw_cmd == "hfreeze":
+            if not is_owner_actor():
+                return await reply_text("❌ Owner only.")
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hfreeze <user_id>")
+            data = load(AUTH_FILE)
+            if str(tid) not in data:
+                return await reply_text("❌ User is not a moderator.")
+            if data[str(tid)].get("frozen"):
+                return await reply_text(f"ℹ️ {make_mention(target)} is already frozen.")
+            data[str(tid)]["frozen"] = True
+            await save_and_backup(AUTH_FILE, data)
+            await reply_text(f"🧊 {make_mention(target)} has been frozen.")
+            lg = get_log_group()
+            if lg:
+                await tg_send(lg, f"🧊 Moderator frozen\n👤 {make_mention(target)} (`{tid}`)\n🛡 By: `{uid}`")
+            return
+
+        # ── /hunfreeze ────────────────────────────────────
+        if raw_cmd == "hunfreeze":
+            if not is_owner_actor():
+                return await reply_text("❌ Owner only.")
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hunfreeze <user_id>")
+            data = load(AUTH_FILE)
+            if str(tid) not in data:
+                return await reply_text("❌ User is not a moderator.")
+            if not data[str(tid)].get("frozen"):
+                return await reply_text(f"ℹ️ {make_mention(target)} is not frozen.")
+            data[str(tid)]["frozen"] = False
+            await save_and_backup(AUTH_FILE, data)
+            await reply_text(f"🔥 {make_mention(target)} has been unfrozen.")
+            lg = get_log_group()
+            if lg:
+                await tg_send(lg, f"🔥 Moderator unfrozen\n👤 {make_mention(target)} (`{tid}`)\n🛡 By: `{uid}`")
+            return
+
+        # ── /hbadge ───────────────────────────────────────
+        if raw_cmd == "hbadge":
+            if not is_owner_actor():
+                return await reply_text("❌ Owner only.")
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hbadge <user_id> <badge text>")
+            # Badge text: everything after the user ID argument
+            badge_start = 0 if reply else 1
+            badge_text  = extract_reason(args, badge_start, "").strip()
+            if not badge_text:
+                return await reply_text("❌ Provide a badge text.\nUsage: /hbadge <user_id> <badge text>")
+            data = load(AUTH_FILE)
+            if str(tid) not in data:
+                return await reply_text("❌ User is not a moderator.")
+            data[str(tid)]["badge"] = badge_text
+            await save_and_backup(AUTH_FILE, data)
+            await reply_text(f"🏷️ Badge set to `{badge_text}` for {make_mention(target)}")
+            return
+
+        # ── /hwarnconfig ──────────────────────────────────
+        if raw_cmd == "hwarnconfig":
+            if not is_owner_actor():
+                return await reply_text("❌ Owner only.")
+            config = get_warn_config()
+            if not args or args[0].lower() == "show":
+                return await reply_text(
+                    f"⚙️ **Warn Configuration**\n\n"
+                    f"🔢 Threshold: `{config['threshold']}`\n"
+                    f"⚔️ Auto-action: `{config['action']}`\n"
+                    f"⏱️ Duration: `{format_duration(config['duration'])}`\n\n"
+                    f"Usage:\n"
+                    f"`/hwarnconfig threshold <n>` - Set warn limit\n"
+                    f"`/hwarnconfig action <ban|mute|kick>` - Set action\n"
+                    f"`/hwarnconfig duration <e.g. 1h>` - Set duration"
+                )
+            sub = args[0].lower()
+            if sub == "threshold":
+                if len(args) < 2 or not args[1].isdigit() or int(args[1]) < 1:
+                    return await reply_text("❌ Usage: /hwarnconfig threshold <number ≥ 1>")
+                config["threshold"] = int(args[1])
+                save_warn_config(config)
+                return await reply_text(f"✅ Warn threshold set to `{config['threshold']}`")
+            elif sub == "action":
+                if len(args) < 2 or args[1].lower() not in ("ban", "mute", "kick"):
+                    return await reply_text("❌ Usage: /hwarnconfig action <ban|mute|kick>")
+                config["action"] = args[1].lower()
+                save_warn_config(config)
+                return await reply_text(f"✅ Auto-action set to `{config['action']}`")
+            elif sub == "duration":
+                if len(args) < 2:
+                    return await reply_text("❌ Usage: /hwarnconfig duration <e.g. 30m, 2h, 1d>")
+                dur = parse_duration_token(args[1])
+                if not dur:
+                    return await reply_text("❌ Invalid duration. Examples: 30m, 2h, 1d")
+                config["duration"] = dur
+                save_warn_config(config)
+                return await reply_text(f"✅ Auto-action duration set to `{format_duration(dur)}`")
+            else:
+                return await reply_text("❌ Unknown option. Use: threshold / action / duration / show")
+
         # ── /hban ─────────────────────────────────────────
         if raw_cmd in ("hban", "hb"):
             if not await check_mod("ban"):
                 return
-            target, tid, terr = resolve_target(reply, args, 0)
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hban <user_id> [duration] [reason]")
+                return await reply_text(f"{terr}\nUsage: /hban <user_id/@user> [duration] [reason]")
+            # [FIX-4] Self-ban protection
+            if not is_anon_admin and tid == uid:
+                return await reply_text("❌ You cannot ban yourself.")
+            # [FIX-3] Admin status check
+            try:
+                member = await bot.get_chat_member(action_chat_id, tid)
+                if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
+                    return await reply_text("❌ Cannot ban an admin or the group owner.")
+            except UserNotParticipant:
+                pass  # not in chat — ban still valid (prevents rejoining)
+            except Exception:
+                pass
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
             if is_protected(tid):
                 return await reply_text("🛡 That user is protected.")
-            if await anti_nuke(chat_id, msg_id, uid):
+            if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
             until_ts = int(time.time()) + dur if dur else None
-            ok, err  = await api_ban(chat_id, tid, until_date=until_ts)
+            ok, err  = await api_ban(action_chat_id, tid, until_date=until_ts)
             if not ok:
                 return await reply_text(f"❌ Ban failed: {err}")
             if dur:
@@ -1725,7 +2180,7 @@ async def handle_message(bot: Client, msg: dict):
                 "temporary": bool(dur), "duration": dur, "expires_at": until_ts,
             })
             if dur:
-                schedule_temp_action("ban", chat_id, tid, until_ts, uid, reason, case_id=case_id)
+                schedule_temp_action("ban", action_chat_id, tid, until_ts, uid, reason, case_id=case_id)
             await send_action_log(chat_id, msg_id, "BAN", target, reason, case_id, actor_mod_info())
             return
 
@@ -1733,16 +2188,28 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hkick", "hk"):
             if not await check_mod("kick"):
                 return
-            target, tid, terr = resolve_target(reply, args, 0)
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hkick <user_id> [reason]")
+                return await reply_text(f"{terr}\nUsage: /hkick <user_id/@user> [reason]")
+            # [FIX-4] Self-kick protection
+            if not is_anon_admin and tid == uid:
+                return await reply_text("❌ You cannot kick yourself.")
+            # [FIX-3] Admin status check
+            try:
+                member = await bot.get_chat_member(action_chat_id, tid)
+                if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
+                    return await reply_text("❌ Cannot kick an admin or the group owner.")
+            except UserNotParticipant:
+                return await reply_text("❌ This user is not in the chat.")
+            except Exception:
+                pass
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No Reason")
             if is_protected(tid):
                 return await reply_text("🛡 That user is protected.")
-            if await anti_nuke(chat_id, msg_id, uid):
+            if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
-            ok, err = await api_kick(chat_id, tid)
+            ok, err = await api_kick(action_chat_id, tid)
             if not ok:
                 return await reply_text(f"❌ Kick failed: {err}")
             case_id = create_case("KICK", uid, tid, reason)
@@ -1753,17 +2220,28 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hmute", "hm"):
             if not await check_mod("mute"):
                 return
-            target, tid, terr = resolve_target(reply, args, 0)
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hmute <user_id> [duration] [reason]")
+                return await reply_text(f"{terr}\nUsage: /hmute <user_id/@user> [duration] [reason]")
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
+            try:
+                member = await bot.get_chat_member(action_chat_id, tid)
+            except UserNotParticipant:
+                return await reply_text("This user isn't in the chat!")
+            except BadRequest as exc:
+                return await reply_text(f"❌ Could not check the target user: {exc}")
+
+            if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
+                return await reply_text("Afraid I can't stop an admin from talking!")
+            if tid == _bot_id:
+                return await reply_text("I'm not muting myself!")
             if is_protected(tid):
                 return await reply_text("🛡 That user is protected.")
-            if await anti_nuke(chat_id, msg_id, uid):
+            if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
             until_ts = int(time.time()) + dur if dur else None
-            ok, err  = await api_mute(chat_id, tid, until_date=until_ts)
+            ok, err  = await api_mute(action_chat_id, tid, until_date=until_ts)
             if not ok:
                 return await reply_text(f"❌ Mute failed: {err}")
             if dur:
@@ -1772,7 +2250,7 @@ async def handle_message(bot: Client, msg: dict):
                 "temporary": bool(dur), "duration": dur, "expires_at": until_ts,
             })
             if dur:
-                schedule_temp_action("mute", chat_id, tid, until_ts, uid, reason, case_id=case_id)
+                schedule_temp_action("mute", action_chat_id, tid, until_ts, uid, reason, case_id=case_id)
             await send_action_log(chat_id, msg_id, "MUTE", target, reason, case_id, actor_mod_info())
             return
 
@@ -1780,16 +2258,18 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hunban", "hub"):
             if not await check_mod("unban"):
                 return
-            target, tid, terr = resolve_target(reply, args, 0)
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hunban <user_id> [reason]")
+                return await reply_text(f"{terr}\nUsage: /hunban <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
-            ok, err = await api_unban(chat_id, tid)
+            # [FIX-5] Anti-nuke check
+            if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
+                return
+            ok, err = await api_unban(action_chat_id, tid)
             if not ok:
                 return await reply_text(f"❌ Unban failed: {err}")
-            # FIX #6 — cancel any pending temp ban
-            cancel_temp_action("ban", chat_id, tid)
+            cancel_temp_action("ban", action_chat_id, tid)
             case_id = create_case("UNBAN", uid, tid, reason)
             await send_action_log(chat_id, msg_id, "UNBAN", target, reason, case_id, actor_mod_info())
             return
@@ -1798,16 +2278,27 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hunmute", "hum"):
             if not await check_mod("unmute"):
                 return
-            target, tid, terr = resolve_target(reply, args, 0)
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hunmute <user_id> [reason]")
+                return await reply_text(f"{terr}\nUsage: /hunmute <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
-            ok, err = await api_unmute(chat_id, tid)
+            try:
+                member = await bot.get_chat_member(action_chat_id, tid)
+            except UserNotParticipant:
+                return await reply_text("This user isn't even in the chat!")
+            except BadRequest as exc:
+                return await reply_text(f"❌ Could not check the target user: {exc}")
+
+            if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
+                return await reply_text("This user already has the right to speak.")
+            # [FIX-5] Anti-nuke check
+            if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
+                return
+            ok, err = await api_unmute(action_chat_id, tid)
             if not ok:
                 return await reply_text(f"❌ Unmute failed: {err}")
-            # FIX #6 — cancel any pending temp mute
-            cancel_temp_action("mute", chat_id, tid)
+            cancel_temp_action("mute", action_chat_id, tid)
             case_id = create_case("UNMUTE", uid, tid, reason)
             await send_action_log(chat_id, msg_id, "UNMUTE", target, reason, case_id, actor_mod_info())
             return
@@ -1821,7 +2312,7 @@ async def handle_message(bot: Client, msg: dict):
             reply_msg_id = reply.get("message_id")
             if not reply_msg_id:
                 return await reply_text("❌ Could not determine the replied message.")
-            ok, err = await api_pin(chat_id, reply_msg_id)
+            ok, err = await api_pin(action_chat_id, reply_msg_id)
             if not ok:
                 return await reply_text(f"❌ Pin failed: {err}")
             await reply_text("📌 Message pinned.")
@@ -1831,7 +2322,7 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd == "unpin":
             if not await check_mod("pin"):
                 return
-            ok, err = await api_unpin(chat_id)
+            ok, err = await api_unpin(action_chat_id)
             if not ok:
                 return await reply_text(f"❌ Unpin failed: {err}")
             await reply_text("📍 Pinned message removed.")
@@ -1841,17 +2332,18 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd == "adminlist":
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
-            await reply_text(await build_admin_list_text(bot, chat_id))
+            await reply_text(await build_admin_list_text(bot, action_chat_id))
             return
 
         # ── /zombies ──────────────────────────────────────
         if raw_cmd == "zombies":
             if not await check_mod("kick"):
                 return
-            if await anti_nuke(chat_id, msg_id, uid):
+            if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
             await reply_text("🔎 Scanning for deleted/bot accounts...")
-            kicked_deleted, kicked_bots, failures = await scan_zombies(bot, chat_id)
+            # [FIX-8] Pass bot_id to exclude the bot itself
+            kicked_deleted, kicked_bots, failures = await scan_zombies(bot, action_chat_id, _bot_id)
             summary = (
                 f"🧟 Zombie scan complete\n"
                 f"• Deleted accounts kicked: `{kicked_deleted}`\n"
@@ -1882,74 +2374,115 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hwarn", "hw"):
             if not await check_mod("warn"):
                 return
-            target, tid, terr = resolve_target(reply, args, 0)
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hwarn <user_id> [reason]")
+                return await reply_text(f"{terr}\nUsage: /hwarn <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
             if is_protected(tid):
                 return await reply_text("🛡 That user is protected.")
-            if await anti_nuke(chat_id, msg_id, uid):
+            if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
-            warns = load(WARN_FILE)
-            key   = str(tid)
-            warns.setdefault(key, 0)
-            warns[key] += 1
-            await save_and_backup(WARN_FILE, warns)
-            warn_config = get_warn_config()
-            threshold   = warn_config.get("threshold", 3)
-            auto_action = warn_config.get("action", "mute")
-            duration    = warn_config.get("duration", 3600)
+
+            warner_tag = actor_mod_info() or str(uid)
+            res = warn(tid, action_chat_id, reason, warner=warner_tag)
+
             case_id = create_case("WARN", uid, tid, reason)
             await send_action_log(
                 chat_id, msg_id, "WARN", target, reason, case_id, actor_mod_info(),
-                extra=f"📊 Total Warns: {warns[key]}",
+                extra=f"📊 Total Warns: {res.get('num_warns', 0)}/{res.get('threshold', 0)}",
             )
-            # FIX #7 — safe defaults before branching
-            if warns[key] >= threshold:
-                ok           = False
-                action_label = "MUTE"
-                until_ts     = int(time.time()) + duration
-                if auto_action == "ban":
-                    ok, err  = await api_ban(chat_id, tid, until_date=until_ts)
-                    action_label = "BAN"
-                elif auto_action == "kick":
-                    ok, err  = await api_kick(chat_id, tid)
-                    action_label = "KICK"
+
+            action = res.get("action")
+            if action:
+                ok  = False
+                err = ""
+                until_ts     = int(time.time()) + get_warn_config().get("duration", 3600)
+                action_label = action.upper()
+                if action == "ban":
+                    ok, err = await api_ban(action_chat_id, tid, until_date=until_ts)
+                elif action == "kick":
+                    ok, err = await api_kick(action_chat_id, tid)
                 else:
-                    ok, err  = await api_mute(chat_id, tid, until_date=until_ts)
-                    action_label = "MUTE"
+                    ok, err = await api_mute(action_chat_id, tid, until_date=until_ts)
+
                 if ok:
-                    auto_reason = f"Warn threshold ({threshold}) reached"
+                    auto_reason = f"Warn threshold ({res.get('threshold')}) reached"
                     auto_case   = create_case(action_label, uid, tid, auto_reason)
                     await send_action_log(
                         chat_id, msg_id, action_label, target,
                         auto_reason, auto_case, actor_mod_info(),
-                        extra=f"⚡ Auto-action on {warns[key]} warns",
+                        extra="⚡ Auto-action on warn threshold",
                     )
-                    if auto_action in ("ban", "mute"):
-                        schedule_temp_action(
-                            auto_action, chat_id, tid, until_ts,
-                            uid, auto_reason, case_id=auto_case,
-                        )
+                    if action in ("ban", "mute"):
+                        schedule_temp_action(action, action_chat_id, tid, until_ts, uid, auto_reason, case_id=auto_case)
+            return
+
+        # ── /resetwarns ───────────────────────────────────
+        if raw_cmd == "resetwarns":
+            if not await check_mod("warn"):
+                return
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /resetwarns <user_id/@user>")
+            reset_warns(tid, action_chat_id, admin_tag=actor_mod_info())
+            await reply_text("Warnings have been reset!")
+            case_id = create_case("RESETWARNS", uid, tid, "Warnings reset")
+            await send_action_log(chat_id, msg_id, "RESETWARNS", target, "Warnings reset", case_id, actor_mod_info())
+            return
+
+        # ── /warns ────────────────────────────────────────
+        if raw_cmd == "warns":
+            user_lookup = uid
+            if args:
+                # [FIX-10] Support @username in /warns
+                if args[0].startswith("@"):
+                    try:
+                        user_obj = await bot.get_user(args[0][1:])
+                        user_lookup = user_obj.id
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        user_lookup = int(args[0])
+                    except Exception:
+                        if reply:
+                            _, rid = extract_reply_user(reply)
+                            if rid:
+                                user_lookup = rid
+            elif reply:
+                _, rid = extract_reply_user(reply)
+                if rid:
+                    user_lookup = rid
+            # [FIX-7] Use action_chat_id so PM-connected sessions resolve correctly
+            result    = warns_for(user_lookup, action_chat_id)
+            num_warns = result.get("num_warns", 0)
+            reasons   = result.get("reasons", [])
+            threshold = get_warn_config().get("threshold", 3)
+            if num_warns > 0:
+                text = f"This user has {num_warns}/{threshold} warnings."
+                for r in reasons:
+                    text += f"\n - {r}"
+                await reply_text(text)
+            else:
+                await reply_text("This user hasn't got any warnings!")
             return
 
         # ── /hdel ─────────────────────────────────────────
-        # FIX #1 — correct indentation aligned with all other blocks
         if raw_cmd in ("hdel", "hd"):
             if not await check_mod("delete"):
                 return
             if not reply:
-                return  # command msg already scheduled for delete at top
+                return
             target, tid = extract_reply_user(reply)
             if not tid:
                 return
             if is_protected(tid):
                 return await reply_text("🛡 That user is protected.")
-            if await anti_nuke(chat_id, msg_id, uid):
+            if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
             reply_msg_id = reply.get("message_id")
-            ok, err = await api_delete_msg(chat_id, reply_msg_id)
+            ok, err = await api_delete_msg(action_chat_id, reply_msg_id)
             if not ok:
                 return await reply_text(f"❌ Delete failed: {err}")
             case_id = create_case("DELETE", uid, tid, "Message Deleted")
@@ -1963,21 +2496,35 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hprotect", "hp"):
             if not is_owner_actor():
                 return
-            target, tid, terr = resolve_target(reply, args, 0)
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hprotect <user_id>")
+                return await reply_text(f"{terr}\nUsage: /hprotect <user_id/@user>")
             data = load(PROTECT_FILE)
             key  = str(tid)
             if key in data:
                 return await reply_text(f"ℹ️ {make_mention(target)} is already protected.")
             data[key] = True
-            # FIX #4 — protect file backed up
             await save_and_backup(PROTECT_FILE, data)
             await reply_text(f"🛡 {make_mention(target)} is now protected.")
             return
 
+        # ── /hunprotect ───────────────────────────────────
+        if raw_cmd in ("hunprotect", "hup"):
+            if not is_owner_actor():
+                return
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hunprotect <user_id/@user>")
+            data = load(PROTECT_FILE)
+            key  = str(tid)
+            if key not in data:
+                return await reply_text(f"ℹ️ {make_mention(target)} is not protected.")
+            del data[key]
+            await save_and_backup(PROTECT_FILE, data)
+            await reply_text(f"🔓 Protection removed from {make_mention(target)}.")
+            return
+
         # ── /hcase ────────────────────────────────────────
-        # FIX #9 — proper error reply for unauthorised
         if raw_cmd in ("hcase", "hc"):
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
@@ -1999,7 +2546,6 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # ── /hmodinfo ─────────────────────────────────────
-        # FIX #9 — proper error reply for unauthorised
         if raw_cmd in ("hmodinfo", "hmi"):
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
@@ -2026,7 +2572,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("❌ That user is not a moderator.")
             perms     = mod.get("permissions", {})
             perm_list = "\n".join(
-                f"  {'✅' if v else '❌'} {k}" for k, v in perms.items()
+                f"  {'✅' if v else '❌'} {k}" for k, v in sorted(perms.items())
             ) or "  No permissions set"
             status = "🔴 Frozen" if mod.get("frozen") else "🟢 Active"
             await reply_text(
@@ -2069,7 +2615,6 @@ async def handle_callback(bot: Client, cb: dict):
             tid     = int(data.split("_", 1)[1])
             ok, err = await api_unban(chat_id, tid)
             if ok:
-                # FIX #6 — cancel pending temp ban from inline button
                 cancel_temp_action("ban", chat_id, tid)
                 await tg_answer_cb(cb_id, "✅ User unbanned.")
             else:
@@ -2081,7 +2626,6 @@ async def handle_callback(bot: Client, cb: dict):
             tid     = int(data.split("_", 1)[1])
             ok, err = await api_unmute(chat_id, tid)
             if ok:
-                # FIX #6 — cancel pending temp mute from inline button
                 cancel_temp_action("mute", chat_id, tid)
                 await tg_answer_cb(cb_id, "✅ User unmuted.")
             else:
@@ -2090,13 +2634,14 @@ async def handle_callback(bot: Client, cb: dict):
         elif data.startswith("removewarn_"):
             if not has_permission(uid, "warn"):
                 return await tg_answer_cb(cb_id, "❌ No warn permission.", alert=True)
-            tid   = int(data.split("_", 1)[1])
-            warns = load(WARN_FILE)
-            key   = str(tid)
-            if key in warns and warns[key] > 0:
-                warns[key] -= 1
-                save(WARN_FILE, warns)
-            await tg_answer_cb(cb_id, f"✅ Warning removed. Total: {warns.get(key, 0)}")
+            tid  = int(data.split("_", 1)[1])
+            # [FIX-1] Use namespaced key matching warn() storage format
+            warns_data = load(WARN_FILE)
+            key        = f"{chat_id}:{tid}"
+            if key in warns_data and warns_data[key] > 0:
+                warns_data[key] -= 1
+                save(WARN_FILE, warns_data)
+            await tg_answer_cb(cb_id, f"✅ Warning removed. Total: {warns_data.get(key, 0)}")
 
         elif data.startswith("case_"):
             case_id = data.split("_", 1)[1]
