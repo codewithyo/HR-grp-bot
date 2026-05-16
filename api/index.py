@@ -1717,9 +1717,13 @@ def moderation_help_markup(section: str = "home") -> dict:
     if section == "home":
         return build_markup(
             (("🚫 Ban", "cb:help_ban"), ("🔇 Mute", "cb:help_mute"), ("👢 Kick", "cb:help_kick")),
+            (("🛡 Protect", "cb:help_protect"), ("📋 Notes", "cb:help_notes"), ("🔍 Filters", "cb:help_filters")),
+            (("🔗 Connections", "cb:help_connections"), ("📊 Mod Info/Stats", "cb:help_stats"), ("🔐 Authorization", "cb:help_auth")),
         )
     return build_markup(
         (("🚫 Ban", "cb:help_ban"), ("🔇 Mute", "cb:help_mute"), ("👢 Kick", "cb:help_kick")),
+        (("🛡 Protect", "cb:help_protect"), ("📋 Notes", "cb:help_notes"), ("🔍 Filters", "cb:help_filters")),
+        (("🔗 Connections", "cb:help_connections"), ("📊 Mod Info/Stats", "cb:help_stats"), ("🔐 Authorization", "cb:help_auth")),
         (("⬅️ Back", "cb:help_home"),),
     )
 
@@ -1758,12 +1762,76 @@ def moderation_help_text(section: str, uid: int) -> str:
             "• Example: `/hkick @user rule break`\n"
             "• Kick removes the user immediately and is not temporary.\n"
         )
+    if section == "protect":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🛡 **Protection Commands**\n\n"
+            "`/hprotect <user_id>` - Protect a user from moderation\n"
+            "`/hunprotect <user_id>` - Remove user protection\n\n"
+            "**Usage**\n"
+            "• Owner-only commands.\n"
+            "• Use these to whitelist trusted users from mod actions.\n"
+            "• Example: `/hprotect 123456789`\n"
+        )
+    if section == "notes":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "📋 **Notes Commands**\n\n"
+            "`/notes` - List saved notes\n"
+            "`/save <name> <text>` - Save a note\n"
+            "`/save <name>` (reply) - Save replied content\n"
+            "`/get <name>` or `#name` - Get a note\n"
+            "`/clear <name>` - Delete a note\n"
+        )
+    if section == "filters":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🔍 **Filters Commands**\n\n"
+            "`/filters` - List filters\n"
+            "`/filter <keyword> <response>` - Add a filter\n"
+            "`/filter -exact <keyword> <response>` - Exact match\n"
+            "`/filter -start <keyword> <response>` - Starts with\n"
+            "`/filter -regex <pattern> <response>` - Regex filter\n"
+            "`/stop <keyword>` - Remove a filter\n"
+        )
+    if section == "connections":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🔗 **Connections Commands**\n\n"
+            "`/connect <chat_id>` - Connect PM to a group\n"
+            "`/connections` - View and switch connected groups\n"
+            "`/disconnect [chat_id|all]` - Disconnect a group\n"
+            "`/allowconnections yes|no` - Allow or block PM connections\n"
+        )
+    if section == "stats":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "📊 **Moderator Info & Stats**\n\n"
+            "`/hstats` - Show moderation stats\n"
+            "`/hmod list` - List authorized moderators\n"
+            "`/hmodinfo [user_id]` - View moderator info\n"
+            "`/hcase <case_id>` - View case details\n"
+            "`/hdel` - Delete replied message\n"
+            "`/hr` - Get user information\n"
+        )
+    if section == "auth":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🔐 **Authorization Commands**\n\n"
+            "`/hauth <user_id>` - Authorize a moderator\n"
+            "`/hgrant`, `/hrevoke` - Grant or revoke permissions\n"
+            "`/hfreeze`, `/hunfreeze` - Freeze or unfreeze a moderator\n"
+            "`/hbadge <user_id> <badge text>` - Set moderator badge\n"
+            "`/hwarnconfig` - Configure warn actions\n"
+        )
     return (
         f"👮 **{role} Help Center**\n\n"
-        "Choose a moderation category below to see the valid commands and usage.\n\n"
+        "Choose a category below to see the valid commands and usage.\n\n"
         "• Ban: `/hban`, `/hunban`\n"
         "• Mute: `/hmute`, `/hunmute`\n"
-        "• Kick: `/hkick`\n\n"
+        "• Kick: `/hkick`\n"
+        "• Protect: `/hprotect`, `/hunprotect`\n"
+        "• Notes, Filters, Connections, Stats, Authorization\n\n"
         "💡 Reply to the target message to avoid typing a user ID.\n"
         "⏱️ Duration examples: `30m`, `2h`, `1d`\n"
     )
