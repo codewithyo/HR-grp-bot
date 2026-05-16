@@ -1416,14 +1416,20 @@ async def scan_zombies(bot: Client, chat_id: int, bot_id: int) -> tuple[int, int
             continue
         if user.id == bot_id:
             continue
-        is_deleted = bool(getattr(user, "is_deleted", False))
-        is_bot     = bool(getattr(user, "is_bot", False))
-        if not is_deleted and not is_bot:
+        # Detect deleted accounts reliably: prefer explicit flag, fall back to "Deleted Account" name
+        first_name = (getattr(user, "first_name", "") or "").strip()
+        is_deleted = bool(getattr(user, "is_deleted", False)) or first_name.lower() == "deleted account" or first_name.lower().startswith("deleted")
+        is_bot = bool(getattr(user, "is_bot", False))
+
+        # Only target deleted user accounts. Skip bots.
+        if not is_deleted:
             continue
+        if is_bot:
+            continue
+
         ok, err = await api_kick(chat_id, user.id)
         if ok:
-            if is_deleted: kicked_deleted += 1
-            if is_bot:     kicked_bots    += 1
+            kicked_deleted += 1
         else:
             failures.append(f"{user.id}: {err}")
     return kicked_deleted, kicked_bots, failures
@@ -1958,13 +1964,13 @@ async def handle_message(bot: Client, msg: dict):
                 for tag in hashtags:
                     note = note_get(chat_id, tag.lower())
                     if note:
-                        await tg_send(chat_id, note["content"], reply_to=msg_id)
+                        await tg_send(chat_id, note["content"], reply_to=msg_id, parse_mode=None)
                         return  # only respond to the first matching note
 
                 # 2) Check filters
                 keyword, fdata = filter_check(chat_id, text)
                 if keyword and fdata:
-                    await tg_send(chat_id, fdata["response"], reply_to=msg_id)
+                    await tg_send(chat_id, fdata["response"], reply_to=msg_id, parse_mode=None)
             return
 
         # ── Parse command ─────────────────────────────────────────────────
@@ -2181,6 +2187,13 @@ async def handle_message(bot: Client, msg: dict):
                     response += f"🔗 Username: @{uname}\n"
                 response += f"📌 Link: [Profile](tg://user?id={target_id})"
 
+                # Include group ID when command is used inside a group
+                if not is_private:
+                    try:
+                        response += f"\n\nGroup ID: `{chat_id}`"
+                    except Exception:
+                        pass
+
                 if is_owner_actor() and not is_private:
                     await notify_owner(response)
                 else:
@@ -2268,7 +2281,7 @@ async def handle_message(bot: Client, msg: dict):
             note = note_get(action_chat_id, note_name)
             if not note:
                 return await reply_text(f"❌ Note `{note_name}` not found.\nUse `/notes` to see all saved notes.")
-            await tg_send(chat_id, note["content"], reply_to=msg_id)
+            await tg_send(chat_id, note["content"], reply_to=msg_id, parse_mode=None)
             return
 
         # ── /clear <name> ───────────────────────────────────────────────
@@ -2804,12 +2817,11 @@ async def handle_message(bot: Client, msg: dict):
                 return
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
-            await reply_text("🔎 Scanning for deleted/bot accounts...")
+            await reply_text("🔎 Scanning for deleted accounts...")
             kicked_deleted, kicked_bots, failures = await scan_zombies(bot, action_chat_id, _bot_id)
             summary = (
                 f"🧟 Zombie scan complete\n"
-                f"• Deleted accounts kicked: `{kicked_deleted}`\n"
-                f"• Bot accounts kicked: `{kicked_bots}`"
+                f"• Deleted accounts kicked: `{kicked_deleted}`"
             )
             if failures:
                 summary += f"\n• Failures: `{len(failures)}`"
@@ -3084,7 +3096,7 @@ async def handle_callback(bot: Client, cb: dict):
             note_name = data.split("_", 1)[1]
             note      = note_get(chat_id, note_name)
             if note:
-                await tg_send(chat_id, note["content"])
+                await tg_send(chat_id, note["content"], parse_mode=None)
                 await tg_answer_cb(cb_id, f"📋 Note: #{note_name}")
             else:
                 await tg_answer_cb(cb_id, "❌ Note not found.", alert=True)
