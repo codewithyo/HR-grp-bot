@@ -2159,11 +2159,22 @@ async def handle_message(bot: Client, msg: dict):
                 try:
                     me = await bot.get_me()
                     pm_link = f"https://t.me/{me.username}?start=connect_{chat_id}"
+                    try:
+                        chat_obj = await bot.get_chat(chat_id)
+                        title = chat_obj.title
+                    except Exception:
+                        title = None
+                    if title:
+                        msg_text = f"🔗 Connect *{title}* (`{chat_id}`) in PM — tap the button below."
+                        btn_label = f"Connect to {title[:30]}"
+                    else:
+                        msg_text = "🔗 Tap the button below to connect this group in PM."
+                        btn_label = "Connect to PM"
                     await tg_send(
                         chat_id,
-                        "🔗 Tap the button below to connect this group in PM.",
+                        msg_text,
                         reply_to=msg_id,
-                        markup=build_markup([("Connect to PM", f"url:{pm_link}")]),
+                        markup=build_markup([(btn_label, f"url:{pm_link}")]),
                     )
                 except Exception:
                     await reply_text("❌ Could not create the PM connect link.")
@@ -2179,18 +2190,29 @@ async def handle_message(bot: Client, msg: dict):
                 try:
                     me = await bot.get_me()
                     pm_link = f"https://t.me/{me.username}?start=disconnect_{chat_id}"
+                    try:
+                        chat_obj = await bot.get_chat(chat_id)
+                        title = chat_obj.title
+                    except Exception:
+                        title = None
+                    if title:
+                        msg_text = f"🔗 Disconnect *{title}* (`{chat_id}`) in PM — tap the button below."
+                        btn_label = f"Disconnect {title[:30]}"
+                    else:
+                        msg_text = "🔗 Tap the button below to disconnect this group in PM."
+                        btn_label = "Disconnect from PM"
                     await tg_send(
                         chat_id,
-                        "🔗 Tap the button below to disconnect this group in PM.",
+                        msg_text,
                         reply_to=msg_id,
-                        markup=build_markup([("Disconnect from PM", f"url:{pm_link}")]),
+                        markup=build_markup([(btn_label, f"url:{pm_link}")]),
                     )
                 except Exception:
                     await reply_text("❌ Could not create the PM disconnect link.")
             return
 
         # ── /connections — list all connected groups ───────────────────────
-        if raw_cmd == "connections":
+        if raw_cmd in "connections":
             if not is_private:
                 return await reply_text("Use /connections in bot DM.")
             chats = get_connected_chats(uid)
@@ -2203,15 +2225,20 @@ async def handle_message(bot: Client, msg: dict):
             lines = ["🔗 **Your Connected Groups**\n"]
             rows  = []
             for cid in chats:
-                label = f"`{cid}`"
+                title = None
                 try:
                     chat_obj = await bot.get_chat(cid)
-                    label = chat_obj.title
+                    title = chat_obj.title
                 except Exception:
-                    pass
+                    title = None
                 star = " ⭐" if cid == active else ""
-                lines.append(f"• {label}{star} (`{cid}`)")
-                btn_text = f"✅ Active" if cid == active else f"Switch → {label[:20]}"
+                if title:
+                    lines.append(f"• *{title}*{star} (`{cid}`)")
+                    display_label = title[:20]
+                else:
+                    lines.append(f"• `{cid}`{star}")
+                    display_label = f"`{cid}`"
+                btn_text = f"✅ Active" if cid == active else f"Switch → {display_label}"
                 rows.append([(btn_text, f"cb:setactive_{cid}")])
             markup = build_markup(*rows)
             await tg_send(
