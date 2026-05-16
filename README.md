@@ -162,6 +162,3 @@ Open source - feel free to fork and customize!
 ---
 
 **🚀 Deploy now and enjoy 24/7 group moderation!**
-
-
-[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=hr-grp-bot&type=git&repository=yatinbst%2FHR-grp-bot&branch=main&builder=dockerfile&instance_type=free&regions=fra&instances_min=0&autoscaling_sleep_idle_delay=3900&env%5BAPI_HASH%5D=822d45aa548a53682a458efa1933e4c9&env%5BAPI_ID%5D=9605646&env%5BAPP_URL%5D=institutional-rebeka-yatinbst-344ddd90.koyeb.app%2F&env%5BBOT_TOKEN%5D=8707026358%3AAAF-DAP96HYUZe6d4aQ7g_d3lyE97q8KOBo&env%5BLOG_GROUP_ID%5D=-1003834934514&env%5BOWNER_ID%5D=8457503781)
