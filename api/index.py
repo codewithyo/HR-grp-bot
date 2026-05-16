@@ -22,14 +22,20 @@
 #   [FIX-10] resolve_target_ext supports @username in all moderation commands
 #
 # NEW FEATURES:
-#   /hunprotect — remove user protection
-#   /hfreeze / /hunfreeze — manual moderator freeze/unfreeze
-#   /hwarnconfig — configure warn threshold, action, duration
-#   /hrevoke all — revoke all permissions at once
-#   /hbadge — set custom moderator badge/title
+#   /hunprotect       — remove user protection
+#   /hfreeze /hunfreeze — manual moderator freeze/unfreeze
+#   /hwarnconfig      — configure warn threshold, action, duration
+#   /hrevoke all      — revoke all permissions at once
+#   /hbadge           — set custom moderator badge/title
+#
+# MISS ROSE STYLE FEATURES:
+#   Notes   — /save, /get, /clear, /notes, #notename trigger
+#   Filters — /filter, /stop, /filters, auto-respond to keywords
+#   Multi-group PM — /connect adds groups, /connections lists+switch,
+#                    /disconnect [chat_id|all], active group for mod commands
 # =========================================================
 
-import os, json, time, random, string, asyncio, httpx
+import os, json, time, random, string, asyncio, httpx, re
 import traceback, sys, shutil, io, threading
 from datetime import datetime
 from pathlib import Path
@@ -100,15 +106,27 @@ BOT_COMMANDS = [
     {"command": "help",           "description": "📖 Display available commands for your role"},
     {"command": "hr",             "description": "🆔 Get user ID & profile information"},
     {"command": "hmodinfo",       "description": "👮 View moderator information"},
+    {"command": "notes",          "description": "📋 List all saved notes in this group"},
+    {"command": "save",           "description": "💾 Save a note: /save <name> <text>"},
+    {"command": "get",            "description": "📖 Get a note: /get <name>"},
+    {"command": "clear",          "description": "🗑️ Delete a note: /clear <name>"},
+    {"command": "filters",        "description": "🔍 List all active filters in this group"},
+    {"command": "filter",         "description": "➕ Add a filter: /filter <keyword> <response>"},
+    {"command": "stop",           "description": "➖ Remove a filter: /stop <keyword>"},
+    {"command": "connections",    "description": "🔗 View & switch your connected groups"},
+    {"command": "connect",        "description": "🔗 Connect PM to a group"},
+    {"command": "disconnect",     "description": "❌ Disconnect from a group"},
 ]
 
 VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
 
-# [FIX-6] Added hdel, hd, pin, unpin so PM-connected sessions route correctly
+# [FIX-6] Added hdel, hd, pin, unpin, notes/filter commands for PM routing
 MODERATION_COMMANDS = {
     "hban", "hb", "hkick", "hk", "hmute", "hm",
     "hunban", "hub", "hunmute", "hum", "hwarn", "hw",
     "resetwarns", "hdel", "hd", "pin", "unpin",
+    "save", "get", "clear", "notes",
+    "filter", "stop", "filters",
 }
 ACTION_LOG_AUTO_DELETE = 60  # seconds
 
@@ -193,6 +211,9 @@ TEMP_ACTIONS_FILE     = f"{STORAGE_PATH}/temp_actions.json"
 APPEALS_FILE          = f"{STORAGE_PATH}/appeals.json"
 CONNECTIONS_FILE      = f"{STORAGE_PATH}/connections.json"
 USER_CONNECTIONS_FILE = f"{STORAGE_PATH}/user_connections.json"
+ACTIVE_CONN_FILE      = f"{STORAGE_PATH}/active_conn.json"       # NEW: active group per user
+NOTES_FILE            = f"{STORAGE_PATH}/notes.json"             # NEW: notes per group
+FILTERS_FILE          = f"{STORAGE_PATH}/filters.json"           # NEW: filters per group
 TTT_SCORES_FILE       = f"{STORAGE_PATH}/ttt_scores.json"
 TTT_STATE_FILE        = f"{STORAGE_PATH}/ttt_state.json"
 
@@ -207,6 +228,9 @@ FALLBACK_FILE_MAP = {
     APPEALS_FILE:          f"{FALLBACK_STORAGE_PATH}/appeals.json",
     CONNECTIONS_FILE:      f"{FALLBACK_STORAGE_PATH}/connections.json",
     USER_CONNECTIONS_FILE: f"{FALLBACK_STORAGE_PATH}/user_connections.json",
+    ACTIVE_CONN_FILE:      f"{FALLBACK_STORAGE_PATH}/active_conn.json",
+    NOTES_FILE:            f"{FALLBACK_STORAGE_PATH}/notes.json",
+    FILTERS_FILE:          f"{FALLBACK_STORAGE_PATH}/filters.json",
     TTT_SCORES_FILE:       f"{FALLBACK_STORAGE_PATH}/ttt_scores.json",
     TTT_STATE_FILE:        f"{FALLBACK_STORAGE_PATH}/ttt_state.json",
 }
@@ -224,10 +248,15 @@ FILE_LABEL = {
     APPEALS_FILE:          "appeals",
     CONNECTIONS_FILE:      "connections",
     USER_CONNECTIONS_FILE: "user_connections",
+    ACTIVE_CONN_FILE:      "active_conn",
+    NOTES_FILE:            "notes",
+    FILTERS_FILE:          "filters",
     TTT_SCORES_FILE:       "ttt_scores",
     TTT_STATE_FILE:        "ttt_state",
 }
 
+# Notes, Filters, and active_conn use local-only storage for now.
+# mongo_db module should add load_notes / save_notes etc. to enable cloud sync.
 MONGO_LOADERS = {
     AUTH_FILE:             mongo_db.load_auth,
     WARN_FILE:             mongo_db.load_warns,
@@ -241,6 +270,9 @@ MONGO_LOADERS = {
     USER_CONNECTIONS_FILE: mongo_db.load_user_connections,
     TTT_SCORES_FILE:       mongo_db.load_ttt_scores,
     TTT_STATE_FILE:        mongo_db.load_ttt_state,
+    ACTIVE_CONN_FILE:      mongo_db.load_active_conn,
+    NOTES_FILE:            mongo_db.load_notes,
+    FILTERS_FILE:          mongo_db.load_filters,
 }
 
 MONGO_SAVERS = {
@@ -256,6 +288,9 @@ MONGO_SAVERS = {
     USER_CONNECTIONS_FILE: mongo_db.save_user_connections,
     TTT_SCORES_FILE:       mongo_db.save_ttt_scores,
     TTT_STATE_FILE:        mongo_db.save_ttt_state,
+    ACTIVE_CONN_FILE:      mongo_db.save_active_conn,
+    NOTES_FILE:            mongo_db.save_notes,
+    FILTERS_FILE:          mongo_db.save_filters,
 }
 
 # =========================================================
@@ -358,6 +393,14 @@ def save(file: str, data):
         elif file == PROTECT_FILE:
             for key in _cache.keys():
                 if key.startswith("protected:"):
+                    _cache.invalidate(key)
+        elif file == NOTES_FILE:
+            for key in _cache.keys():
+                if key.startswith("notes:"):
+                    _cache.invalidate(key)
+        elif file == FILTERS_FILE:
+            for key in _cache.keys():
+                if key.startswith("filters:"):
                     _cache.invalidate(key)
         tmp = f"{file}.tmp"
         try:
@@ -557,6 +600,7 @@ async def upload_backup(label: str, data) -> bool:
 _BACKUP_LABELS = {
     "auth", "warns", "cases", "protected", "abuse",
     "temp_actions", "appeals", "connections", "user_connections",
+    "notes", "filters",
 }
 
 async def save_and_backup(file: str, data):
@@ -663,49 +707,99 @@ def generate_mod_id() -> str:
 def get_mod_info(uid: int) -> dict:
     return load(AUTH_FILE).get(str(uid), {})
 
-def load_connections() -> dict:
-    data = load(CONNECTIONS_FILE)
-    return data if isinstance(data, dict) else {}
-
-def save_connections(data: dict):
-    save(CONNECTIONS_FILE, data)
-
-def load_user_connections() -> dict:
-    data = load(USER_CONNECTIONS_FILE)
-    return data if isinstance(data, dict) else {}
-
-def save_user_connections(data: dict):
-    save(USER_CONNECTIONS_FILE, data)
-
 def allow_connect_to_chat(chat_id: int) -> bool:
-    return bool(load_connections().get(str(chat_id), False))
+    return bool(load(CONNECTIONS_FILE).get(str(chat_id), False))
 
 def set_allow_connect_to_chat(chat_id: int, enabled: bool):
-    data = load_connections()
+    data = load(CONNECTIONS_FILE)
     data[str(chat_id)] = bool(enabled)
-    save_connections(data)
+    save(CONNECTIONS_FILE, data)
 
-def get_connected_chat(user_id: int) -> int | None:
-    data = load_user_connections()
+# =========================================================
+# MULTI-GROUP CONNECTION SYSTEM (Miss Rose style)
+# =========================================================
+
+def get_connected_chats(user_id: int) -> list[int]:
+    """Return all chat IDs the user has connected to."""
+    data = load(USER_CONNECTIONS_FILE)
+    value = data.get(str(user_id))
+    if value is None:
+        return []
+    # Migrate old single-value format
+    if isinstance(value, (int, float)):
+        return [int(value)]
+    if isinstance(value, list):
+        return [int(x) for x in value if str(x).lstrip("-").isdigit()]
+    return []
+
+def get_active_connection(user_id: int) -> int | None:
+    """Return the user's currently active group chat ID."""
+    data = load(ACTIVE_CONN_FILE)
     value = data.get(str(user_id))
     try:
         return int(value) if value is not None else None
     except Exception:
         return None
 
-def connect_user(user_id: int, chat_id: int) -> bool:
-    data = load_user_connections()
+def set_active_connection(user_id: int, chat_id: int):
+    data = load(ACTIVE_CONN_FILE)
     data[str(user_id)] = int(chat_id)
-    save_user_connections(data)
+    save(ACTIVE_CONN_FILE, data)
+
+def add_user_connection(user_id: int, chat_id: int):
+    data  = load(USER_CONNECTIONS_FILE)
+    key   = str(user_id)
+    chats = get_connected_chats(user_id)
+    if int(chat_id) not in chats:
+        chats.append(int(chat_id))
+    data[key] = chats
+    save(USER_CONNECTIONS_FILE, data)
+    set_active_connection(user_id, chat_id)
+
+def remove_user_connection(user_id: int, chat_id: int = None) -> bool:
+    data  = load(USER_CONNECTIONS_FILE)
+    key   = str(user_id)
+    chats = get_connected_chats(user_id)
+    if chat_id is not None:
+        cid = int(chat_id)
+        if cid not in chats:
+            return False
+        chats.remove(cid)
+        data[key] = chats
+        save(USER_CONNECTIONS_FILE, data)
+        # Update active if we removed the active group
+        active = get_active_connection(user_id)
+        if active == cid:
+            if chats:
+                set_active_connection(user_id, chats[0])
+            else:
+                active_data = load(ACTIVE_CONN_FILE)
+                active_data.pop(str(user_id), None)
+                save(ACTIVE_CONN_FILE, active_data)
+        return True
+    else:
+        # Disconnect from all
+        data.pop(key, None)
+        save(USER_CONNECTIONS_FILE, data)
+        active_data = load(ACTIVE_CONN_FILE)
+        active_data.pop(str(user_id), None)
+        save(ACTIVE_CONN_FILE, active_data)
+        return True
+
+# Legacy single-value alias kept for callback compatibility
+def get_connected_chat(user_id: int) -> int | None:
+    active = get_active_connection(user_id)
+    if active:
+        return active
+    chats = get_connected_chats(user_id)
+    return chats[0] if chats else None
+
+def connect_user(user_id: int, chat_id: int) -> bool:
+    add_user_connection(user_id, chat_id)
     return True
 
 def disconnect_user(user_id: int) -> bool:
-    data = load_user_connections()
-    if str(user_id) not in data:
-        return False
-    data.pop(str(user_id), None)
-    save_user_connections(data)
-    return True
+    return remove_user_connection(user_id)
 
 async def is_chat_admin(bot: Client, chat_id: int, user_id: int) -> bool:
     try:
@@ -715,19 +809,25 @@ async def is_chat_admin(bot: Client, chat_id: int, user_id: int) -> bool:
         return False
 
 async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = True):
+    """Returns the active connected chat_id if valid, else False."""
     if not isinstance(chat, dict) or chat.get("type") != "private":
         return False
-    conn_id = get_connected_chat(user_id)
+    conn_id = get_active_connection(user_id)
     if not conn_id:
-        return False
+        chats = get_connected_chats(user_id)
+        if chats:
+            conn_id = chats[0]
+            set_active_connection(user_id, conn_id)
+        else:
+            return False
     try:
         member = await bot.get_chat_member(conn_id, user_id)
     except Exception:
-        disconnect_user(user_id)
+        remove_user_connection(user_id, conn_id)
         return False
     allowed = member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
     if not allowed and not (allow_connect_to_chat(conn_id) and member.status == enums.ChatMemberStatus.MEMBER):
-        disconnect_user(user_id)
+        remove_user_connection(user_id, conn_id)
         return False
     if need_admin and not allowed:
         return False
@@ -737,7 +837,7 @@ async def allow_connections(bot: Client, msg: dict, args: list[str]) -> str:
     chat = msg.get("chat", {})
     if chat.get("type") == "private":
         return "Please enter on/yes/off/no in group!"
-    user = msg.get("from", {})
+    user    = msg.get("from", {})
     user_id = user.get("id")
     if not user_id:
         return "Please enter on/yes/off/no in group!"
@@ -755,8 +855,8 @@ async def allow_connections(bot: Client, msg: dict, args: list[str]) -> str:
     return "Please enter on/yes/off/no in group!"
 
 async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
-    chat = msg.get("chat", {})
-    user = msg.get("from", {})
+    chat    = msg.get("chat", {})
+    user    = msg.get("from", {})
     user_id = user.get("id")
     if chat.get("type") != "private":
         return "Usage limited to PMs only!"
@@ -774,7 +874,6 @@ async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
         return "Connections to this chat not allowed!"
     except BadRequest:
         return "Invalid Chat ID provided!"
-
     allowed = member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
     if not allowed:
         allowed = allow_connect_to_chat(connect_id) and member.status == enums.ChatMemberStatus.MEMBER
@@ -782,22 +881,185 @@ async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
         return "Connections to this chat not allowed!"
     try:
         target_chat = await bot.get_chat(connect_id)
-        connect_user(user_id, connect_id)
-        return f"Successfully connected to *{target_chat.title}*"
+        add_user_connection(user_id, connect_id)
+        chats = get_connected_chats(user_id)
+        count = len(chats)
+        return (
+            f"✅ Connected to *{target_chat.title}*\n"
+            f"📌 Set as active group\n"
+            f"🔗 Total connected: `{count}`\n\n"
+            f"Use /connections to view & switch groups."
+        )
     except Exception:
         return "Connection failed!"
 
-async def disconnect_chat(bot: Client, msg: dict) -> str:
-    chat = msg.get("chat", {})
-    user = msg.get("from", {})
+async def disconnect_chat(bot: Client, msg: dict, args: list[str]) -> str:
+    chat    = msg.get("chat", {})
+    user    = msg.get("from", {})
     user_id = user.get("id")
     if chat.get("type") != "private":
         return "Usage restricted to PMs only"
     if not user_id:
         return "Invalid user!"
-    if disconnect_user(user_id):
-        return "Disconnected from chat!"
-    return "Disconnection unsuccessful!"
+    # /disconnect all
+    if args and args[0].lower() == "all":
+        remove_user_connection(user_id)
+        return "✅ Disconnected from all groups."
+    # /disconnect <chat_id>
+    if args:
+        try:
+            cid = int(args[0])
+            if remove_user_connection(user_id, cid):
+                return f"✅ Disconnected from `{cid}`."
+            return "❌ You were not connected to that group."
+        except ValueError:
+            return "❌ Invalid chat ID."
+    # /disconnect — remove active
+    active = get_active_connection(user_id)
+    if active:
+        remove_user_connection(user_id, active)
+        remaining = get_connected_chats(user_id)
+        if remaining:
+            new_active = get_active_connection(user_id)
+            try:
+                chat_obj = await bot.get_chat(new_active)
+                return f"✅ Disconnected. Active group switched to *{chat_obj.title}*."
+            except Exception:
+                return f"✅ Disconnected. Active group: `{new_active}`."
+        return "✅ Disconnected from active group."
+    return "You are not connected to any group."
+
+# =========================================================
+# NOTES SYSTEM (Miss Rose style)
+# =========================================================
+
+def _notes_for_chat(chat_id: int) -> dict:
+    cache_key = f"notes:{chat_id}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    data   = load(NOTES_FILE)
+    result = data.get(str(chat_id), {})
+    _cache.set(cache_key, result)
+    return result
+
+def _save_notes_for_chat(chat_id: int, notes: dict):
+    data = load(NOTES_FILE)
+    data[str(chat_id)] = notes
+    save(NOTES_FILE, data)
+    _cache.invalidate(f"notes:{chat_id}")
+
+def note_get(chat_id: int, name: str) -> dict | None:
+    return _notes_for_chat(chat_id).get(name.lower().strip())
+
+def note_save(
+    chat_id: int, name: str, content: str,
+    note_type: str = "text", file_id: str = None,
+    created_by: int = None,
+):
+    notes = _notes_for_chat(chat_id)
+    notes[name.lower().strip()] = {
+        "content":    content,
+        "type":       note_type,
+        "file_id":    file_id,
+        "created_by": created_by,
+        "updated_at": str(datetime.now()),
+    }
+    _save_notes_for_chat(chat_id, notes)
+
+def note_delete(chat_id: int, name: str) -> bool:
+    notes = _notes_for_chat(chat_id)
+    key   = name.lower().strip()
+    if key not in notes:
+        return False
+    del notes[key]
+    _save_notes_for_chat(chat_id, notes)
+    return True
+
+def note_list(chat_id: int) -> list[str]:
+    return sorted(_notes_for_chat(chat_id).keys())
+
+def note_count(chat_id: int) -> int:
+    return len(_notes_for_chat(chat_id))
+
+# =========================================================
+# FILTERS SYSTEM (Miss Rose style)
+# =========================================================
+
+def _filters_for_chat(chat_id: int) -> dict:
+    cache_key = f"filters:{chat_id}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    data   = load(FILTERS_FILE)
+    result = data.get(str(chat_id), {})
+    _cache.set(cache_key, result)
+    return result
+
+def _save_filters_for_chat(chat_id: int, filters: dict):
+    data = load(FILTERS_FILE)
+    data[str(chat_id)] = filters
+    save(FILTERS_FILE, data)
+    _cache.invalidate(f"filters:{chat_id}")
+
+def filter_add(
+    chat_id: int, keyword: str, response: str,
+    match_type: str = "contains", created_by: int = None,
+):
+    """
+    match_type: "contains" | "exact" | "startswith" | "regex"
+    """
+    filters = _filters_for_chat(chat_id)
+    filters[keyword.lower().strip()] = {
+        "response":   response,
+        "match_type": match_type,
+        "created_by": created_by,
+        "updated_at": str(datetime.now()),
+    }
+    _save_filters_for_chat(chat_id, filters)
+
+def filter_remove(chat_id: int, keyword: str) -> bool:
+    filters = _filters_for_chat(chat_id)
+    key     = keyword.lower().strip()
+    if key not in filters:
+        return False
+    del filters[key]
+    _save_filters_for_chat(chat_id, filters)
+    return True
+
+def filter_list(chat_id: int) -> list[str]:
+    return sorted(_filters_for_chat(chat_id).keys())
+
+def filter_count(chat_id: int) -> int:
+    return len(_filters_for_chat(chat_id))
+
+def filter_check(chat_id: int, text: str) -> tuple[str | None, dict | None]:
+    """Return (keyword, filter_data) if a filter matches, else (None, None)."""
+    if not text:
+        return None, None
+    filters    = _filters_for_chat(chat_id)
+    text_lower = text.lower()
+    for keyword, fdata in filters.items():
+        match_type = fdata.get("match_type", "contains")
+        matched = False
+        if match_type == "exact":
+            matched = text_lower == keyword
+        elif match_type == "startswith":
+            matched = text_lower.startswith(keyword)
+        elif match_type == "regex":
+            try:
+                matched = bool(re.search(keyword, text, re.IGNORECASE))
+            except re.error:
+                pass
+        else:  # contains (default)
+            matched = keyword in text_lower
+        if matched:
+            return keyword, fdata
+    return None, None
+
+# =========================================================
+# MISC HELPERS
+# =========================================================
 
 def is_protected(uid: int) -> bool:
     cache_key = f"protected:{uid}"
@@ -853,7 +1115,6 @@ def parse_positive_user_id(value: str) -> int | None:
         return None
 
 def resolve_target(reply, args, idx) -> tuple[dict, int | None, str | None]:
-    """Sync resolver: handles reply or numeric user ID only."""
     target, tid = extract_reply_user(reply)
     if tid:
         return target, tid, None
@@ -864,11 +1125,9 @@ def resolve_target(reply, args, idx) -> tuple[dict, int | None, str | None]:
         return {}, None, "❌ Invalid user ID."
     return {}, None, "❌ Reply to a user or pass their user ID."
 
-# [FIX-10] Async resolver that also handles @username arguments
 async def resolve_target_ext(
     bot: Client, reply, args, idx
 ) -> tuple[dict, int | None, str | None]:
-    """Async resolver: handles reply, @username, or numeric user ID."""
     target, tid = extract_reply_user(reply)
     if tid:
         return target, tid, None
@@ -945,13 +1204,11 @@ def warn(user_id: int, chat_id: int, reason: str, warner: str | None = None) -> 
     warns.setdefault(key, 0)
     warns[key] += 1
     save(WARN_FILE, warns)
-
     cfg = get_warn_config()
     threshold   = int(cfg.get("threshold", 3))
     auto_action = cfg.get("action", "mute")
     moderator_tag = warner or "Automated warn filter"
     num = warns[key]
-
     if num >= threshold:
         warns[key] = 0
         save(WARN_FILE, warns)
@@ -1147,7 +1404,6 @@ async def build_admin_list_text(bot: Client, chat_id: int) -> str:
         lines.append("No administrators found.")
     return "\n".join(lines)
 
-# [FIX-8] Excludes the bot itself and accepts bot_id parameter
 async def scan_zombies(bot: Client, chat_id: int, bot_id: int) -> tuple[int, int, list[str]]:
     kicked_deleted = 0
     kicked_bots    = 0
@@ -1158,7 +1414,6 @@ async def scan_zombies(bot: Client, chat_id: int, bot_id: int) -> tuple[int, int
             continue
         if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
             continue
-        # [FIX-8] Never kick the bot itself
         if user.id == bot_id:
             continue
         is_deleted = bool(getattr(user, "is_deleted", False))
@@ -1224,13 +1479,24 @@ def role_help_text(uid: int) -> str:
             "`/hgrant <perm> <user_id>` - Grant one permission\n"
             "`/hfreeze <user_id>` - Freeze moderator account\n"
             "`/hunfreeze <user_id>` - Unfreeze moderator account\n"
-            "`/hbadge <user_id> <badge text>` - Set mod badge/title\n"
-            "Permissions: ban, unban, mute, unmute, kick, warn, delete, pin\n\n"
+            "`/hbadge <user_id> <badge text>` - Set mod badge/title\n\n"
             "⚙️ **Warn Configuration:**\n"
             "`/hwarnconfig threshold <n>` - Set warn threshold\n"
             "`/hwarnconfig action <ban|mute|kick>` - Set auto-action\n"
             "`/hwarnconfig duration <e.g. 1h>` - Set auto-action duration\n"
             "`/hwarnconfig show` - Show current config\n\n"
+            "📋 **Notes (group-scoped):**\n"
+            "`/save <name> <text>` - Save a text note\n"
+            "`/save <name>` (reply) - Save replied message as note\n"
+            "`/get <name>` or `#name` - Retrieve a note\n"
+            "`/clear <name>` - Delete a note\n"
+            "`/notes` - List all notes\n\n"
+            "🔍 **Filters (auto-reply keywords):**\n"
+            "`/filter <keyword> <response>` - Add a filter\n"
+            "`/filter -regex <pattern> <response>` - Regex filter\n"
+            "`/filter -exact <keyword> <response>` - Exact-match filter\n"
+            "`/stop <keyword>` - Remove a filter\n"
+            "`/filters` - List all filters\n\n"
             "🛡️ **Protection Commands:**\n"
             "`/hprotect <user_id>` - Protect user from moderation\n"
             "`/hunprotect <user_id>` - Remove user protection\n\n"
@@ -1246,21 +1512,18 @@ def role_help_text(uid: int) -> str:
             "`/hdel` - Delete replied message\n"
             "`/hcase <case_id>` - View case details\n"
             "`/hmodinfo [user_id]` - View moderator info\n\n"
-            "🔗 **Connections:**\n"
+            "🔗 **Connections (PM multi-group):**\n"
             "`/allowconnections yes|no` - Allow PM connection to this group\n"
-            "`/connect <chat_id>` - Connect this PM to a group\n"
-            "`/disconnect` - Disconnect this PM from the current group\n\n"
+            "`/connect <chat_id>` - Connect PM to a group\n"
+            "`/connections` - List & switch connected groups\n"
+            "`/disconnect [chat_id|all]` - Disconnect from a group\n\n"
             "🎮 **Games:**\n"
             "`/ttt [user_id]` - Start Tic-Tac-Toe\n"
             "`/tttleaderboard` - Show top players\n"
             "`/tttmystats` - Show your game stats\n"
             "`/tttend` - Forfeit active game\n\n"
-            "⏱️ **Duration Format:** 30m, 2h, 1d\n\n"
-            "💡 **Tip:** Reply to a message to target without ID\n\n"
-            "📖 **Examples:**\n"
-            "`/hban @user 2h spam` - Ban for 2 hours\n"
-            "`/hmute 123456789 30m abuse` - Mute for 30 mins\n"
-            "`/hrevoke all 123456789` - Revoke all permissions\n"
+            "⏱️ **Duration Format:** 30m, 2h, 1d\n"
+            "💡 **Tip:** Reply to a message to target without ID\n"
         )
     if is_authorized(uid):
         return (
@@ -1276,21 +1539,28 @@ def role_help_text(uid: int) -> str:
             "`/hstats` - Show moderation stats\n"
             "`/hwarn [user_id/@user] [reason]` - Warn user\n"
             "`/hdel` - Delete replied message\n\n"
+            "📋 **Notes:**\n"
+            "`/save <name> <text>` - Save a note\n"
+            "`/get <name>` or `#name` - Get a note\n"
+            "`/clear <name>` - Delete a note\n"
+            "`/notes` - List all notes\n\n"
+            "🔍 **Filters:**\n"
+            "`/filter <keyword> <response>` - Add keyword auto-reply\n"
+            "`/stop <keyword>` - Remove a filter\n"
+            "`/filters` - List all filters\n\n"
             "📋 **Information Commands:**\n"
             "`/hcase <case_id>` - View case details\n"
             "`/hmod list` - List authorized moderators\n"
             "`/hmodinfo` - View your moderator info\n"
             "`/hr` - Get user information\n\n"
+            "🔗 **Connections:**\n"
+            "`/connect <chat_id>` - Connect PM to a group\n"
+            "`/connections` - List & switch connected groups\n"
+            "`/disconnect [chat_id|all]` - Disconnect\n\n"
             "🎮 **Games:**\n"
             "`/ttt [user_id]` - Start Tic-Tac-Toe\n"
-            "`/tttleaderboard` - Show top players\n"
-            "`/tttmystats` - Show your game stats\n"
-            "`/tttend` - Forfeit active game\n\n"
-            "⏱️ **Duration Format:** 30m, 2h, 1d\n\n"
-            "💡 **Tip:** Reply to a message or use @username / user ID\n\n"
-            "📖 **Examples:**\n"
-            "`/hban @user 30m spam` - Ban for 30 minutes\n"
-            "`/hwarn 123456789 off-topic` - Issue warning\n"
+            "`/tttleaderboard` - Show top players\n\n"
+            "⏱️ **Duration Format:** 30m, 2h, 1d\n"
         )
     return (
         "╔════════════════════════════════════════╗\n"
@@ -1304,12 +1574,13 @@ def role_help_text(uid: int) -> str:
         "`/tttleaderboard` - Show top players\n"
         "`/tttmystats` - Show your game stats\n"
         "`/tttend` - Forfeit active game\n\n"
+        "📋 **Notes:**\n"
+        "`/get <name>` or `#name` - Get a saved note\n"
+        "`/notes` - List available notes\n\n"
         "📢 **Appeals:**\n"
-        "Disputed a moderation action?\n"
-        "Use `/happeal <case_id> <message>` in bot DM\n\n"
+        "`/happeal <case_id> <message>` in bot DM\n\n"
         "📞 **Support:**\n"
-        "Contact your group administrator for assistance\n\n"
-        "✨ *For more features, ask a group moderator*"
+        "Contact your group administrator for assistance\n"
     )
 
 # =========================================================
@@ -1333,7 +1604,7 @@ def build_markup(*rows) -> dict:
 # =========================================================
 
 _bot: Client       = None
-_bot_id: int       = 0   # cached at startup
+_bot_id: int       = 0
 bot_ready: bool    = False
 _temp_worker_task  = None
 _games_worker_task = None
@@ -1397,7 +1668,7 @@ async def resolve_log_group(bot: Client):
         log_msg("⚠️ LOG_GROUP_ID not set. Log messages will be skipped.", "WARNING")
         await tg_send(OWNER_ID, "⚠️ Set LOG_GROUP_ID in Koyeb env vars. Auto-detection unavailable for bots.")
         return
-    _log_group_id   = groups[0]
+    _log_group_id = groups[0]
     if _backup_chat_id == 0:
         _backup_chat_id = _log_group_id
     _tg_backup_enabled = True
@@ -1443,7 +1714,6 @@ async def anti_nuke(chat_id: int, reply_to: int, uid: int, is_anon: bool = False
     total = track_action(uid)
     if total < 10:
         return False
-    # [FIX-9] Only try to freeze if this is a real mod (not anon admin)
     if not is_anon:
         auth = load(AUTH_FILE)
         if str(uid) in auth:
@@ -1673,23 +1943,37 @@ async def webhook(request: Request):
 
 async def handle_message(bot: Client, msg: dict):
     try:
-        text = msg.get("text", "")
+        text     = msg.get("text", "")
+        chat_id  = msg["chat"]["id"]
+        msg_id   = msg["message_id"]
+        is_private = msg.get("chat", {}).get("type") == "private"
+        uid, err, is_anon_admin = extract_actor_user_id(msg)
+        reply    = msg.get("reply_to_message") or {}
+
+        # ── Non-command messages: filters + #note triggers ────────────────
         if not text.startswith("/"):
+            if not is_private and text:
+                # 1) Check for #notename trigger (anywhere in the text)
+                hashtags = re.findall(r'#(\w+)', text)
+                for tag in hashtags:
+                    note = note_get(chat_id, tag.lower())
+                    if note:
+                        await tg_send(chat_id, note["content"], reply_to=msg_id)
+                        return  # only respond to the first matching note
+
+                # 2) Check filters
+                keyword, fdata = filter_check(chat_id, text)
+                if keyword and fdata:
+                    await tg_send(chat_id, fdata["response"], reply_to=msg_id)
             return
 
-        chat_id              = msg["chat"]["id"]
-        msg_id               = msg["message_id"]
-        uid, err, is_anon_admin = extract_actor_user_id(msg)
-        reply                = msg.get("reply_to_message") or {}
-
+        # ── Parse command ─────────────────────────────────────────────────
         parts   = text.split(None, 1)
         raw_cmd = parts[0].split("@")[0].lstrip("/").lower()
         args    = parts[1].split() if len(parts) > 1 else []
 
         actor_label = f"anon_admin:{chat_id}" if is_anon_admin else str(uid)
         log_msg(f"/{raw_cmd} from actor={actor_label} chat={chat_id}", "INFO")
-
-        is_private = msg.get("chat", {}).get("type") == "private"
 
         async def reply_text(t: str):
             sent = await tg_send(chat_id, t, reply_to=msg_id)
@@ -1713,10 +1997,13 @@ async def handle_message(bot: Client, msg: dict):
         if is_private and raw_cmd in MODERATION_COMMANDS:
             resolved = await connected(bot, msg.get("chat", {}), uid, need_admin=False)
             if not resolved:
-                return await reply_text("You are not connected to any group. Use /connect <chat_id> in PM.")
+                return await reply_text(
+                    "❌ You are not connected to any group.\n"
+                    "Use `/connect <chat_id>` to connect."
+                )
             action_chat_id = resolved
 
-        # ── Actor helpers ─────────────────────────────────
+        # ── Actor helpers ─────────────────────────────────────────────────
         def is_owner_actor() -> bool:
             return (not is_anon_admin) and is_owner(uid)
 
@@ -1749,28 +2036,61 @@ async def handle_message(bot: Client, msg: dict):
                 return False
             return True
 
-        # ── /allowconnections ─────────────────────────────
+        # ── /allowconnections ─────────────────────────────────────────────
         if raw_cmd == "allowconnections":
             message = await allow_connections(bot, msg, args)
             if message:
                 await reply_text(message)
             return
 
-        # ── /connect ─────────────────────────────────────
+        # ── /connect ──────────────────────────────────────────────────────
         if raw_cmd == "connect":
             message = await connect_chat(bot, msg, args)
             if message:
                 await reply_text(message)
             return
 
-        # ── /disconnect ──────────────────────────────────
+        # ── /disconnect ───────────────────────────────────────────────────
         if raw_cmd == "disconnect":
-            message = await disconnect_chat(bot, msg)
+            message = await disconnect_chat(bot, msg, args)
             if message:
                 await reply_text(message)
             return
 
-        # ── /start ────────────────────────────────────────
+        # ── /connections — list all connected groups ───────────────────────
+        if raw_cmd == "connections":
+            if not is_private:
+                return await reply_text("Use /connections in bot DM.")
+            chats = get_connected_chats(uid)
+            active = get_active_connection(uid)
+            if not chats:
+                return await reply_text(
+                    "You are not connected to any group.\n"
+                    "Use `/connect <chat_id>` to connect."
+                )
+            lines = ["🔗 **Your Connected Groups**\n"]
+            rows  = []
+            for cid in chats:
+                label = f"`{cid}`"
+                try:
+                    chat_obj = await bot.get_chat(cid)
+                    label = chat_obj.title
+                except Exception:
+                    pass
+                star = " ⭐" if cid == active else ""
+                lines.append(f"• {label}{star} (`{cid}`)")
+                btn_text = f"✅ Active" if cid == active else f"Switch → {label[:20]}"
+                rows.append([(btn_text, f"cb:setactive_{cid}")])
+            markup = build_markup(*rows)
+            await tg_send(
+                chat_id,
+                "\n".join(lines) + "\n\n⭐ = currently active group",
+                reply_to=msg_id,
+                markup=markup,
+            )
+            return
+
+        # ── /start ────────────────────────────────────────────────────────
         if raw_cmd == "start":
             await reply_text(
                 "🛡️ **SentriX Prime**\n\n"
@@ -1778,6 +2098,8 @@ async def handle_message(bot: Client, msg: dict):
                 "**Quick Commands**\n"
                 "• `/help` - Role-based commands\n"
                 "• `/hr` - User insights\n"
+                "• `/notes` - Group notes\n"
+                "• `/filters` - Active filters\n"
                 "• `/ttt` - Tic-Tac-Toe battle\n"
                 "• `/happeal` - Appeal in DM\n\n"
                 "👨‍💻 Developed by @dreamm\_ca\n"
@@ -1786,7 +2108,7 @@ async def handle_message(bot: Client, msg: dict):
             )
             return
 
-        # ── /help ─────────────────────────────────────────
+        # ── /help ─────────────────────────────────────────────────────────
         if raw_cmd == "help":
             if is_anon_admin:
                 await reply_text(
@@ -1794,7 +2116,8 @@ async def handle_message(bot: Client, msg: dict):
                     "You can use moderation commands while posting anonymously:\n"
                     "`/hban`, `/hkick`, `/hmute`, `/hunban`, `/hunmute`, `/hstats`, "
                     "`/hwarn`, `/hdel`, `/hcase`, `/hmod list`, `/hmodinfo`, `/hr`, "
-                    "`/pin`, `/unpin`, `/adminlist`, `/zombies`\n\n"
+                    "`/pin`, `/unpin`, `/adminlist`, `/zombies`, `/save`, `/get`, "
+                    "`/clear`, `/notes`, `/filter`, `/stop`, `/filters`\n\n"
                     "Owner-only commands (`/hauth`, `/hgrant`, `/hrevoke`, `/hprotect`, "
                     "`/hunprotect`, `/hfreeze`, `/hunfreeze`, `/hbadge`, `/hwarnconfig`) "
                     "require a normal account identity."
@@ -1803,7 +2126,7 @@ async def handle_message(bot: Client, msg: dict):
                 await reply_text(role_help_text(uid))
             return
 
-        # ── /hr ───────────────────────────────────────────
+        # ── /hr ───────────────────────────────────────────────────────────
         if raw_cmd in ("hr", "id"):
             try:
                 target_id   = None
@@ -1813,7 +2136,6 @@ async def handle_message(bot: Client, msg: dict):
                     if is_anon_admin:
                         return await reply_text("❌ `me` unavailable in anonymous mode.")
                     target_id = uid
-
                 elif args and args[0].startswith("@"):
                     username = args[0][1:]
                     try:
@@ -1821,8 +2143,7 @@ async def handle_message(bot: Client, msg: dict):
                         target_id   = target_user.id
                     except Exception as e:
                         return await reply_text(f"❌ User @{username} not found: {e}")
-
-                elif args and args[0].isdigit():
+                elif args and args[0].lstrip("-").isdigit():
                     parsed_id = parse_positive_user_id(args[0])
                     if parsed_id:
                         target_id = parsed_id
@@ -1832,7 +2153,6 @@ async def handle_message(bot: Client, msg: dict):
                             return await reply_text(f"❌ User ID {target_id} not found: {e}")
                     else:
                         return await reply_text("❌ Invalid user ID.")
-
                 elif reply:
                     target_dict, tid, terr = resolve_target(reply, [], 0)
                     if tid:
@@ -1870,7 +2190,7 @@ async def handle_message(bot: Client, msg: dict):
                 log_msg(f"Error in /hr: {e}\n{traceback.format_exc()}", "ERROR")
                 return await reply_text(f"❌ Error: {e}")
 
-        # ── /ttt commands ─────────────────────────────────
+        # ── /ttt commands ─────────────────────────────────────────────────
         if raw_cmd in ("ttt", "ttt_game"):
             await handle_ttt_command(bot, msg, args, reply, uid, chat_id, msg_id)
             return
@@ -1884,7 +2204,7 @@ async def handle_message(bot: Client, msg: dict):
             await handle_ttt_end(uid, chat_id, msg_id, is_owner=is_owner_actor())
             return
 
-        # ── /happeal ──────────────────────────────────────
+        # ── /happeal ──────────────────────────────────────────────────────
         if raw_cmd == "happeal":
             if not is_private:
                 return await reply_text("❌ Use /happeal in bot DM only.")
@@ -1905,7 +2225,191 @@ async def handle_message(bot: Client, msg: dict):
             await notify_owner(f"📨 New appeal #{aid}\nCase: #{case_id}\nUser: `{uid}`\n{appeal_msg}")
             return
 
-        # ── /hauth ────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════
+        # NOTES COMMANDS
+        # ══════════════════════════════════════════════════════════════════
+
+        # ── /save <name> [content] ──────────────────────────────────────
+        if raw_cmd == "save":
+            if not is_authorized_actor():
+                return await security_fail()
+            if not args:
+                return await reply_text(
+                    "❌ Usage:\n"
+                    "`/save <name> <content>` — save text as note\n"
+                    "`/save <name>` + reply — save replied message as note"
+                )
+            note_name = args[0].lower().strip()
+            if len(note_name) > 64:
+                return await reply_text("❌ Note name too long (max 64 chars).")
+
+            # Content from args or from replied message
+            if len(args) > 1:
+                content = " ".join(args[1:]).strip()
+            elif reply:
+                content = reply.get("text") or reply.get("caption") or ""
+                if not content:
+                    return await reply_text("❌ Replied message has no text to save.")
+            else:
+                return await reply_text(
+                    "❌ Provide content after the name, or reply to a message.\n"
+                    "Example: `/save rules No spamming!`"
+                )
+
+            note_save(action_chat_id, note_name, content, created_by=uid)
+            await reply_text(f"📋 Note `{note_name}` saved! Get it with `/get {note_name}` or `#{note_name}`.")
+            return
+
+        # ── /get <name> ─────────────────────────────────────────────────
+        if raw_cmd == "get":
+            if not args:
+                return await reply_text("Usage: `/get <name>`")
+            note_name = args[0].lower().strip()
+            note = note_get(action_chat_id, note_name)
+            if not note:
+                return await reply_text(f"❌ Note `{note_name}` not found.\nUse `/notes` to see all saved notes.")
+            await tg_send(chat_id, note["content"], reply_to=msg_id)
+            return
+
+        # ── /clear <name> ───────────────────────────────────────────────
+        if raw_cmd == "clear":
+            if not is_authorized_actor():
+                return await security_fail()
+            if not args:
+                return await reply_text("Usage: `/clear <name>`")
+            note_name = args[0].lower().strip()
+            if note_delete(action_chat_id, note_name):
+                await reply_text(f"🗑️ Note `{note_name}` deleted.")
+            else:
+                await reply_text(f"❌ Note `{note_name}` not found.")
+            return
+
+        # ── /notes ──────────────────────────────────────────────────────
+        if raw_cmd == "notes":
+            names = note_list(action_chat_id)
+            if not names:
+                return await reply_text(
+                    "📋 No notes saved in this group yet.\n"
+                    "Use `/save <name> <text>` to add one."
+                )
+            # Build inline keyboard: 3 notes per row
+            note_rows = []
+            row = []
+            for i, name in enumerate(names):
+                row.append((f"#{name}", f"cb:getnote_{name}"))
+                if len(row) == 3:
+                    note_rows.append(row)
+                    row = []
+            if row:
+                note_rows.append(row)
+            markup = build_markup(*note_rows)
+            await tg_send(
+                chat_id,
+                f"📋 **Notes in this group** — `{len(names)}` saved\n\n"
+                + "\n".join(f"• `#{n}`" for n in names)
+                + "\n\nTap a button or type `#notename` to retrieve.",
+                reply_to=msg_id,
+                markup=markup,
+            )
+            return
+
+        # ══════════════════════════════════════════════════════════════════
+        # FILTERS COMMANDS
+        # ══════════════════════════════════════════════════════════════════
+
+        # ── /filter <keyword> <response> ─────────────────────────────────
+        if raw_cmd == "filter":
+            if not is_authorized_actor():
+                return await security_fail()
+            if len(args) < 2:
+                return await reply_text(
+                    "❌ Usage:\n"
+                    "`/filter <keyword> <response>` — contains match (default)\n"
+                    "`/filter -exact <keyword> <response>` — exact message match\n"
+                    "`/filter -start <keyword> <response>` — message starts with\n"
+                    "`/filter -regex <pattern> <response>` — regex match\n\n"
+                    "Example: `/filter spam You cannot spam here!`"
+                )
+            # Parse optional match-type flag
+            match_type = "contains"
+            arg_start  = 0
+            if args[0].startswith("-"):
+                flag = args[0].lower()
+                flag_map = {
+                    "-exact":   "exact",
+                    "-start":   "startswith",
+                    "-regex":   "regex",
+                    "-contains":"contains",
+                }
+                if flag in flag_map:
+                    match_type = flag_map[flag]
+                    arg_start  = 1
+                else:
+                    return await reply_text(f"❌ Unknown flag `{flag}`. Valid: -exact, -start, -regex, -contains")
+            if len(args) < arg_start + 2:
+                return await reply_text("❌ Provide both a keyword and a response.")
+            keyword  = args[arg_start].lower().strip()
+            response = " ".join(args[arg_start + 1:]).strip()
+            if len(keyword) > 128:
+                return await reply_text("❌ Keyword too long (max 128 chars).")
+            if not response:
+                return await reply_text("❌ Response text cannot be empty.")
+            # Validate regex
+            if match_type == "regex":
+                try:
+                    re.compile(keyword)
+                except re.error as e:
+                    return await reply_text(f"❌ Invalid regex pattern: `{e}`")
+            filter_add(action_chat_id, keyword, response, match_type=match_type, created_by=uid)
+            await reply_text(
+                f"✅ Filter added!\n"
+                f"🔑 Keyword: `{keyword}`\n"
+                f"🔍 Match: `{match_type}`\n"
+                f"💬 Response: {response[:80]}{'...' if len(response) > 80 else ''}"
+            )
+            return
+
+        # ── /stop <keyword> ───────────────────────────────────────────────
+        if raw_cmd == "stop":
+            if not is_authorized_actor():
+                return await security_fail()
+            if not args:
+                return await reply_text("Usage: `/stop <keyword>`")
+            keyword = args[0].lower().strip()
+            if filter_remove(action_chat_id, keyword):
+                await reply_text(f"✅ Filter `{keyword}` removed.")
+            else:
+                await reply_text(
+                    f"❌ No filter found for `{keyword}`.\n"
+                    "Use `/filters` to see all active filters."
+                )
+            return
+
+        # ── /filters ──────────────────────────────────────────────────────
+        if raw_cmd == "filters":
+            keywords = filter_list(action_chat_id)
+            if not keywords:
+                return await reply_text(
+                    "🔍 No filters active in this group.\n"
+                    "Use `/filter <keyword> <response>` to add one."
+                )
+            fdata_all = _filters_for_chat(action_chat_id)
+            lines     = [f"🔍 **Active Filters** — `{len(keywords)}`\n"]
+            for kw in keywords:
+                fd   = fdata_all.get(kw, {})
+                mt   = fd.get("match_type", "contains")
+                resp = fd.get("response", "")[:50]
+                lines.append(f"• `{kw}` [{mt}] → _{resp}_")
+            await reply_text(
+                "\n".join(lines) + "\n\nUse `/stop <keyword>` to remove a filter."
+            )
+            return
+
+        # ══════════════════════════════════════════════════════════════════
+        # OWNER COMMANDS
+        # ══════════════════════════════════════════════════════════════════
+
+        # ── /hauth ────────────────────────────────────────────────────────
         if raw_cmd in ("hauth", "ha"):
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
@@ -1930,8 +2434,7 @@ async def handle_message(bot: Client, msg: dict):
                 await tg_send(lg, f"✅ Moderator authorized\n👤 {make_mention(target)} (`{tid}`)\n🛡 By: `{uid}`")
             return
 
-        # ── /hgrant ───────────────────────────────────────
-        # [FIX-2] Fixed perm+reply resolution logic
+        # ── /hgrant ───────────────────────────────────────────────────────
         if raw_cmd in ("hgrant", "hg"):
             if not is_owner_actor():
                 return
@@ -1946,13 +2449,11 @@ async def handle_message(bot: Client, msg: dict):
             terr   = None
 
             if args[0].lower() in VALID_PERMISSIONS:
-                # /hgrant <perm> — target is reply or args[1]
                 perm = args[0].lower()
                 target, tid, terr = await resolve_target_ext(bot, reply, args, 1)
                 if not tid:
                     return await reply_text(terr or "❌ Reply to a user or pass their user ID.")
             else:
-                # /hgrant <user_id> — grant all
                 target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
                 if not tid:
                     return await reply_text(terr)
@@ -1974,7 +2475,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_grant_log(chat_id, msg_id, uid, target, perm, case_id)
             return
 
-        # ── /hrevoke ──────────────────────────────────────
+        # ── /hrevoke ──────────────────────────────────────────────────────
         if raw_cmd in ("hrevoke", "hrev"):
             if not is_owner_actor():
                 return
@@ -2011,7 +2512,7 @@ async def handle_message(bot: Client, msg: dict):
                 )
             return
 
-        # ── /hfreeze ──────────────────────────────────────
+        # ── /hfreeze ──────────────────────────────────────────────────────
         if raw_cmd == "hfreeze":
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
@@ -2031,7 +2532,7 @@ async def handle_message(bot: Client, msg: dict):
                 await tg_send(lg, f"🧊 Moderator frozen\n👤 {make_mention(target)} (`{tid}`)\n🛡 By: `{uid}`")
             return
 
-        # ── /hunfreeze ────────────────────────────────────
+        # ── /hunfreeze ────────────────────────────────────────────────────
         if raw_cmd == "hunfreeze":
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
@@ -2051,14 +2552,13 @@ async def handle_message(bot: Client, msg: dict):
                 await tg_send(lg, f"🔥 Moderator unfrozen\n👤 {make_mention(target)} (`{tid}`)\n🛡 By: `{uid}`")
             return
 
-        # ── /hbadge ───────────────────────────────────────
+        # ── /hbadge ───────────────────────────────────────────────────────
         if raw_cmd == "hbadge":
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /hbadge <user_id> <badge text>")
-            # Badge text: everything after the user ID argument
             badge_start = 0 if reply else 1
             badge_text  = extract_reason(args, badge_start, "").strip()
             if not badge_text:
@@ -2071,7 +2571,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(f"🏷️ Badge set to `{badge_text}` for {make_mention(target)}")
             return
 
-        # ── /hwarnconfig ──────────────────────────────────
+        # ── /hwarnconfig ──────────────────────────────────────────────────
         if raw_cmd == "hwarnconfig":
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
@@ -2112,23 +2612,25 @@ async def handle_message(bot: Client, msg: dict):
             else:
                 return await reply_text("❌ Unknown option. Use: threshold / action / duration / show")
 
-        # ── /hban ─────────────────────────────────────────
+        # ══════════════════════════════════════════════════════════════════
+        # MODERATION COMMANDS
+        # ══════════════════════════════════════════════════════════════════
+
+        # ── /hban ─────────────────────────────────────────────────────────
         if raw_cmd in ("hban", "hb"):
             if not await check_mod("ban"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /hban <user_id/@user> [duration] [reason]")
-            # [FIX-4] Self-ban protection
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot ban yourself.")
-            # [FIX-3] Admin status check
             try:
                 member = await bot.get_chat_member(action_chat_id, tid)
                 if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                     return await reply_text("❌ Cannot ban an admin or the group owner.")
             except UserNotParticipant:
-                pass  # not in chat — ban still valid (prevents rejoining)
+                pass
             except Exception:
                 pass
             rs = 0 if reply else 1
@@ -2151,17 +2653,15 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "BAN", target, reason, case_id, actor_mod_info())
             return
 
-        # ── /hkick ────────────────────────────────────────
+        # ── /hkick ────────────────────────────────────────────────────────
         if raw_cmd in ("hkick", "hk"):
             if not await check_mod("kick"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /hkick <user_id/@user> [reason]")
-            # [FIX-4] Self-kick protection
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot kick yourself.")
-            # [FIX-3] Admin status check
             try:
                 member = await bot.get_chat_member(action_chat_id, tid)
                 if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
@@ -2183,7 +2683,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "KICK", target, reason, case_id, actor_mod_info())
             return
 
-        # ── /hmute ────────────────────────────────────────
+        # ── /hmute ────────────────────────────────────────────────────────
         if raw_cmd in ("hmute", "hm"):
             if not await check_mod("mute"):
                 return
@@ -2198,7 +2698,6 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("This user isn't in the chat!")
             except BadRequest as exc:
                 return await reply_text(f"❌ Could not check the target user: {exc}")
-
             if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                 return await reply_text("Afraid I can't stop an admin from talking!")
             if tid == _bot_id:
@@ -2221,7 +2720,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "MUTE", target, reason, case_id, actor_mod_info())
             return
 
-        # ── /hunban ───────────────────────────────────────
+        # ── /hunban ───────────────────────────────────────────────────────
         if raw_cmd in ("hunban", "hub"):
             if not await check_mod("unban"):
                 return
@@ -2230,7 +2729,6 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hunban <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
-            # [FIX-5] Anti-nuke check
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
             ok, err = await api_unban(action_chat_id, tid)
@@ -2241,7 +2739,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "UNBAN", target, reason, case_id, actor_mod_info())
             return
 
-        # ── /hunmute ──────────────────────────────────────
+        # ── /hunmute ──────────────────────────────────────────────────────
         if raw_cmd in ("hunmute", "hum"):
             if not await check_mod("unmute"):
                 return
@@ -2256,10 +2754,8 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("This user isn't even in the chat!")
             except BadRequest as exc:
                 return await reply_text(f"❌ Could not check the target user: {exc}")
-
             if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                 return await reply_text("This user already has the right to speak.")
-            # [FIX-5] Anti-nuke check
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
             ok, err = await api_unmute(action_chat_id, tid)
@@ -2270,7 +2766,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "UNMUTE", target, reason, case_id, actor_mod_info())
             return
 
-        # ── /pin ──────────────────────────────────────────
+        # ── /pin ──────────────────────────────────────────────────────────
         if raw_cmd == "pin":
             if not await check_mod("pin"):
                 return
@@ -2285,7 +2781,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text("📌 Message pinned.")
             return
 
-        # ── /unpin ────────────────────────────────────────
+        # ── /unpin ────────────────────────────────────────────────────────
         if raw_cmd == "unpin":
             if not await check_mod("pin"):
                 return
@@ -2295,21 +2791,20 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text("📍 Pinned message removed.")
             return
 
-        # ── /adminlist ────────────────────────────────────
+        # ── /adminlist ────────────────────────────────────────────────────
         if raw_cmd == "adminlist":
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
             await reply_text(await build_admin_list_text(bot, action_chat_id))
             return
 
-        # ── /zombies ──────────────────────────────────────
+        # ── /zombies ──────────────────────────────────────────────────────
         if raw_cmd == "zombies":
             if not await check_mod("kick"):
                 return
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
             await reply_text("🔎 Scanning for deleted/bot accounts...")
-            # [FIX-8] Pass bot_id to exclude the bot itself
             kicked_deleted, kicked_bots, failures = await scan_zombies(bot, action_chat_id, _bot_id)
             summary = (
                 f"🧟 Zombie scan complete\n"
@@ -2321,14 +2816,14 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(summary)
             return
 
-        # ── /hstats ───────────────────────────────────────
+        # ── /hstats ───────────────────────────────────────────────────────
         if raw_cmd == "hstats":
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
             await reply_text(build_stats_text())
             return
 
-        # ── /hmod ─────────────────────────────────────────
+        # ── /hmod ─────────────────────────────────────────────────────────
         if raw_cmd == "hmod":
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
@@ -2337,7 +2832,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(build_moderator_list_text())
             return
 
-        # ── /hwarn ────────────────────────────────────────
+        # ── /hwarn ────────────────────────────────────────────────────────
         if raw_cmd in ("hwarn", "hw"):
             if not await check_mod("warn"):
                 return
@@ -2350,16 +2845,13 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("🛡 That user is protected.")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
-
             warner_tag = actor_mod_info() or str(uid)
             res = warn(tid, action_chat_id, reason, warner=warner_tag)
-
             case_id = create_case("WARN", uid, tid, reason)
             await send_action_log(
                 chat_id, msg_id, "WARN", target, reason, case_id, actor_mod_info(),
                 extra=f"📊 Total Warns: {res.get('num_warns', 0)}/{res.get('threshold', 0)}",
             )
-
             action = res.get("action")
             if action:
                 ok  = False
@@ -2372,7 +2864,6 @@ async def handle_message(bot: Client, msg: dict):
                     ok, err = await api_kick(action_chat_id, tid)
                 else:
                     ok, err = await api_mute(action_chat_id, tid, until_date=until_ts)
-
                 if ok:
                     auto_reason = f"Warn threshold ({res.get('threshold')}) reached"
                     auto_case   = create_case(action_label, uid, tid, auto_reason)
@@ -2385,7 +2876,7 @@ async def handle_message(bot: Client, msg: dict):
                         schedule_temp_action(action, action_chat_id, tid, until_ts, uid, auto_reason, case_id=auto_case)
             return
 
-        # ── /resetwarns ───────────────────────────────────
+        # ── /resetwarns ───────────────────────────────────────────────────
         if raw_cmd == "resetwarns":
             if not await check_mod("warn"):
                 return
@@ -2398,11 +2889,10 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "RESETWARNS", target, "Warnings reset", case_id, actor_mod_info())
             return
 
-        # ── /warns ────────────────────────────────────────
+        # ── /warns ────────────────────────────────────────────────────────
         if raw_cmd == "warns":
             user_lookup = uid
             if args:
-                # [FIX-10] Support @username in /warns
                 if args[0].startswith("@"):
                     try:
                         user_obj = await bot.get_user(args[0][1:])
@@ -2421,21 +2911,20 @@ async def handle_message(bot: Client, msg: dict):
                 _, rid = extract_reply_user(reply)
                 if rid:
                     user_lookup = rid
-            # [FIX-7] Use action_chat_id so PM-connected sessions resolve correctly
             result    = warns_for(user_lookup, action_chat_id)
             num_warns = result.get("num_warns", 0)
             reasons   = result.get("reasons", [])
             threshold = get_warn_config().get("threshold", 3)
             if num_warns > 0:
-                text = f"This user has {num_warns}/{threshold} warnings."
+                text_out = f"This user has {num_warns}/{threshold} warnings."
                 for r in reasons:
-                    text += f"\n - {r}"
-                await reply_text(text)
+                    text_out += f"\n - {r}"
+                await reply_text(text_out)
             else:
                 await reply_text("This user hasn't got any warnings!")
             return
 
-        # ── /hdel ─────────────────────────────────────────
+        # ── /hdel ─────────────────────────────────────────────────────────
         if raw_cmd in ("hdel", "hd"):
             if not await check_mod("delete"):
                 return
@@ -2459,7 +2948,7 @@ async def handle_message(bot: Client, msg: dict):
             )
             return
 
-        # ── /hprotect ─────────────────────────────────────
+        # ── /hprotect ─────────────────────────────────────────────────────
         if raw_cmd in ("hprotect", "hp"):
             if not is_owner_actor():
                 return
@@ -2475,7 +2964,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(f"🛡 {make_mention(target)} is now protected.")
             return
 
-        # ── /hunprotect ───────────────────────────────────
+        # ── /hunprotect ───────────────────────────────────────────────────
         if raw_cmd in ("hunprotect", "hup"):
             if not is_owner_actor():
                 return
@@ -2491,7 +2980,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(f"🔓 Protection removed from {make_mention(target)}.")
             return
 
-        # ── /hcase ────────────────────────────────────────
+        # ── /hcase ────────────────────────────────────────────────────────
         if raw_cmd in ("hcase", "hc"):
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
@@ -2512,7 +3001,7 @@ async def handle_message(bot: Client, msg: dict):
             )
             return
 
-        # ── /hmodinfo ─────────────────────────────────────
+        # ── /hmodinfo ─────────────────────────────────────────────────────
         if raw_cmd in ("hmodinfo", "hmi"):
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
@@ -2567,11 +3056,41 @@ async def handle_callback(bot: Client, cb: dict):
         message   = cb.get("message", {})
         chat_id   = message.get("chat", {}).get("id")
 
+        # TTT callbacks
         for prefix in TTT_CALLBACK_PREFIXES:
             if data.startswith(prefix):
                 await handle_ttt_callback(cb_id, data, uid, from_user, chat_id, message)
                 return
 
+        # ── setactive_<chat_id> — switch active group ─────────────────────
+        if data.startswith("setactive_"):
+            try:
+                new_active = int(data.split("_", 1)[1])
+            except ValueError:
+                return await tg_answer_cb(cb_id, "❌ Invalid chat ID.", alert=True)
+            chats = get_connected_chats(uid)
+            if new_active not in chats:
+                return await tg_answer_cb(cb_id, "❌ You are not connected to that group.", alert=True)
+            set_active_connection(uid, new_active)
+            try:
+                chat_obj = await bot.get_chat(new_active)
+                await tg_answer_cb(cb_id, f"✅ Switched to: {chat_obj.title}", alert=False)
+            except Exception:
+                await tg_answer_cb(cb_id, f"✅ Active group set to {new_active}.", alert=False)
+            return
+
+        # ── getnote_<name> — retrieve a note via inline button ───────────
+        if data.startswith("getnote_"):
+            note_name = data.split("_", 1)[1]
+            note      = note_get(chat_id, note_name)
+            if note:
+                await tg_send(chat_id, note["content"])
+                await tg_answer_cb(cb_id, f"📋 Note: #{note_name}")
+            else:
+                await tg_answer_cb(cb_id, "❌ Note not found.", alert=True)
+            return
+
+        # ── Mod-only callbacks ────────────────────────────────────────────
         if not is_authorized(uid):
             await tg_answer_cb(cb_id, "⛔ Only moderators can use this.", alert=True)
             return
@@ -2601,8 +3120,7 @@ async def handle_callback(bot: Client, cb: dict):
         elif data.startswith("removewarn_"):
             if not has_permission(uid, "warn"):
                 return await tg_answer_cb(cb_id, "❌ No warn permission.", alert=True)
-            tid  = int(data.split("_", 1)[1])
-            # [FIX-1] Use namespaced key matching warn() storage format
+            tid        = int(data.split("_", 1)[1])
             warns_data = load(WARN_FILE)
             key        = f"{chat_id}:{tid}"
             if key in warns_data and warns_data[key] > 0:

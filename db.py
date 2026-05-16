@@ -33,6 +33,9 @@ class MongoDBHandler:
             "user_connections": "user_connections",
             "ttt_scores": "ttt_scores",
             "ttt_state": "ttt_state",
+                "active_conn": "active_connections",
+                "notes": "group_notes",
+                "filters": "group_filters",
         }
         
     def connect(self) -> bool:
@@ -201,6 +204,30 @@ class MongoDBHandler:
     def save_user_connections(self, data: Dict[str, Any]) -> bool:
         """Save user-to-group connection mappings."""
         return self._save_collection_data("user_connections", data)
+
+    def load_active_conn(self) -> Dict[str, Any]:
+        """Load per-user active connection (active group) mapping."""
+        return self._load_collection_data("active_conn", {})
+
+    def save_active_conn(self, data: Dict[str, Any]) -> bool:
+        """Save per-user active connection mapping."""
+        return self._save_collection_data("active_conn", data)
+
+    def load_notes(self) -> Dict[str, Any]:
+        """Load saved notes per group."""
+        return self._load_collection_data("notes", {})
+
+    def save_notes(self, data: Dict[str, Any]) -> bool:
+        """Save notes per group."""
+        return self._save_collection_data("notes", data)
+
+    def load_filters(self) -> Dict[str, Any]:
+        """Load keyword filters per group."""
+        return self._load_collection_data("filters", {})
+
+    def save_filters(self, data: Dict[str, Any]) -> bool:
+        """Save keyword filters per group."""
+        return self._save_collection_data("filters", data)
 
     def load_ttt_scores(self) -> Dict[str, Any]:
         """Load Tic-Tac-Toe scores."""
