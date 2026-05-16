@@ -494,6 +494,24 @@ async def tg_send(
     return await tg_api("sendMessage", json=payload)
 
 
+async def tg_edit_text(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    markup: dict = None,
+    parse_mode: str = "Markdown",
+    entities: list = None,
+) -> dict:
+    payload: dict = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if markup:
+        payload["reply_markup"] = markup
+    if parse_mode is not None:
+        payload["parse_mode"] = parse_mode
+    if entities is not None:
+        payload["entities"] = entities
+    return await tg_api("editMessageText", json=payload)
+
+
 async def tg_send_media(chat_id: int, note: dict, reply_to: int = None):
     """Send a saved media note (photo, document, video, audio, voice, sticker, animation).
     note: dict containing keys `type`, `file_id`, `content` (caption), and optional `entities`.
@@ -1694,6 +1712,62 @@ def build_markup(*rows) -> dict:
         keyboard.append(btn_row)
     return {"inline_keyboard": keyboard}
 
+
+def moderation_help_markup(section: str = "home") -> dict:
+    if section == "home":
+        return build_markup(
+            (("🚫 Ban", "cb:help_ban"), ("🔇 Mute", "cb:help_mute"), ("👢 Kick", "cb:help_kick")),
+        )
+    return build_markup(
+        (("🚫 Ban", "cb:help_ban"), ("🔇 Mute", "cb:help_mute"), ("👢 Kick", "cb:help_kick")),
+        (("⬅️ Back", "cb:help_home"),),
+    )
+
+
+def moderation_help_text(section: str, uid: int) -> str:
+    role = "OWNER" if is_owner(uid) else "MODERATOR"
+    if section == "ban":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🚫 **Ban Commands**\n\n"
+            "`/hban [user_id/@user] [duration] [reason]` - Ban a user\n"
+            "`/hunban [user_id/@user] [reason]` - Unban a user\n\n"
+            "**Usage**\n"
+            "• Reply to a user's message or pass a user ID/username.\n"
+            "• Duration is optional. Examples: `30m`, `2h`, `1d`.\n"
+            "• Example: `/hban @user 2h spam`\n"
+        )
+    if section == "mute":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🔇 **Mute Commands**\n\n"
+            "`/hmute [user_id/@user] [duration] [reason]` - Mute a user\n"
+            "`/hunmute [user_id/@user] [reason]` - Unmute a user\n\n"
+            "**Usage**\n"
+            "• Reply to a user's message or pass a user ID/username.\n"
+            "• Duration is optional. Examples: `30m`, `2h`, `1d`.\n"
+            "• Example: `/hmute @user 1h flooding chat`\n"
+        )
+    if section == "kick":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "👢 **Kick Commands**\n\n"
+            "`/hkick <user_id/@user> [reason]` - Kick a user from the group\n\n"
+            "**Usage**\n"
+            "• Reply to a user's message or pass a user ID/username.\n"
+            "• Example: `/hkick @user rule break`\n"
+            "• Kick removes the user immediately and is not temporary.\n"
+        )
+    return (
+        f"👮 **{role} Help Center**\n\n"
+        "Choose a moderation category below to see the valid commands and usage.\n\n"
+        "• Ban: `/hban`, `/hunban`\n"
+        "• Mute: `/hmute`, `/hunmute`\n"
+        "• Kick: `/hkick`\n\n"
+        "💡 Reply to the target message to avoid typing a user ID.\n"
+        "⏱️ Duration examples: `30m`, `2h`, `1d`\n"
+    )
+
 # =========================================================
 # PYROGRAM CLIENT
 # =========================================================
@@ -2081,8 +2155,8 @@ async def handle_message(bot: Client, msg: dict):
         actor_label = f"anon_admin:{chat_id}" if is_anon_admin else str(uid)
         log_msg(f"/{raw_cmd} from actor={actor_label} chat={chat_id}", "INFO")
 
-        async def reply_text(t: str):
-            sent = await tg_send(chat_id, t, reply_to=msg_id)
+        async def reply_text(t: str, markup: dict = None, parse_mode: str = "Markdown"):
+            sent = await tg_send(chat_id, t, reply_to=msg_id, markup=markup, parse_mode=parse_mode)
             if not is_private and sent.get("ok"):
                 rmid = sent.get("result", {}).get("message_id")
                 if rmid:
@@ -2287,24 +2361,17 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── /help ─────────────────────────────────────────────────────────
         if raw_cmd == "help":
-            if is_anon_admin:
+            if is_anon_admin or is_authorized(uid):
                 await reply_text(
-                    "🎭 **Anonymous Admin Mode**\n\n"
-                    "You can use moderation commands while posting anonymously:\n"
-                    "`/hban`, `/hkick`, `/hmute`, `/hunban`, `/hunmute`, `/hstats`, "
-                    "`/hwarn`, `/hdel`, `/hcase`, `/hmod list`, `/hmodinfo`, `/hr`, "
-                    "`/pin`, `/unpin`, `/adminlist`, `/zombies`, `/save`, `/get`, "
-                    "`/clear`, `/notes`, `/filter`, `/stop`, `/filters`\n\n"
-                    "Owner-only commands (`/hauth`, `/hgrant`, `/hrevoke`, `/hprotect`, "
-                    "`/hunprotect`, `/hfreeze`, `/hunfreeze`, `/hbadge`, `/hwarnconfig`) "
-                    "require a normal account identity."
+                    moderation_help_text("home", uid),
+                    markup=moderation_help_markup("home"),
                 )
             else:
                 await reply_text(role_help_text(uid))
             return
 
         # ── /hr ───────────────────────────────────────────────────────────
-        if raw_cmd in ("hr", "id"):
+        if raw_cmd == "hr":
             try:
                 # If invoked in a group with no args/reply, return the group ID
                 if not args and not reply and not is_private:
@@ -3329,6 +3396,24 @@ async def handle_callback(bot: Client, cb: dict):
                 await tg_answer_cb(cb_id, f"📋 Note: #{note_name}")
             else:
                 await tg_answer_cb(cb_id, "❌ Note not found.", alert=True)
+            return
+
+        if data.startswith("help_"):
+            if not is_authorized(uid):
+                await tg_answer_cb(cb_id, "⛔ Only moderators can use this.", alert=True)
+                return
+            message_id = message.get("message_id")
+            if not message_id:
+                await tg_answer_cb(cb_id, "❌ Could not update help message.", alert=True)
+                return
+            section = data.split("_", 1)[1]
+            await tg_edit_text(
+                chat_id,
+                message_id,
+                moderation_help_text(section, uid),
+                markup=moderation_help_markup(section),
+            )
+            await tg_answer_cb(cb_id, "✅ Help updated.")
             return
 
         # ── Mod-only callbacks ────────────────────────────────────────────
