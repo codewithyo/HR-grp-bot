@@ -245,6 +245,12 @@ MONGO_SAVERS = {
     FILTERS_FILE:          mongo_db.save_filters,
 }
 
+MONGO_PERSISTENT_FILES = {
+    CONNECTIONS_FILE,
+    USER_CONNECTIONS_FILE,
+    ACTIVE_CONN_FILE,
+}
+
 # =========================================================
 # STORAGE HELPERS
 # =========================================================
@@ -298,7 +304,10 @@ log_msg(f"Storage: {STORAGE_PATH}  Fallback: {FALLBACK_STORAGE_PATH}", "INFO")
 def load(file: str):
     cached = _cache.get(file)
     if cached is not None:
-        return cached
+        if file in MONGO_PERSISTENT_FILES and _is_empty_payload(cached) and mongo_db.is_connected():
+            _cache.invalidate(file)
+        else:
+            return cached
     try:
         data = None
         if os.path.exists(file):
@@ -392,6 +401,8 @@ def sync_storage_with_mongo():
                 saver(local_data)
         elif not _is_empty_payload(remote_data):
             _write_local_json(file, remote_data)
+        if file in MONGO_PERSISTENT_FILES:
+            _cache.invalidate(file)
 
 # =========================================================
 # PERSISTENT HTTP CLIENT
@@ -852,11 +863,10 @@ async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = Tr
     try:
         member = await bot.get_chat_member(conn_id, user_id)
     except Exception:
-        remove_user_connection(user_id, conn_id)
+        log_msg(f"Unable to verify connection for user {user_id} in chat {conn_id}; keeping stored connection", "WARNING")
         return False
     allowed = member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
     if not allowed and not (allow_connect_to_chat(conn_id) and member.status == enums.ChatMemberStatus.MEMBER):
-        remove_user_connection(user_id, conn_id)
         return False
     if need_admin and not allowed:
         return False
