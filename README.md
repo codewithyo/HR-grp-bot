@@ -34,67 +34,54 @@ Examples:
 
 When in doubt, reply to target messages to avoid parsing errors or mistaken IDs.
 
-## Full Command Summary (representative)
+## Commands & Usage
 
-Note: Some commands are Owner-only or Moderator-only. Use `/help` for interactive, role-aware help pages.
+Most commands work either by replying to a target message (recommended) or by passing a user id / `@username` directly.
 
-- `/start` — Bot welcome message
-- `/help` — Interactive help menu (Ban, Mute, Warn, Kick, Protect, Notes, Filters, Blocklist, Connections, Authorization, Stats, Games)
-- `/hr` / `/id` — Show user/chat id and profile info
-
-- Moderation
-	- `/hban [user|@user|reply] [duration] [reason]` — Ban user
-	- `/hunban [user|@user|reply]` — Unban user
-	- `/hkick [user|@user|reply] [reason]` — Kick user
-	- `/hmute [user|@user|reply] [duration] [reason]` — Mute user
-	- `/hunmute [user|@user|reply]` — Unmute user
-	- `/hwarn [user|@user|reply] [reason]` — Warn user (creates a case)
-	- `/warns [user|@user]` — Show warnings (per-group or cross-chat totals)
-	- `/resetwarns [user|@user|reply]` — Reset warns for a user
-	- `/pin` (reply) — Pin a message; `/unpin` — Unpin last pinned
-
-- Protection & Authorization
-	- `/hprotect [user|id|reply]` — Protect a user from moderation (Owner)
-	- `/hunprotect [user|id|reply]` — Remove protection (Owner)
-	- `/hauth <user_id>` — Authorize moderator (Owner)
-	- `/hunauth <user_id>` — Remove moderator (Owner)
-	- `/hgrant <user_id> <perm>` — Grant permission
-	- `/hrevoke <user_id> <perm>` — Revoke permission
-	- `/hfreeze <user_id>` / `/hunfreeze <user_id>` — Freeze/unfreeze moderator
-	- `/hbadge <user_id> <badge_text>` — Set moderator badge
-
-- Notes & Filters
-	- `/notes` — List saved notes
-	- `/save <name> <text>` or reply+`/save <name>` — Save note
-	- `/get <name>` or `#name` — Retrieve note
-	- `/clear <name>` — Delete note
-	- `/filters` — List filters
-	- `/filter <keyword> <response>` — Add filter (supports `-exact`, `-start`, `-regex`)
-	- `/stop <keyword>` — Remove filter
-
-- Blocklist
-	- `/addblocklist <keyword>` — Add blocked keyword
-	- `/deleteblocklist <keyword>` — Remove blocked keyword
-	- `/blocklists` — List group blocklist keywords
-	- `/blocklistmode [warn|mute|ban]` — Set action for blocked keywords
-
-- Connections & Multi-Group
-	- `/connect <chat_id>` — Connect PM to group for management
-	- `/connections` — View and switch connected groups
-	- `/disconnect [chat_id|all]` — Disconnect
-	- `/allowconnections yes|no` — Toggle PM connection allowance
-
-- Warn Configuration
-	- `/hwarnconfig threshold <n>` — Set warn threshold
-	- `/hwarnconfig action <ban|mute|kick>` — Set auto-action
-	- `/hwarnconfig duration <30m|2h|1d>` — Action duration
-
-- Games
-	- `/ttt [user_id]` — Start Tic-Tac-Toe with a user
-	- `/ttt [user_id] 5` — Start 5x5 board
-	- `/tttleaderboard` — Show top players
-	- `/tttmystats` — Show your stats
-	- `/tttend` — Forfeit active game
+| Emoji | Command | Description | Permission |
+|---:|---|---|---|
+| 🟢 | `/start` | Bot welcome message | Anyone |
+| ❓ | `/help` | Interactive help menu (category buttons) | Anyone |
+| 🆔 | `/hr`, `/id` | Show user/chat id and profile info | Anyone |
+| 🚫 | `/hban [user|@user|reply] [duration] [reason]` | Ban a user (temporary or permanent) | Moderator |
+| ✅ | `/hunban [user|@user|reply]` | Unban a user | Moderator |
+| 👢 | `/hkick [user|@user|reply] [reason]` | Kick a user from the group | Moderator |
+| 🔇 | `/hmute [user|@user|reply] [duration] [reason]` | Mute a user | Moderator |
+| 🔊 | `/hunmute [user|@user|reply]` | Unmute a user | Moderator |
+| ⚠️ | `/hwarn [user|@user|reply] [reason]` | Issue a warning (creates a case) | Moderator |
+| 📈 | `/warns [user|@user]` | Show warnings (per-group or cross-chat totals) | Anyone |
+| ♻️ | `/resetwarns [user|@user|reply]` | Reset warnings for a user | Moderator |
+| 📌 | `/pin` (reply) / `/unpin` | Pin/unpin a message | Moderator |
+| 🛡️ | `/hprotect [user|id|reply]` | Protect a user from moderation | Owner |
+| 🔓 | `/hunprotect [user|id|reply]` | Remove protection | Owner |
+| 👥 | `/hauth <user_id>` | Authorize a moderator | Owner |
+| 🚫👥 | `/hunauth <user_id>` | Remove moderator authorization | Owner |
+| 🔧 | `/hgrant <user_id> <perm>` | Grant a permission to a moderator | Owner |
+| 🛠️ | `/hrevoke <user_id> <perm>` | Revoke a permission | Owner |
+| ❄️ | `/hfreeze <user_id>` / `/hunfreeze <user_id>` | Freeze/unfreeze moderator actions | Owner |
+| 🏷️ | `/hbadge <user_id> <badge_text>` | Set moderator badge | Owner |
+| 📝 | `/notes` | List saved notes for the group | Authorized |
+| 💾 | `/save <name> <text>` or reply+`/save <name>` | Save a note | Authorized |
+| 📖 | `/get <name>` or `#name` | Retrieve a saved note | Anyone (in group) |
+| 🗑️ | `/clear <name>` | Delete a note | Authorized |
+| 🔍 | `/filters` | List all filters | Anyone |
+| ➕ | `/filter <keyword> <response>` | Add an auto-reply filter (`-exact`, `-start`, `-regex`) | Authorized |
+| ⛔ | `/stop <keyword>` | Remove a filter | Authorized |
+| 🔒 | `/addblocklist <keyword>` | Add a blocked keyword (group-scoped) | Authorized |
+| ❌ | `/deleteblocklist <keyword>` | Remove a blocklist keyword | Authorized |
+| 📋 | `/blocklists` | List blocklist keywords for this group | Authorized |
+| ⚙️ | `/blocklistmode [warn|mute|ban]` | Set action for blocklist matches | Authorized |
+| 🔗 | `/connect <chat_id>` | Connect PM to manage a group | Anyone (DM) |
+| 🔁 | `/connections` | View/switch connected groups | Anyone (DM) |
+| 🔌 | `/disconnect [chat_id|all]` | Disconnect a connected group | Anyone (DM) |
+| 🔐 | `/allowconnections yes|no` | Allow/block PM connections | Moderator |
+| ⚙️ | `/hwarnconfig threshold <n>` | Set warn threshold | Owner |
+| ⚙️ | `/hwarnconfig action <ban|mute|kick>` | Set auto-action on threshold | Owner |
+| ⏱️ | `/hwarnconfig duration <30m|2h|1d>` | Set duration for auto-action | Owner |
+| 🎮 | `/ttt [user_id] [size]` | Start Tic-Tac-Toe (optional size, default 3) | Anyone |
+| 🏆 | `/tttleaderboard` | Show top Tic-Tac-Toe players | Anyone |
+| 📊 | `/tttmystats` | Show your game stats | Anyone |
+| 🛑 | `/tttend` | Forfeit active game | Anyone |
 
 If a command is missing here, open `/help` in the bot for the full interactive view.
 
