@@ -36,6 +36,8 @@ class MongoDBHandler:
                 "active_conn": "active_connections",
                 "notes": "group_notes",
                 "filters": "group_filters",
+                "blocklists": "blocklists",
+                "blocklist_mode": "blocklist_mode",
         }
         
     def connect(self) -> bool:
@@ -114,12 +116,15 @@ class MongoDBHandler:
             return False
     
     def is_connected(self) -> bool:
-        """Check if MongoDB is connected (fast check using client state)."""
+        """Check if MongoDB is connected.
+
+        FIX: replaced the deprecated ``ismaster`` command (removed in
+        MongoDB 5.0 / Atlas) with the modern ``ping`` command.
+        """
         if not self.connected or self.db is None:
             return False
         try:
-            # Use ismaster which is faster than ping
-            self.db.command('ismaster')
+            self.client.admin.command("ping")
             return True
         except Exception:
             self.connected = False
@@ -220,6 +225,22 @@ class MongoDBHandler:
     def save_notes(self, data: Dict[str, Any]) -> bool:
         """Save notes per group."""
         return self._save_collection_data("notes", data)
+
+    def load_blocklists(self) -> Dict[str, Any]:
+        """Load blocklist keywords per group."""
+        return self._load_collection_data("blocklists", {})
+
+    def save_blocklists(self, data: Dict[str, Any]) -> bool:
+        """Save blocklist keywords per group."""
+        return self._save_collection_data("blocklists", data)
+
+    def load_blocklist_mode(self) -> Dict[str, Any]:
+        """Load blocklist mode per group."""
+        return self._load_collection_data("blocklist_mode", {})
+
+    def save_blocklist_mode(self, data: Dict[str, Any]) -> bool:
+        """Save blocklist mode per group."""
+        return self._save_collection_data("blocklist_mode", data)
 
     def load_filters(self) -> Dict[str, Any]:
         """Load keyword filters per group."""
