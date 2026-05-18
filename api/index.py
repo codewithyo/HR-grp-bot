@@ -84,6 +84,9 @@ MODERATION_COMMANDS = {
     "filter", "stop", "filters",
     "addblocklist", "deleteblocklist", "removeblocklist", "blocklists", "blocklistmode",
     "hprotect", "hp", "hunprotect", "hup", "hprotected", "protect", "unprotect", "protected",
+    "setwelcome", "setgoodbye", "setrules", "hlock", "hunlock", "unlock",
+    # new toggle commands
+    "welcome", "goodbye", "rules",
 }
 ACTION_LOG_AUTO_DELETE = 60  # seconds
 
@@ -173,8 +176,13 @@ NOTES_FILE            = f"{STORAGE_PATH}/notes.json"
 FILTERS_FILE          = f"{STORAGE_PATH}/filters.json"
 BLOCKLIST_FILE        = f"{STORAGE_PATH}/blocklists.json"
 BLOCKLIST_MODE_FILE   = f"{STORAGE_PATH}/blocklist_mode.json"
+WELCOME_FILE          = f"{STORAGE_PATH}/welcome.json"
+GOODBYE_FILE          = f"{STORAGE_PATH}/goodbye.json"
+RULES_FILE            = f"{STORAGE_PATH}/rules.json"
+LOCKS_FILE            = f"{STORAGE_PATH}/chat_locks.json"
 TTT_SCORES_FILE       = f"{STORAGE_PATH}/ttt_scores.json"
 TTT_STATE_FILE        = f"{STORAGE_PATH}/ttt_state.json"
+CHAT_TITLES_FILE      = f"{STORAGE_PATH}/chat_titles.json"
 
 FALLBACK_FILE_MAP = {
     AUTH_FILE:             f"{FALLBACK_STORAGE_PATH}/auth.json",
@@ -194,6 +202,11 @@ FALLBACK_FILE_MAP = {
     TTT_SCORES_FILE:       f"{FALLBACK_STORAGE_PATH}/ttt_scores.json",
     TTT_STATE_FILE:        f"{FALLBACK_STORAGE_PATH}/ttt_state.json",
     BLOCKLIST_MODE_FILE:   f"{FALLBACK_STORAGE_PATH}/blocklist_mode.json",
+    WELCOME_FILE:          f"{FALLBACK_STORAGE_PATH}/welcome.json",
+    GOODBYE_FILE:          f"{FALLBACK_STORAGE_PATH}/goodbye.json",
+    RULES_FILE:            f"{FALLBACK_STORAGE_PATH}/rules.json",
+    LOCKS_FILE:            f"{FALLBACK_STORAGE_PATH}/chat_locks.json",
+    CHAT_TITLES_FILE:      f"{FALLBACK_STORAGE_PATH}/chat_titles.json",
 }
 
 ALL_FILES = list(FALLBACK_FILE_MAP.keys())
@@ -216,6 +229,11 @@ FILE_LABEL = {
     TTT_SCORES_FILE:       "ttt_scores",
     TTT_STATE_FILE:        "ttt_state",
     BLOCKLIST_MODE_FILE:   "blocklist_mode",
+    WELCOME_FILE:          "welcome",
+    GOODBYE_FILE:          "goodbye",
+    RULES_FILE:            "rules",
+    LOCKS_FILE:            "chat_locks",
+    CHAT_TITLES_FILE:      "chat_titles",
 }
 
 MONGO_LOADERS = {
@@ -236,6 +254,11 @@ MONGO_LOADERS = {
     FILTERS_FILE:          mongo_db.load_filters,
     BLOCKLIST_FILE:        mongo_db.load_blocklists,
     BLOCKLIST_MODE_FILE:   mongo_db.load_blocklist_mode,
+    WELCOME_FILE:          mongo_db.load_welcome,
+    GOODBYE_FILE:          mongo_db.load_goodbye,
+    RULES_FILE:            mongo_db.load_rules,
+    LOCKS_FILE:            mongo_db.load_chat_locks,
+    CHAT_TITLES_FILE:      mongo_db.load_chat_titles,
 }
 
 MONGO_SAVERS = {
@@ -256,6 +279,11 @@ MONGO_SAVERS = {
     FILTERS_FILE:          mongo_db.save_filters,
     BLOCKLIST_FILE:        mongo_db.save_blocklists,
     BLOCKLIST_MODE_FILE:   mongo_db.save_blocklist_mode,
+    WELCOME_FILE:          mongo_db.save_welcome,
+    GOODBYE_FILE:          mongo_db.save_goodbye,
+    RULES_FILE:            mongo_db.save_rules,
+    LOCKS_FILE:            mongo_db.save_chat_locks,
+    CHAT_TITLES_FILE:      mongo_db.save_chat_titles,
 }
 
 MONGO_PERSISTENT_FILES = {
@@ -380,6 +408,22 @@ def save(file: str, data):
             for key in _cache.keys():
                 if key.startswith("blocklists:"):
                     _cache.invalidate(key)
+        elif file == WELCOME_FILE:
+            for key in _cache.keys():
+                if key.startswith("welcome:"):
+                    _cache.invalidate(key)
+        elif file == GOODBYE_FILE:
+            for key in _cache.keys():
+                if key.startswith("goodbye:"):
+                    _cache.invalidate(key)
+        elif file == RULES_FILE:
+            for key in _cache.keys():
+                if key.startswith("rules:"):
+                    _cache.invalidate(key)
+        elif file == LOCKS_FILE:
+            for key in _cache.keys():
+                if key.startswith("lock:"):
+                    _cache.invalidate(key)
         tmp = f"{file}.tmp"
         try:
             Path(file).parent.mkdir(parents=True, exist_ok=True)
@@ -440,6 +484,10 @@ def verify_storage_restored():
         "blocklists":  sum(len(v) for v in load(BLOCKLIST_FILE).values() if isinstance(v, dict)),
         "cases":       len(load(CASE_FILE)),
         "protections": protected_count,
+        "welcome":     len(load(WELCOME_FILE)) if isinstance(load(WELCOME_FILE), dict) else 0,
+        "goodbye":     len(load(GOODBYE_FILE)) if isinstance(load(GOODBYE_FILE), dict) else 0,
+        "rules":       len(load(RULES_FILE)) if isinstance(load(RULES_FILE), dict) else 0,
+        "locks":       len(load(LOCKS_FILE)) if isinstance(load(LOCKS_FILE), dict) else 0,
     }
 
     status_lines = []
@@ -649,6 +697,12 @@ async def api_unmute(chat_id: int, user_id: int, permissions: dict | None = None
     })
     return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
 
+async def api_set_chat_permissions(chat_id: int, permissions: dict) -> tuple[bool, str]:
+    r = await tg_api("setChatPermissions", json={
+        "chat_id": chat_id, "permissions": permissions,
+    })
+    return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
+
 async def api_pin(chat_id: int, message_id: int) -> tuple[bool, str]:
     r = await tg_api("pinChatMessage", json={"chat_id": chat_id, "message_id": message_id})
     return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
@@ -696,7 +750,7 @@ async def upload_backup(label: str, data) -> bool:
 _BACKUP_LABELS = {
     "auth", "warns", "cases", "protected", "abuse",
     "temp_actions", "appeals", "connections", "user_connections",
-    "notes", "filters",
+    "notes", "filters", "welcome", "goodbye", "rules", "chat_locks",
 }
 
 async def save_and_backup(file: str, data):
@@ -912,14 +966,23 @@ async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = Tr
     try:
         member = await bot.get_chat_member(conn_id, user_id)
     except Exception:
-        log_msg(f"Unable to verify connection for user {user_id} in chat {conn_id}; keeping stored connection", "WARNING")
-        return False
+        # Bot restarted or Telegram API hiccup — keep the stored connection
+        # rather than silently dropping it. Trust the persisted data.
+        log_msg(
+            f"Cannot verify member {user_id} in {conn_id} right now; "
+            "keeping stored connection.",
+            "WARNING",
+        )
+        # For need_admin we cannot confirm privilege, so fall through
+        # only for non-admin paths (PM moderation commands pass need_admin=False).
+        if need_admin:
+            return conn_id  # trust stored data; worst case Telegram rejects the action
+        return conn_id
     allowed = member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
     if not allowed and not (allow_connect_to_chat(conn_id) and member.status == enums.ChatMemberStatus.MEMBER):
         return False
     if need_admin and not allowed:
         return False
-    # Auto-bootstrap group storage when a connection is resolved
     try:
         create_group_defaults(conn_id)
     except Exception:
@@ -980,6 +1043,8 @@ async def connect_user_to_chat(bot: Client, user_id: int, connect_id: int) -> st
 
     try:
         target_chat = await bot.get_chat(connect_id)
+        title = target_chat.title or f"Chat {connect_id}"
+        cache_chat_title(connect_id, title)          # ← persist for post-restart use
         add_user_connection(user_id, connect_id)
         try:
             create_group_defaults(connect_id)
@@ -988,7 +1053,7 @@ async def connect_user_to_chat(bot: Client, user_id: int, connect_id: int) -> st
         chats = get_connected_chats(user_id)
         count = len(chats)
         return (
-            f"✅ Connected to *{target_chat.title}*\n"
+            f"✅ Connected to *{title}*\n"
             f"📌 Set as active group\n"
             f"🔗 Total connected: `{count}`\n\n"
             f"Use /connections to view & switch groups."
@@ -1175,6 +1240,9 @@ def create_group_defaults(chat_id: int):
         BLOCKLIST_FILE: {},
         WARN_FILE: {},
         WARN_CONFIG_FILE: {"threshold": 3, "action": "mute", "duration": 3600},
+        WELCOME_FILE: {},
+        GOODBYE_FILE: {},
+        RULES_FILE: {},
     }
     for f, default in files_defaults.items():
         data = load(f)
@@ -1275,6 +1343,152 @@ def set_blocklist_mode(chat_id: int, mode: str):
     data[str(chat_id)] = mode
     save(BLOCKLIST_MODE_FILE, data)
 
+
+# =========================================================
+# CHAT TITLE CACHE
+# =========================================================
+
+def get_cached_chat_title(chat_id: int) -> str | None:
+    data = load(CHAT_TITLES_FILE)
+    return data.get(str(chat_id)) if isinstance(data, dict) else None
+
+def cache_chat_title(chat_id: int, title: str):
+    if not title:
+        return
+    data = load(CHAT_TITLES_FILE)
+    if not isinstance(data, dict):
+        data = {}
+    data[str(chat_id)] = title
+    save(CHAT_TITLES_FILE, data)
+
+# =========================================================
+# WELCOME / GOODBYE / RULES / LOCKS
+# =========================================================
+
+def _escape_markdown(text: str) -> str:
+    if text is None:
+        return ""
+    return re.sub(r"([_*`\[])", r"\\\1", str(text))
+
+
+def _user_display_name(user: dict) -> str:
+    if not isinstance(user, dict):
+        return "User"
+    first = (user.get("first_name") or "").strip()
+    last = (user.get("last_name") or "").strip()
+    full = " ".join(x for x in (first, last) if x).strip()
+    if full:
+        return full
+    uname = (user.get("username") or "").strip()
+    return uname or "User"
+
+
+def _format_welcome_text(template: str, user: dict) -> str:
+    uid = user.get("id") if isinstance(user, dict) else None
+    name = _user_display_name(user)
+    safe_name = _escape_markdown(name)
+    mention = safe_name
+    if isinstance(uid, int) and uid > 0:
+        mention = f"[{safe_name}](tg://user?id={uid})"
+    text = template or ""
+    return (
+        text.replace("{mention}", mention)
+            .replace("{name}", safe_name)
+            .replace("{id}", str(uid or ""))
+    )
+
+
+def _welcome_for_chat(chat_id: int) -> dict:
+    cache_key = f"welcome:{chat_id}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    data = load(WELCOME_FILE)
+    entry = data.get(str(chat_id), {}) if isinstance(data, dict) else {}
+    _cache.set(cache_key, entry)
+    return entry
+
+
+def _save_welcome_for_chat(chat_id: int, entry: dict | None):
+    data = load(WELCOME_FILE)
+    if not isinstance(data, dict):
+        data = {}
+    if entry:
+        data[str(chat_id)] = entry
+    else:
+        data.pop(str(chat_id), None)
+    save(WELCOME_FILE, data)
+    _cache.invalidate(f"welcome:{chat_id}")
+
+
+def _goodbye_for_chat(chat_id: int) -> dict:
+    cache_key = f"goodbye:{chat_id}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    data = load(GOODBYE_FILE)
+    entry = data.get(str(chat_id), {}) if isinstance(data, dict) else {}
+    _cache.set(cache_key, entry)
+    return entry
+
+
+def _save_goodbye_for_chat(chat_id: int, entry: dict | None):
+    data = load(GOODBYE_FILE)
+    if not isinstance(data, dict):
+        data = {}
+    if entry:
+        data[str(chat_id)] = entry
+    else:
+        data.pop(str(chat_id), None)
+    save(GOODBYE_FILE, data)
+    _cache.invalidate(f"goodbye:{chat_id}")
+
+
+def _rules_for_chat(chat_id: int) -> dict:
+    cache_key = f"rules:{chat_id}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    data = load(RULES_FILE)
+    entry = data.get(str(chat_id), {}) if isinstance(data, dict) else {}
+    _cache.set(cache_key, entry)
+    return entry
+
+
+def _save_rules_for_chat(chat_id: int, entry: dict | None):
+    data = load(RULES_FILE)
+    if not isinstance(data, dict):
+        data = {}
+    if entry:
+        data[str(chat_id)] = entry
+    else:
+        data.pop(str(chat_id), None)
+    save(RULES_FILE, data)
+    _cache.invalidate(f"rules:{chat_id}")
+
+
+def _lock_for_chat(chat_id: int) -> dict | None:
+    cache_key = f"lock:{chat_id}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    data = load(LOCKS_FILE)
+    entry = data.get(str(chat_id)) if isinstance(data, dict) else None
+    _cache.set(cache_key, entry)
+    return entry
+
+
+def _save_lock_for_chat(chat_id: int, entry: dict | None):
+    data = load(LOCKS_FILE)
+    if not isinstance(data, dict):
+        data = {}
+    if entry:
+        data[str(chat_id)] = entry
+    else:
+        data.pop(str(chat_id), None)
+    save(LOCKS_FILE, data)
+    _cache.invalidate(f"lock:{chat_id}")
+
 # =========================================================
 # MISC HELPERS
 # =========================================================
@@ -1333,6 +1547,19 @@ def make_mention(user: dict) -> str:
     uid  = user.get("id")
     name = ((user.get("first_name") or "") + " " + (user.get("last_name") or "")).strip() or "User"
     return f"[{name}](tg://user?id={uid})" if uid else name
+
+def _message_link(chat: dict, message_id: int) -> str | None:
+    if not isinstance(chat, dict) or not message_id:
+        return None
+    username = chat.get("username")
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+    chat_id = chat.get("id")
+    if isinstance(chat_id, int):
+        cid = str(chat_id)
+        if cid.startswith("-100"):
+            return f"https://t.me/c/{cid[4:]}/{message_id}"
+    return None
 
 def extract_actor_user_id(msg: dict) -> tuple[int | None, str | None, bool]:
     if not isinstance(msg, dict):
@@ -1713,6 +1940,7 @@ async def scan_zombies(bot: Client, chat_id: int, bot_id: int) -> tuple[int, int
 def schedule_temp_action(
     action_type: str, chat_id: int, target_id: int,
     until_ts: int, set_by: int, reason: str, case_id: str | None = None,
+    extra: dict | None = None,
 ):
     actions = load_temp_actions()
     action  = {
@@ -1722,6 +1950,8 @@ def schedule_temp_action(
     }
     if case_id:
         action["case_id"] = case_id
+    if isinstance(extra, dict):
+        action.update(extra)
     actions.append(action)
     save_temp_actions(actions)
 
@@ -1783,6 +2013,17 @@ def role_help_text(uid: int) -> str:
             "`/hprotect <user_id>` - Protect user from moderation\n"
             "`/hunprotect <user_id>` - Remove user protection\n"
             "`/hprotected` - List protected users\n\n"
+            "🎉 **Welcome / Goodbye:**\n"
+            "`/setwelcome <text>` - Set welcome message\n"
+            "`/setgoodbye <text>` - Set goodbye message\n"
+            "`/welcome on|off` - Toggle welcome on/off\n"
+            "`/goodbye on|off` - Toggle goodbye on/off\n"
+            "`/setrules <text>` - Set group rules\n"
+            "`/rules on|off` - Toggle rules command\n\n"
+            "🚨 **Report / Lock:**\n"
+            "`/report [reason]` - Report a message to admins\n"
+            "`/hlock [duration]` - Lock the chat\n"
+            "`/hunlock` - Unlock the chat\n\n"
             "📋 **Moderation Commands:**\n"
             "`/hban [user_id/@user] [duration] [reason]` - Ban user\n"
             "`/hkick <user_id/@user> [reason]` - Kick user from group\n"
@@ -1884,18 +2125,25 @@ def build_markup(*rows) -> dict:
 
 
 def moderation_help_markup(section: str = "home") -> dict:
+    base_rows = (
+        (("🚫 Ban", "cb:help_ban"), ("🔇 Mute", "cb:help_mute"), ("⚠ Warn", "cb:help_warn")),
+        (("👢 Kick", "cb:help_kick"), ("🛡 Protect", "cb:help_protect"), ("📋 Notes", "cb:help_notes")),
+        (("🔍 Filters", "cb:help_filters"), ("🔒 Blocklist", "cb:help_blocklist"), ("🔗 Connections", "cb:help_connections")),
+        (("🔐 Authorization", "cb:help_auth"), ("📊 Stats", "cb:help_stats"), ("🎮 Games", "cb:help_games")),
+        (("🎉 Welcome", "cb:help_welcome"), ("📜 Rules", "cb:help_rules"), ("🚨 Report", "cb:help_report")),
+        (("🔒 Lock", "cb:help_lock"),),
+    )
     if section == "home":
-        return build_markup(
-            (("🚫 Ban", "cb:help_ban"), ("🔇 Mute", "cb:help_mute"), ("⚠ Warn", "cb:help_warn")),
-            (("👢 Kick", "cb:help_kick"), ("🛡 Protect", "cb:help_protect"), ("📋 Notes", "cb:help_notes")),
-            (("🔍 Filters", "cb:help_filters"), ("🔒 Blocklist", "cb:help_blocklist"), ("🔗 Connections", "cb:help_connections")),
-            (("🔐 Authorization", "cb:help_auth"), ("📊 Stats", "cb:help_stats"), ("🎮 Games", "cb:help_games")),
-        )
+        return build_markup(*base_rows)
+    return build_markup(*base_rows, (("⬅️ Back", "cb:help_home"),))
+
     return build_markup(
         (("🚫 Ban", "cb:help_ban"), ("🔇 Mute", "cb:help_mute"), ("⚠ Warn", "cb:help_warn")),
         (("👢 Kick", "cb:help_kick"), ("🛡 Protect", "cb:help_protect"), ("📋 Notes", "cb:help_notes")),
         (("🔍 Filters", "cb:help_filters"), ("🔒 Blocklist", "cb:help_blocklist"), ("🔗 Connections", "cb:help_connections")),
         (("🔐 Authorization", "cb:help_auth"), ("📊 Stats", "cb:help_stats"), ("🎮 Games", "cb:help_games")),
+        (("🎉 Welcome", "cb:help_welcome"), ("📜 Rules", "cb:help_rules"), ("🚨 Report", "cb:help_report")),
+        (("🔒 Lock", "cb:help_lock"),),
         (("⬅️ Back", "cb:help_home"),),
     )
 
@@ -1980,6 +2228,63 @@ def moderation_help_text(section: str, uid: int) -> str:
             "• Protected users cannot be banned, muted, kicked, or warned.\n"
             "• Use for bots, admins, or trusted members.\n"
             "• Example: `/hprotect 123456789`\n"
+        )
+    if section == "welcome":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🎉 **Welcome & Goodbye**\n\n"
+            "`/setwelcome <text>` — Set welcome message\n"
+            "`/setgoodbye <text>` — Set goodbye message\n"
+            "`/welcome on|off` — Enable or disable welcome\n"
+            "`/goodbye on|off` — Enable or disable goodbye\n"
+            "`/welcome` — View current welcome message & status\n"
+            "`/goodbye` — View current goodbye message & status\n\n"
+            "**Variables**\n"
+            "• `{mention}` — Clickable user mention\n"
+            "• `{name}` — User display name\n"
+            "• `{id}` — User ID\n\n"
+            "**Examples**\n"
+            "• `/setwelcome Hello {mention}, welcome to the group! 👋`\n"
+            "• `/setgoodbye Goodbye {name}, we'll miss you!`\n"
+            "• `/welcome off` — Temporarily pause welcome messages\n"
+            "• `/welcome on` — Resume them\n"
+        )
+    if section == "rules":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "📜 **Rules**\n\n"
+            "`/setrules <text>` — Set or update group rules\n"
+            "`/rules` — Show current rules (members)\n"
+            "`/rules on|off` — Enable or disable the rules command\n\n"
+            "**Usage**\n"
+            "• Use `/setrules off` to clear rules entirely.\n"
+            "• Use `/rules off` to hide rules without deleting them.\n"
+            "• Example: `/setrules 1) Be respectful 2) No spam 3) Stay on topic`\n"
+        )
+    if section == "report":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🚨 **Report System**\n\n"
+            "`/report [reason]` — Alert all admins and the log group\n\n"
+            "**Usage**\n"
+            "• Reply to the offending message, then run `/report`.\n"
+            "• Optionally include a reason: `/report posting scam links`\n"
+            "• The report is sent privately to every admin and to the log group.\n"
+            "• You'll see a confirmation message when the report is sent.\n"
+        )
+    if section == "lock":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🔒 **Chat Lock**\n\n"
+            "`/hlock` — Lock chat until manually unlocked\n"
+            "`/hlock <duration>` — Lock for a fixed time, then auto-unlock\n"
+            "`/hunlock` — Restore original chat permissions\n\n"
+            "**Duration Format:** `10m`, `2h`, `1d`\n\n"
+            "**Notes**\n"
+            "• Original permissions are saved and fully restored on unlock.\n"
+            "• Admins are unaffected.\n"
+            "• If the bot restarts during a timed lock, the lock expires "
+            "automatically when the temp-action worker next runs.\n"
         )
     if section == "notes":
         return (
@@ -2380,6 +2685,20 @@ async def process_due_temp_actions(bot: Client):
                         log_msg(f"auto-delete failed for msg {target_id} (retry {retry_count + 1}): {del_err}", "WARNING")
                     else:
                         log_msg(f"auto-delete gave up for msg {target_id}: {del_err}", "WARNING")
+            elif atype == "lock":
+                restore_perms = action.get("permissions") if isinstance(action.get("permissions"), dict) else _FULL_PERMISSIONS
+                ok, err = await api_set_chat_permissions(chat_id, restore_perms)
+                if ok:
+                    _save_lock_for_chat(chat_id, None)
+                    msg_text = f"🔓 Chat unlocked\n⏰ Expired: {format_timestamp(until_ts)}"
+                    try:
+                        await tg_send(chat_id, msg_text)
+                    except Exception as send_err:
+                        log_msg(f"temp lock update failed for {chat_id}: {send_err}", "WARNING")
+                else:
+                    pending.append(action)
+                    log_msg(f"auto-unlock failed for {chat_id}: {err}", "WARNING")
+                    continue
         except Exception as e:
             log_msg(f"temp action error {action}: {e}", "ERROR")
             pending.append(action)
@@ -2464,6 +2783,33 @@ async def handle_message(bot: Client, msg: dict):
         is_private = msg.get("chat", {}).get("type") == "private"
         uid, err, is_anon_admin = extract_actor_user_id(msg)
         reply    = msg.get("reply_to_message") or {}
+
+        if not is_private:
+            new_members = msg.get("new_chat_members") or []
+            if not new_members and msg.get("new_chat_member"):
+                new_members = [msg.get("new_chat_member")]
+            if new_members:
+                welcome_entry = _welcome_for_chat(chat_id)
+                welcome_text = welcome_entry.get("text") if isinstance(welcome_entry, dict) else None
+                welcome_on   = welcome_entry.get("enabled", True) if isinstance(welcome_entry, dict) else False
+                if welcome_text and welcome_on:
+                    for member in new_members:
+                        if not isinstance(member, dict):
+                            continue
+                        if member.get("id") == _bot_id:
+                            continue
+                        rendered = _format_welcome_text(welcome_text, member)
+                        await tg_send(chat_id, rendered, reply_to=msg_id)
+
+            left_member = msg.get("left_chat_member")
+            if isinstance(left_member, dict):
+                if left_member.get("id") != _bot_id:
+                    goodbye_entry = _goodbye_for_chat(chat_id)
+                    goodbye_text = goodbye_entry.get("text") if isinstance(goodbye_entry, dict) else None
+                    goodbye_on   = goodbye_entry.get("enabled", True) if isinstance(goodbye_entry, dict) else False
+                    if goodbye_text and goodbye_on:
+                        rendered = _format_welcome_text(goodbye_text, left_member)
+                        await tg_send(chat_id, rendered, reply_to=msg_id)
 
         # ── Non-command messages: filters + #note triggers ────────────────
         if not text.startswith("/"):
@@ -2674,20 +3020,25 @@ async def handle_message(bot: Client, msg: dict):
             lines = ["🔗 **Your Connected Groups**\n"]
             rows  = []
             for cid in chats:
+                # Try live fetch first; fall back to persisted title
                 title = None
                 try:
                     chat_obj = await bot.get_chat(cid)
-                    title = chat_obj.title
+                    title = getattr(chat_obj, "title", None)
+                    if title:
+                        cache_chat_title(cid, title)
                 except Exception:
-                    title = None
+                    title = get_cached_chat_title(cid)
+
                 star = " ⭐" if cid == active else ""
+                display_id = f"`{cid}`"
                 if title:
-                    lines.append(f"• *{title}*{star} (`{cid}`)")
+                    lines.append(f"• *{title}*{star} ({display_id})")
                     display_label = title[:20]
                 else:
-                    lines.append(f"• `{cid}`{star}")
-                    display_label = f"`{cid}`"
-                btn_text = f"✅ Active" if cid == active else f"Switch → {display_label}"
+                    lines.append(f"• {display_id}{star}")
+                    display_label = str(cid)
+                btn_text = "✅ Active" if cid == active else f"Switch → {display_label}"
                 rows.append([(btn_text, f"cb:setactive_{cid}")])
             markup = build_markup(*rows)
             await tg_send(
@@ -2744,6 +3095,316 @@ async def handle_message(bot: Client, msg: dict):
             else:
                 await reply_text(role_help_text(uid))
             return
+
+        # ── Welcome / Goodbye / Rules / Report / Lock ───────────────────
+        # ── Welcome / Goodbye / Rules / Report / Lock ──────────────────────
+        if raw_cmd == "setwelcome":
+            if not is_authorized_actor():
+                return await security_fail()
+            raw_text = parts[1].strip() if len(parts) > 1 else ""
+            if not raw_text and reply:
+                raw_text = (reply.get("text") or reply.get("caption") or "").strip()
+            if not raw_text:
+                return await reply_text(
+                    "❌ Usage: `/setwelcome <text>`\n"
+                    "Variables: `{mention}`, `{name}`, `{id}`\n"
+                    "Toggle: `/welcome on` or `/welcome off`"
+                )
+            if raw_text.lower() in ("off", "disable", "clear", "none"):
+                _save_welcome_for_chat(action_chat_id, None)
+                return await reply_text("✅ Welcome message cleared.")
+            existing = _welcome_for_chat(action_chat_id) or {}
+            _save_welcome_for_chat(
+                action_chat_id,
+                {
+                    "text":       raw_text,
+                    "enabled":    existing.get("enabled", True),
+                    "set_by":     uid,
+                    "updated_at": str(datetime.now()),
+                },
+            )
+            await reply_text(
+                f"✅ Welcome message saved!\n"
+                f"Status: {'🟢 On' if existing.get('enabled', True) else '🔴 Off'}\n\n"
+                f"Preview:\n{_format_welcome_text(raw_text, {'id': uid, 'first_name': 'User'})}"
+            )
+            return
+
+        if raw_cmd == "welcome":
+            if not is_authorized_actor():
+                return await security_fail()
+            entry = _welcome_for_chat(action_chat_id)
+            if not args:
+                # Show current status
+                if isinstance(entry, dict) and entry.get("text"):
+                    status = "🟢 On" if entry.get("enabled", True) else "🔴 Off"
+                    return await reply_text(
+                        f"🎉 **Welcome Message**\nStatus: {status}\n\n"
+                        f"{entry['text']}\n\n"
+                        f"Toggle: `/welcome on` or `/welcome off`\n"
+                        f"Change text: `/setwelcome <text>`"
+                    )
+                return await reply_text(
+                    "🎉 No welcome message set.\nUse `/setwelcome <text>` to add one."
+                )
+            flag = args[0].lower()
+            if flag not in ("on", "off", "yes", "no", "enable", "disable"):
+                return await reply_text("❌ Usage: `/welcome on` or `/welcome off`")
+            enabled = flag in ("on", "yes", "enable")
+            if not isinstance(entry, dict) or not entry.get("text"):
+                return await reply_text(
+                    "❌ No welcome message saved yet.\n"
+                    "Use `/setwelcome <text>` first."
+                )
+            entry["enabled"] = enabled
+            entry["updated_at"] = str(datetime.now())
+            _save_welcome_for_chat(action_chat_id, entry)
+            status_icon = "🟢" if enabled else "🔴"
+            return await reply_text(f"{status_icon} Welcome message turned **{'on' if enabled else 'off'}**.")
+
+        if raw_cmd == "setgoodbye":
+            if not is_authorized_actor():
+                return await security_fail()
+            raw_text = parts[1].strip() if len(parts) > 1 else ""
+            if not raw_text and reply:
+                raw_text = (reply.get("text") or reply.get("caption") or "").strip()
+            if not raw_text:
+                return await reply_text(
+                    "❌ Usage: `/setgoodbye <text>`\n"
+                    "Variables: `{mention}`, `{name}`, `{id}`\n"
+                    "Toggle: `/goodbye on` or `/goodbye off`"
+                )
+            if raw_text.lower() in ("off", "disable", "clear", "none"):
+                _save_goodbye_for_chat(action_chat_id, None)
+                return await reply_text("✅ Goodbye message cleared.")
+            existing = _goodbye_for_chat(action_chat_id) or {}
+            _save_goodbye_for_chat(
+                action_chat_id,
+                {
+                    "text":       raw_text,
+                    "enabled":    existing.get("enabled", True),
+                    "set_by":     uid,
+                    "updated_at": str(datetime.now()),
+                },
+            )
+            await reply_text(
+                f"✅ Goodbye message saved!\n"
+                f"Status: {'🟢 On' if existing.get('enabled', True) else '🔴 Off'}"
+            )
+            return
+
+        if raw_cmd == "goodbye":
+            if not is_authorized_actor():
+                return await security_fail()
+            entry = _goodbye_for_chat(action_chat_id)
+            if not args:
+                if isinstance(entry, dict) and entry.get("text"):
+                    status = "🟢 On" if entry.get("enabled", True) else "🔴 Off"
+                    return await reply_text(
+                        f"👋 **Goodbye Message**\nStatus: {status}\n\n"
+                        f"{entry['text']}\n\n"
+                        f"Toggle: `/goodbye on` or `/goodbye off`\n"
+                        f"Change text: `/setgoodbye <text>`"
+                    )
+                return await reply_text(
+                    "👋 No goodbye message set.\nUse `/setgoodbye <text>` to add one."
+                )
+            flag = args[0].lower()
+            if flag not in ("on", "off", "yes", "no", "enable", "disable"):
+                return await reply_text("❌ Usage: `/goodbye on` or `/goodbye off`")
+            enabled = flag in ("on", "yes", "enable")
+            if not isinstance(entry, dict) or not entry.get("text"):
+                return await reply_text(
+                    "❌ No goodbye message saved yet.\n"
+                    "Use `/setgoodbye <text>` first."
+                )
+            entry["enabled"] = enabled
+            entry["updated_at"] = str(datetime.now())
+            _save_goodbye_for_chat(action_chat_id, entry)
+            status_icon = "🟢" if enabled else "🔴"
+            return await reply_text(f"{status_icon} Goodbye message turned **{'on' if enabled else 'off'}**.")
+
+        if raw_cmd == "setrules":
+            if not is_authorized_actor():
+                return await security_fail()
+            raw_text = parts[1].strip() if len(parts) > 1 else ""
+            if not raw_text and reply:
+                raw_text = (reply.get("text") or reply.get("caption") or "").strip()
+            if not raw_text:
+                return await reply_text(
+                    "❌ Usage: `/setrules <text>`\n"
+                    "Toggle: `/rules on` or `/rules off`"
+                )
+            if raw_text.lower() in ("off", "disable", "clear", "none"):
+                _save_rules_for_chat(action_chat_id, None)
+                return await reply_text("✅ Rules cleared.")
+            existing = _rules_for_chat(action_chat_id) or {}
+            _save_rules_for_chat(
+                action_chat_id,
+                {
+                    "text":       raw_text,
+                    "enabled":    existing.get("enabled", True),
+                    "set_by":     uid,
+                    "updated_at": str(datetime.now()),
+                },
+            )
+            return await reply_text("✅ Rules saved.")
+
+        if raw_cmd == "rules":
+            entry = _rules_for_chat(action_chat_id if is_private else chat_id)
+            if is_authorized_actor() and args:
+                # Mod toggling rules on/off
+                flag = args[0].lower()
+                if flag not in ("on", "off", "yes", "no", "enable", "disable"):
+                    return await reply_text("❌ Usage: `/rules on` or `/rules off`")
+                enabled = flag in ("on", "yes", "enable")
+                if not isinstance(entry, dict) or not entry.get("text"):
+                    return await reply_text(
+                        "❌ No rules saved yet.\nUse `/setrules <text>` first."
+                    )
+                entry["enabled"] = enabled
+                entry["updated_at"] = str(datetime.now())
+                _save_rules_for_chat(action_chat_id if is_private else chat_id, entry)
+                status_icon = "🟢" if enabled else "🔴"
+                return await reply_text(f"{status_icon} Rules turned **{'on' if enabled else 'off'}**.")
+
+            # Regular /rules display
+            if is_private:
+                return await reply_text("Use /rules in a group.")
+            rules_text = entry.get("text") if isinstance(entry, dict) else None
+            rules_on   = entry.get("enabled", True) if isinstance(entry, dict) else True
+            if not rules_text:
+                return await reply_text("📜 No rules set for this group yet.")
+            if not rules_on:
+                return await reply_text("📜 Rules are currently disabled for this group.")
+            await reply_text(f"📜 **Group Rules**\n\n{rules_text}")
+            return
+
+        if raw_cmd == "rules":
+            if is_private:
+                return await reply_text("Use /rules in a group.")
+            entry = _rules_for_chat(chat_id)
+            rules_text = entry.get("text") if isinstance(entry, dict) else None
+            if not rules_text:
+                return await reply_text("📜 No rules set for this group yet.")
+            await reply_text(f"📜 **Group Rules**\n\n{rules_text}")
+            return
+
+        if raw_cmd == "report":
+            if is_private:
+                return await reply_text("Use /report in a group.")
+            reporter = msg.get("from", {})
+            reason = " ".join(args).strip() or "No reason provided"
+            target = None
+            target_id = None
+            target_msg_id = msg_id
+            if reply:
+                target = reply.get("from", {})
+                target_id = target.get("id")
+                target_msg_id = reply.get("message_id") or msg_id
+            chat = msg.get("chat", {})
+            chat_title = chat.get("title") or "Group"
+            link = _message_link(chat, target_msg_id)
+            report_lines = [
+                "🚨 **New Report**",
+                f"Chat: *{_escape_markdown(chat_title)}* (`{chat_id}`)",
+                f"Reporter: {make_mention(reporter)} (`{uid}`)",
+                f"Reason: {reason}",
+            ]
+            if target_id:
+                report_lines.append(f"Reported User: {make_mention(target)} (`{target_id}`)")
+            if link:
+                report_lines.append(f"Message: {link}")
+            report_text = "\n".join(report_lines)
+
+            lg = get_log_group()
+            if lg:
+                await tg_send(lg, report_text)
+
+            try:
+                async for member in bot.get_chat_members(chat_id, filter=enums.ChatMembersFilter.ADMINISTRATORS):
+                    user = getattr(member, "user", None)
+                    if not user or getattr(user, "is_bot", False):
+                        continue
+                    try:
+                        await tg_send(user.id, report_text)
+                    except Exception:
+                        pass
+            except Exception as admin_err:
+                log_msg(f"report admin notify failed: {admin_err}", "WARNING")
+
+            await reply_text("✅ Report sent to admins.")
+            return
+
+        if raw_cmd in ("hlock", "lock"):
+            if not await check_mod("mute"):
+                return
+            if is_private:
+                return await reply_text("Use /hlock in a group or via a connected group.")
+            dur = parse_duration_token(args[0]) if args else None
+            if args and dur is None:
+                return await reply_text("❌ Invalid duration. Examples: 10m, 1h, 1d")
+            lock_entry = _lock_for_chat(action_chat_id)
+            if lock_entry and lock_entry.get("locked"):
+                if dur:
+                    until_ts = int(time.time()) + dur
+                    lock_entry["until_ts"] = until_ts
+                    _save_lock_for_chat(action_chat_id, lock_entry)
+                    cancel_temp_action("lock", action_chat_id, action_chat_id)
+                    schedule_temp_action(
+                        "lock", action_chat_id, action_chat_id, until_ts, uid,
+                        "Chat lock", extra={"permissions": lock_entry.get("permissions")},
+                    )
+                    return await reply_text(f"🔒 Chat lock extended to {format_duration(dur)}.")
+                return await reply_text("🔒 Chat is already locked.")
+
+            original_perms = _FULL_PERMISSIONS
+            try:
+                chat_obj = await bot.get_chat(action_chat_id)
+                original_perms = _chat_permissions_payload(chat_obj)
+            except Exception as perm_err:
+                log_msg(f"lock permissions load failed for {action_chat_id}: {perm_err}", "WARNING")
+
+            ok, err = await api_set_chat_permissions(action_chat_id, _MUTE_PERMISSIONS)
+            if not ok:
+                return await reply_text(f"❌ Lock failed: {err}")
+
+            until_ts = int(time.time()) + dur if dur else 0
+            _save_lock_for_chat(
+                action_chat_id,
+                {
+                    "locked": True,
+                    "set_by": uid,
+                    "set_at": str(datetime.now()),
+                    "until_ts": until_ts,
+                    "permissions": original_perms,
+                },
+            )
+            if dur:
+                schedule_temp_action(
+                    "lock", action_chat_id, action_chat_id, until_ts, uid,
+                    "Chat lock", extra={"permissions": original_perms},
+                )
+                return await reply_text(f"🔒 Chat locked for {format_duration(dur)}.")
+            return await reply_text("🔒 Chat locked until manually unlocked.")
+
+        if raw_cmd in ("hunlock", "unlock"):
+            if not await check_mod("mute"):
+                return
+            if is_private:
+                return await reply_text("Use /hunlock in a group or via a connected group.")
+            lock_entry = _lock_for_chat(action_chat_id)
+            restore_perms = None
+            if isinstance(lock_entry, dict):
+                restore_perms = lock_entry.get("permissions")
+            if restore_perms is None:
+                restore_perms = _FULL_PERMISSIONS
+            ok, err = await api_set_chat_permissions(action_chat_id, restore_perms)
+            if not ok:
+                return await reply_text(f"❌ Unlock failed: {err}")
+            _save_lock_for_chat(action_chat_id, None)
+            cancel_temp_action("lock", action_chat_id, action_chat_id)
+            return await reply_text("🔓 Chat unlocked.")
 
         # ── /hr ───────────────────────────────────────────────────────────
         if raw_cmd == "hr":

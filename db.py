@@ -33,11 +33,16 @@ class MongoDBHandler:
             "user_connections": "user_connections",
             "ttt_scores": "ttt_scores",
             "ttt_state": "ttt_state",
-                "active_conn": "active_connections",
-                "notes": "group_notes",
-                "filters": "group_filters",
-                "blocklists": "blocklists",
-                "blocklist_mode": "blocklist_mode",
+            "active_conn": "active_connections",
+            "notes": "group_notes",
+            "filters": "group_filters",
+            "blocklists": "blocklists",
+            "blocklist_mode": "blocklist_mode",
+            "welcome": "welcome_messages",
+            "goodbye": "goodbye_messages",
+            "rules": "group_rules",
+            "chat_locks": "chat_locks",
+            "chat_titles": "chat_titles",
         }
         
     def connect(self) -> bool:
@@ -250,6 +255,38 @@ class MongoDBHandler:
         """Save keyword filters per group."""
         return self._save_collection_data("filters", data)
 
+    def load_welcome(self) -> Dict[str, Any]:
+        """Load welcome messages per group."""
+        return self._load_collection_data("welcome", {})
+
+    def save_welcome(self, data: Dict[str, Any]) -> bool:
+        """Save welcome messages per group."""
+        return self._save_collection_data("welcome", data)
+
+    def load_goodbye(self) -> Dict[str, Any]:
+        """Load goodbye messages per group."""
+        return self._load_collection_data("goodbye", {})
+
+    def save_goodbye(self, data: Dict[str, Any]) -> bool:
+        """Save goodbye messages per group."""
+        return self._save_collection_data("goodbye", data)
+
+    def load_rules(self) -> Dict[str, Any]:
+        """Load group rules."""
+        return self._load_collection_data("rules", {})
+
+    def save_rules(self, data: Dict[str, Any]) -> bool:
+        """Save group rules."""
+        return self._save_collection_data("rules", data)
+
+    def load_chat_locks(self) -> Dict[str, Any]:
+        """Load chat lock state per group."""
+        return self._load_collection_data("chat_locks", {})
+
+    def save_chat_locks(self, data: Dict[str, Any]) -> bool:
+        """Save chat lock state per group."""
+        return self._save_collection_data("chat_locks", data)
+
     def load_ttt_scores(self) -> Dict[str, Any]:
         """Load Tic-Tac-Toe scores."""
         return self._load_collection_data("ttt_scores", {})
@@ -265,6 +302,14 @@ class MongoDBHandler:
     def save_ttt_state(self, data: Dict[str, Any]) -> bool:
         """Save Tic-Tac-Toe runtime state snapshot."""
         return self._save_collection_data("ttt_state", data)
+
+    def load_chat_titles(self) -> Dict[str, Any]:
+        """Load cached chat titles."""
+        return self._load_collection_data("chat_titles", {})
+
+    def save_chat_titles(self, data: Dict[str, Any]) -> bool:
+        """Save cached chat titles."""
+        return self._save_collection_data("chat_titles", data)
     
     def disconnect(self):
         """Disconnect from MongoDB and close connection pool."""
