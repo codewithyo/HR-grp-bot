@@ -83,6 +83,7 @@ MODERATION_COMMANDS = {
     "save", "get", "clear", "notes",
     "filter", "stop", "filters",
     "addblocklist", "deleteblocklist", "removeblocklist", "blocklists", "blocklistmode",
+    "hprotect", "hp", "hunprotect", "hup", "hprotected", "protect", "unprotect", "protected",
 }
 ACTION_LOG_AUTO_DELETE = 60  # seconds
 
@@ -428,13 +429,17 @@ def verify_storage_restored():
            {chat_id: {name: {...}}} dicts, not {chat_id: {"data": [...]}}.
            Count the inner keys directly instead of looking for a "data" list.
     """
+    protected_data = _normalize_protected_store(load(PROTECT_FILE))
+    protected_count = sum(
+        len(v) for v in protected_data.values() if isinstance(v, dict)
+    )
     stats = {
         "warns":       len(load(WARN_FILE)),
         "notes":       sum(len(v) for v in load(NOTES_FILE).values() if isinstance(v, dict)),
         "filters":     sum(len(v) for v in load(FILTERS_FILE).values() if isinstance(v, dict)),
         "blocklists":  sum(len(v) for v in load(BLOCKLIST_FILE).values() if isinstance(v, dict)),
         "cases":       len(load(CASE_FILE)),
-        "protections": len(load(PROTECT_FILE)),
+        "protections": protected_count,
     }
 
     status_lines = []
@@ -637,9 +642,10 @@ async def api_mute(chat_id: int, user_id: int, until_date: int = None) -> tuple[
     r = await tg_api("restrictChatMember", json=payload)
     return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
 
-async def api_unmute(chat_id: int, user_id: int) -> tuple[bool, str]:
+async def api_unmute(chat_id: int, user_id: int, permissions: dict | None = None) -> tuple[bool, str]:
+    perms = permissions if isinstance(permissions, dict) else _FULL_PERMISSIONS
     r = await tg_api("restrictChatMember", json={
-        "chat_id": chat_id, "user_id": user_id, "permissions": _FULL_PERMISSIONS,
+        "chat_id": chat_id, "user_id": user_id, "permissions": perms,
     })
     return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
 
@@ -1273,12 +1279,51 @@ def set_blocklist_mode(chat_id: int, mode: str):
 # MISC HELPERS
 # =========================================================
 
-def is_protected(uid: int) -> bool:
-    cache_key = f"protected:{uid}"
+def _normalize_protected_store(raw) -> dict:
+    data: dict[str, dict] = {}
+    global_map: dict[str, bool] = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if key == "__global__" and isinstance(value, dict):
+                for uid, flag in value.items():
+                    if flag:
+                        global_map[str(uid)] = True
+                continue
+            if isinstance(value, dict):
+                cleaned = {str(uid): True for uid, flag in value.items() if flag}
+                if cleaned:
+                    data[str(key)] = cleaned
+            else:
+                if value:
+                    global_map[str(key)] = True
+    elif isinstance(raw, list):
+        for uid in raw:
+            global_map[str(uid)] = True
+    if global_map:
+        data["__global__"] = global_map
+    return data
+
+
+def _load_protected_store() -> dict:
+    return _normalize_protected_store(load(PROTECT_FILE))
+
+
+def is_protected(uid: int, chat_id: int | None = None) -> bool:
+    cache_key = f"protected:{chat_id}:{uid}" if chat_id is not None else f"protected:{uid}"
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
-    result = str(uid) in load(PROTECT_FILE)
+    data = _load_protected_store()
+    key = str(uid)
+    result = False
+    if chat_id is not None:
+        group = data.get(str(chat_id))
+        if isinstance(group, dict) and key in group:
+            result = True
+    if not result:
+        global_map = data.get("__global__")
+        if isinstance(global_map, dict) and key in global_map:
+            result = True
     _cache.set(cache_key, result)
     return result
 
@@ -1520,6 +1565,25 @@ def format_admin_privileges(privileges) -> str:
     ]
     return ", ".join(granted) if granted else "none"
 
+def _chat_permissions_payload(chat) -> dict:
+    perms = getattr(chat, "permissions", None)
+    if perms is None:
+        return _FULL_PERMISSIONS
+    fields = [
+        "can_send_messages",
+        "can_send_audios",
+        "can_send_documents",
+        "can_send_photos",
+        "can_send_videos",
+        "can_send_video_notes",
+        "can_send_voice_notes",
+        "can_send_polls",
+        "can_send_other_messages",
+        "can_add_web_page_previews",
+        "can_invite_users",
+    ]
+    return {field: bool(getattr(perms, field, True)) for field in fields}
+
 def grant_all_permissions() -> dict:
     return {perm: True for perm in sorted(VALID_PERMISSIONS)}
 
@@ -1717,7 +1781,8 @@ def role_help_text(uid: int) -> str:
             "`/filters` - List all filters\n\n"
             "🛡️ **Protection Commands:**\n"
             "`/hprotect <user_id>` - Protect user from moderation\n"
-            "`/hunprotect <user_id>` - Remove user protection\n\n"
+            "`/hunprotect <user_id>` - Remove user protection\n"
+            "`/hprotected` - List protected users\n\n"
             "📋 **Moderation Commands:**\n"
             "`/hban [user_id/@user] [duration] [reason]` - Ban user\n"
             "`/hkick <user_id/@user> [reason]` - Kick user from group\n"
@@ -2267,7 +2332,13 @@ async def process_due_temp_actions(bot: Client):
         atype     = action["type"]
         try:
             if atype == "mute":
-                ok, err = await api_unmute(chat_id, target_id)
+                permissions = _FULL_PERMISSIONS
+                try:
+                    chat = await bot.get_chat(chat_id)
+                    permissions = _chat_permissions_payload(chat)
+                except Exception as perm_err:
+                    log_msg(f"temp unmute permission load failed for {chat_id}: {perm_err}", "WARNING")
+                ok, err = await api_unmute(chat_id, target_id, permissions=permissions)
                 if ok:
                     msg_text = f"🔊 Temporary mute ended for `{target_id}`\n⏰ Expired: {format_timestamp(until_ts)}"
                     if action.get("case_id"):
@@ -2419,7 +2490,7 @@ async def handle_message(bot: Client, msg: dict):
                 bkw = blocklist_check(chat_id, text)
                 if bkw:
                     # skip protected users and owners
-                    if not is_protected(uid) and uid != OWNER_ID:
+                    if not is_protected(uid, chat_id) and uid != OWNER_ID:
                         mode = get_blocklist_mode(chat_id)
                         # delete message when matched
                         try:
@@ -3262,7 +3333,7 @@ async def handle_message(bot: Client, msg: dict):
                 pass
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
-            if is_protected(tid):
+            if is_protected(tid, action_chat_id):
                 return await reply_text("🛡 That user is protected.")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
@@ -3298,7 +3369,7 @@ async def handle_message(bot: Client, msg: dict):
                 pass
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No Reason")
-            if is_protected(tid):
+            if is_protected(tid, action_chat_id):
                 return await reply_text("🛡 That user is protected.")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
@@ -3327,7 +3398,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text("Afraid I can't stop an admin from talking!")
             if tid == _bot_id:
                 return await reply_text("I'm not muting myself!")
-            if is_protected(tid):
+            if is_protected(tid, action_chat_id):
                 return await reply_text("🛡 That user is protected.")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
@@ -3456,7 +3527,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hwarn <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
-            if is_protected(tid):
+            if is_protected(tid, action_chat_id):
                 return await reply_text("🛡 That user is protected.")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
@@ -3574,7 +3645,7 @@ async def handle_message(bot: Client, msg: dict):
             target, tid = extract_reply_user(reply)
             if not tid:
                 return
-            if is_protected(tid):
+            if is_protected(tid, action_chat_id):
                 return await reply_text("🛡 That user is protected.")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
                 return
@@ -3589,34 +3660,82 @@ async def handle_message(bot: Client, msg: dict):
             )
             return
 
-        if raw_cmd in ("hprotect", "hp"):
+        if raw_cmd in ("hprotect", "hp", "protect"):
             if not is_owner_actor():
-                return
+                return await reply_text("❌ Owner only.")
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /hprotect <user_id/@user>")
-            data = load(PROTECT_FILE)
-            key  = str(tid)
-            if key in data:
+            data = _load_protected_store()
+            chat_key = str(action_chat_id)
+            group = data.get(chat_key)
+            if not isinstance(group, dict):
+                group = {}
+            key = str(tid)
+            if key in group:
                 return await reply_text(f"ℹ️ {make_mention(target)} is already protected.")
-            data[key] = True
+            group[key] = True
+            data[chat_key] = group
             await save_and_backup(PROTECT_FILE, data)
             await reply_text(f"🛡 {make_mention(target)} is now protected.")
             return
 
-        if raw_cmd in ("hunprotect", "hup"):
+        if raw_cmd in ("hunprotect", "hup", "unprotect"):
             if not is_owner_actor():
-                return
+                return await reply_text("❌ Owner only.")
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /hunprotect <user_id/@user>")
-            data = load(PROTECT_FILE)
-            key  = str(tid)
-            if key not in data:
+            data = _load_protected_store()
+            chat_key = str(action_chat_id)
+            group = data.get(chat_key)
+            if not isinstance(group, dict):
+                group = {}
+            global_map = data.get("__global__") if isinstance(data.get("__global__"), dict) else {}
+            key = str(tid)
+            if key not in group and key not in global_map:
                 return await reply_text(f"ℹ️ {make_mention(target)} is not protected.")
-            del data[key]
+            group.pop(key, None)
+            global_map.pop(key, None)
+            if group:
+                data[chat_key] = group
+            else:
+                data.pop(chat_key, None)
+            if global_map:
+                data["__global__"] = global_map
+            else:
+                data.pop("__global__", None)
             await save_and_backup(PROTECT_FILE, data)
             await reply_text(f"🔓 Protection removed from {make_mention(target)}.")
+            return
+
+        if raw_cmd in ("hprotected", "protected"):
+            if not is_owner_actor():
+                return await reply_text("❌ Owner only.")
+            data = _load_protected_store()
+            chat_key = str(action_chat_id)
+            group = data.get(chat_key)
+            if not isinstance(group, dict):
+                group = {}
+            global_map = data.get("__global__") if isinstance(data.get("__global__"), dict) else {}
+            group_ids = sorted(group.keys(), key=lambda x: int(x) if x.lstrip("-").isdigit() else x)
+            lines = [f"🛡 **Protected Users** — `{len(group_ids)}`"]
+            if group_ids:
+                for uid_str in group_ids[:50]:
+                    lines.append(f"• `{uid_str}`")
+                if len(group_ids) > 50:
+                    lines.append(f"…and `{len(group_ids) - 50}` more")
+            else:
+                lines.append("No protected users for this group.")
+            if global_map:
+                global_ids = sorted(global_map.keys(), key=lambda x: int(x) if x.lstrip("-").isdigit() else x)
+                lines.append("")
+                lines.append(f"🌐 **Global Protected** — `{len(global_ids)}`")
+                for uid_str in global_ids[:20]:
+                    lines.append(f"• `{uid_str}`")
+                if len(global_ids) > 20:
+                    lines.append(f"…and `{len(global_ids) - 20}` more")
+            await reply_text("\n".join(lines))
             return
 
         if raw_cmd in ("hcase", "hc"):

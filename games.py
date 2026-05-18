@@ -28,8 +28,8 @@ _HTTP_CLIENT: Optional[httpx.AsyncClient] = None
 
 # Game storage
 GAMES: Dict[str, dict] = {}  # game_id → game state
-CHALLENGES: Dict[int, dict] = {}  # msg_id → challenge
-PLAYER_GAMES: Dict[int, str] = {}  # uid → game_id (one game per player)
+CHALLENGES: Dict[str, dict] = {}  # challenge_id → challenge
+PLAYER_GAMES: Dict[int, Dict[int, str]] = {}  # uid → {chat_id: game_id}
 
 CHALLENGE_TIMEOUT = 60  # seconds
 MOVE_TIMEOUT = 120  # seconds per move
@@ -98,7 +98,10 @@ def _persist_state():
     payload = {
         "games": GAMES,
         "challenges": CHALLENGES,
-        "player_games": {str(uid): gid for uid, gid in PLAYER_GAMES.items()},
+        "player_games": {
+            str(uid): {str(cid): gid for cid, gid in games.items()}
+            for uid, games in PLAYER_GAMES.items()
+        },
         "saved_at": time.time(),
     }
     _save_data(STATE_FILE, payload)
@@ -113,30 +116,31 @@ def _restore_state():
 
     games = payload.get("games", {})
     challenges = payload.get("challenges", {})
-    player_games = payload.get("player_games", {})
-
     GAMES = games if isinstance(games, dict) else {}
 
-    # JSON/Mongo may serialize int keys as strings; normalize to int when possible.
+    # Normalize challenge keys as strings (challenge IDs are strings).
     normalized_challenges = {}
     if isinstance(challenges, dict):
         for key, value in challenges.items():
-            try:
-                normalized_key = int(key)
-            except Exception:
+            if key is None:
                 continue
-            normalized_challenges[normalized_key] = value
+            normalized_challenges[str(key)] = value
     CHALLENGES = normalized_challenges
 
-    normalized_player_games = {}
-    if isinstance(player_games, dict):
-        for key, value in player_games.items():
-            try:
-                normalized_uid = int(key)
-            except Exception:
+    # Rebuild per-user game index from active games for consistency.
+    PLAYER_GAMES = {}
+    if isinstance(GAMES, dict):
+        for game_id, game in GAMES.items():
+            if not isinstance(game, dict):
                 continue
-            normalized_player_games[normalized_uid] = value
-    PLAYER_GAMES = normalized_player_games
+            if game.get("status") != "active":
+                continue
+            chat_id = game.get("chat_id")
+            if not isinstance(chat_id, int):
+                continue
+            for pid in (game.get("player_x"), game.get("player_o")):
+                if _is_trackable_player(pid):
+                    PLAYER_GAMES.setdefault(pid, {})[chat_id] = game_id
 
     # Drop stale challenge records after restart.
     now = time.time()
@@ -184,9 +188,17 @@ def _is_trackable_player(uid: Optional[int]) -> bool:
 
 def _release_game_players(game: dict):
     """Remove active-game index for human players only."""
+    chat_id = game.get("chat_id")
     for pid in (game.get("player_x"), game.get("player_o")):
-        if _is_trackable_player(pid) and PLAYER_GAMES.get(pid) == game.get("game_id"):
-            PLAYER_GAMES.pop(pid, None)
+        if not _is_trackable_player(pid):
+            continue
+        games_for_user = PLAYER_GAMES.get(pid)
+        if not isinstance(games_for_user, dict) or not isinstance(chat_id, int):
+            continue
+        if games_for_user.get(chat_id) == game.get("game_id"):
+            games_for_user.pop(chat_id, None)
+            if not games_for_user:
+                PLAYER_GAMES.pop(pid, None)
 
 
 def _line_winning_move(board: list[str], symbol: str) -> Optional[int]:
@@ -545,21 +557,34 @@ def create_game(
     }
     GAMES[game_id] = game
     if _is_trackable_player(player_x_id):
-        PLAYER_GAMES[player_x_id] = game_id
+        PLAYER_GAMES.setdefault(player_x_id, {})[chat_id] = game_id
     if _is_trackable_player(player_o_id):
-        PLAYER_GAMES[player_o_id] = game_id
+        PLAYER_GAMES.setdefault(player_o_id, {})[chat_id] = game_id
     _persist_state()
     return game
 
 
-def get_game_for_player(uid: int) -> Optional[dict]:
-    """Get active game for player (if any)."""
-    game_id = PLAYER_GAMES.get(uid)
-    if not game_id:
+def get_game_for_player(uid: int, chat_id: Optional[int] = None) -> Optional[dict]:
+    """Get active game for player (optionally scoped to a chat)."""
+    games_for_user = PLAYER_GAMES.get(uid)
+    if not isinstance(games_for_user, dict) or not games_for_user:
         return None
-    game = GAMES.get(game_id)
-    if game and game["status"] == "active":
-        return game
+    if chat_id is not None:
+        game_id = games_for_user.get(chat_id)
+        if not game_id:
+            return None
+        game = GAMES.get(game_id)
+        if game and game.get("status") == "active":
+            return game
+        games_for_user.pop(chat_id, None)
+        if not games_for_user:
+            PLAYER_GAMES.pop(uid, None)
+        _persist_state()
+        return None
+    for game_id in list(games_for_user.values()):
+        game = GAMES.get(game_id)
+        if game and game.get("status") == "active":
+            return game
     return None
 
 
@@ -594,8 +619,8 @@ def record_game(
 
     winner_trackable = _is_trackable_player(winner_id)
     loser_trackable = _is_trackable_player(loser_id)
-    
-    if is_draw and winner_id and loser_id:
+
+    if is_draw and winner_id is not None and loser_id is not None:
         # Draw
         if winner_trackable:
             _ensure_score_entry(scores, winner_id, winner_name)
@@ -603,7 +628,7 @@ def record_game(
         if loser_trackable and loser_id != winner_id:
             _ensure_score_entry(scores, loser_id, loser_name)
             scores[str(loser_id)]["draws"] += 1
-    elif winner_id and loser_id:
+    elif winner_id is not None and loser_id is not None:
         # Winner
         if winner_trackable:
             _ensure_score_entry(scores, winner_id, winner_name)
@@ -748,12 +773,7 @@ def cleanup_old_games():
     
     for game_id in expired:
         game = GAMES.pop(game_id, {})
-        px = game.get("player_x")
-        po = game.get("player_o")
-        if px and px in PLAYER_GAMES and PLAYER_GAMES[px] == game_id:
-            del PLAYER_GAMES[px]
-        if po and po in PLAYER_GAMES and PLAYER_GAMES[po] == game_id:
-            del PLAYER_GAMES[po]
+        _release_game_players(game)
     if expired:
         _persist_state()
 
@@ -779,7 +799,7 @@ async def handle_ttt_command(
         
         # DM mode: play against bot
         if chat_type == "private":
-            if get_game_for_player(uid):
+            if get_game_for_player(uid, chat_id):
                 await tg_send_message(
                     chat_id,
                     "❌ You already have an active game. Use /tttend first.",
@@ -889,7 +909,7 @@ async def handle_ttt_command(
             return
         
         # Check: either player already in a game
-        if get_game_for_player(challenger_id) or get_game_for_player(opponent_id):
+        if get_game_for_player(challenger_id, chat_id) or get_game_for_player(opponent_id, chat_id):
             await tg_send_message(
                 chat_id,
                 "❌ One or both players are already in a game.",
@@ -1020,7 +1040,7 @@ async def handle_ttt_mystats(uid: int, chat_id: int, msg_id: int):
 async def handle_ttt_end(uid: int, chat_id: int, msg_id: int, is_owner: bool = False):
     """Handle /tttend (forfeit)."""
     try:
-        game = get_game_for_player(uid)
+        game = get_game_for_player(uid, chat_id)
         if not game:
             await tg_send_message(
                 chat_id,
@@ -1133,7 +1153,7 @@ async def handle_accept_challenge(
             return
 
         # Re-check player availability to avoid race conditions.
-        if get_game_for_player(challenge["challenger_id"]) or get_game_for_player(challenge["opponent_id"]):
+        if get_game_for_player(challenge["challenger_id"], chat_id) or get_game_for_player(challenge["opponent_id"], chat_id):
             await tg_answer_callback(cb_id, "❌ One player is already in another game.", alert=True)
             return
         
@@ -1322,6 +1342,11 @@ async def handle_rematch(cb_id: str, game_id: str, uid: int, chat_id: int, messa
             await tg_answer_callback(cb_id, "❌ Only players can start rematch.", alert=True)
             return
         
+        # Ensure neither player is in another active game in this chat.
+        if get_game_for_player(old_game.get("player_x"), chat_id) or get_game_for_player(old_game.get("player_o"), chat_id):
+            await tg_answer_callback(cb_id, "❌ One player is already in another game.", alert=True)
+            return
+
         # Create new game with swapped sides
         new_game = create_game(
             old_game["player_o"],  # Swapped
