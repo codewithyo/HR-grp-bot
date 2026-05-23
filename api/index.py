@@ -975,6 +975,28 @@ async def is_chat_admin(bot: Client, chat_id: int, user_id: int) -> bool:
     except Exception:
         return False
 
+
+async def get_chat_member_safe(bot: Client, chat_id, user_identifier):
+    """Coerce `user_identifier` to int and call get_chat_member with clear errors.
+
+    Returns: (member, None) on success,
+             (None, "UserNotParticipant") if user not in chat,
+             (None, "❌ ...") for other failures.
+    """
+    try:
+        uid = int(user_identifier)
+    except Exception:
+        return None, "❌ Invalid user ID."
+    try:
+        member = await bot.get_chat_member(int(chat_id), uid)
+        return member, None
+    except UserNotParticipant:
+        return None, "UserNotParticipant"
+    except BadRequest as e:
+        return None, f"❌ Could not check the target user: {e}"
+    except Exception as e:
+        return None, f"❌ Could not check the target user: {e}"
+
 async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = True):
     if not isinstance(chat, dict) or chat.get("type") != "private":
         return False
@@ -4044,14 +4066,16 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hban <user_id/@user> [duration] [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot ban yourself.")
-            try:
-                member = await bot.get_chat_member(action_chat_id, tid)
+            member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
+            if gm_err:
+                if gm_err == "UserNotParticipant":
+                    # user not in chat — allow ban attempt (Telegram will handle)
+                    pass
+                else:
+                    log_msg(f"get_chat_member failed for ban check: {gm_err}", "WARNING")
+            else:
                 if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                     return await reply_text("❌ Cannot ban an admin or the group owner.")
-            except UserNotParticipant:
-                pass
-            except Exception:
-                pass
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
             if is_protected(tid, action_chat_id):
@@ -4080,14 +4104,15 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hkick <user_id/@user> [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot kick yourself.")
-            try:
-                member = await bot.get_chat_member(action_chat_id, tid)
+            member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
+            if gm_err:
+                if gm_err == "UserNotParticipant":
+                    return await reply_text("❌ This user is not in the chat.")
+                else:
+                    log_msg(f"get_chat_member failed for kick check: {gm_err}", "WARNING")
+            else:
                 if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                     return await reply_text("❌ Cannot kick an admin or the group owner.")
-            except UserNotParticipant:
-                return await reply_text("❌ This user is not in the chat.")
-            except Exception:
-                pass
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No Reason")
             if is_protected(tid, action_chat_id):
@@ -4109,12 +4134,12 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hmute <user_id/@user> [duration] [reason]")
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
-            try:
-                member = await bot.get_chat_member(action_chat_id, tid)
-            except UserNotParticipant:
-                return await reply_text("This user isn't in the chat!")
-            except BadRequest as exc:
-                return await reply_text(f"❌ Could not check the target user: {exc}")
+            member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
+            if gm_err:
+                if gm_err == "UserNotParticipant":
+                    return await reply_text("This user isn't in the chat!")
+                else:
+                    return await reply_text(gm_err)
             if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                 return await reply_text("Afraid I can't stop an admin from talking!")
             if tid == _bot_id:
@@ -4163,12 +4188,12 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hunmute <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
-            try:
-                member = await bot.get_chat_member(action_chat_id, tid)
-            except UserNotParticipant:
-                return await reply_text("This user isn't even in the chat!")
-            except BadRequest as exc:
-                return await reply_text(f"❌ Could not check the target user: {exc}")
+            member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
+            if gm_err:
+                if gm_err == "UserNotParticipant":
+                    return await reply_text("This user isn't even in the chat!")
+                else:
+                    return await reply_text(gm_err)
             if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                 return await reply_text("This user already has the right to speak.")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
