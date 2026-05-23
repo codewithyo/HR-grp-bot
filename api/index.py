@@ -1606,11 +1606,20 @@ def extract_actor_user_id(msg: dict) -> tuple[int | None, str | None, bool]:
 def extract_reply_user(reply: dict) -> tuple[dict, int | None]:
     if not isinstance(reply, dict):
         return {}, None
+    # If the replied message is from a channel (sender_chat), callers
+    # should not try to treat it as a user. Return the sender_chat dict
+    # and None for the id so higher-level code can reply with a clear error.
+    sender_chat = reply.get("sender_chat")
+    if isinstance(sender_chat, dict):
+        return sender_chat, None
+
     target = reply.get("from")
     if not isinstance(target, dict):
         return {}, None
     tid = target.get("id")
     if not isinstance(tid, int) or tid <= 0:
+        # Keep the raw target dict (may contain username or other metadata)
+        # but indicate there's no valid positive user id.
         return target, None
     return target, tid
 
@@ -1623,6 +1632,9 @@ def parse_positive_user_id(value: str) -> int | None:
 
 def resolve_target(reply, args, idx) -> tuple[dict, int | None, str | None]:
     target, tid = extract_reply_user(reply)
+    # If reply came from a channel (sender_chat), give a specific error.
+    if isinstance(reply, dict) and reply.get("sender_chat"):
+        return {}, None, "❌ Channel messages are not supported for moderation commands."
     if tid:
         return target, tid, None
     if len(args) > idx:
@@ -1636,6 +1648,8 @@ async def resolve_target_ext(
     bot: Client, reply, args, idx
 ) -> tuple[dict, int | None, str | None]:
     target, tid = extract_reply_user(reply)
+    if isinstance(reply, dict) and reply.get("sender_chat"):
+        return {}, None, "❌ Channel messages are not supported for moderation commands."
     if tid:
         return target, tid, None
     if len(args) > idx:
@@ -4286,20 +4300,20 @@ async def handle_message(bot: Client, msg: dict):
             user_lookup = uid
             if args:
                 explicit = True
-                if args[0].startswith("@"):
-                    try:
-                        user_obj = await bot.get_user(args[0][1:])
-                        user_lookup = user_obj.id
-                    except Exception:
-                        pass
+                # Prefer reply / @username / numeric ID uniformly
+                target_tmp, tid_tmp, terr_tmp = await resolve_target_ext(bot, reply, args, 0)
+                if tid_tmp:
+                    user_lookup = tid_tmp
                 else:
-                    try:
-                        user_lookup = int(args[0])
-                    except Exception:
-                        if reply:
-                            _, rid = extract_reply_user(reply)
-                            if rid:
-                                user_lookup = rid
+                    # If resolve_target_ext couldn't find a user, fall back to reply-only lookup
+                    if reply:
+                        _, rid = extract_reply_user(reply)
+                        if rid:
+                            user_lookup = rid
+                        else:
+                            return await reply_text(f"{terr_tmp}")
+                    else:
+                        return await reply_text(f"{terr_tmp}")
             elif reply:
                 explicit = True
                 _, rid = extract_reply_user(reply)
@@ -4477,15 +4491,11 @@ async def handle_message(bot: Client, msg: dict):
                 )
                 return
             lookup = uid
-            if reply:
-                _, rid = extract_reply_user(reply)
-                if rid:
-                    lookup = rid
-            elif args:
-                p = parse_positive_user_id(args[0])
-                if not p:
-                    return await reply_text("❌ Invalid user ID.")
-                lookup = p
+            if reply or args:
+                target_tmp, tid_tmp, terr_tmp = await resolve_target_ext(bot, reply, args, 0)
+                if not tid_tmp:
+                    return await reply_text(terr_tmp)
+                lookup = tid_tmp
             mod = get_mod_info(lookup)
             if not mod:
                 return await reply_text("❌ That user is not a moderator.")
