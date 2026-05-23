@@ -98,7 +98,7 @@ MODERATION_COMMANDS = {
     "setwelcome", "setgoodbye", "setrules", "hlock", "lock", "hunlock", "unlock",
     "locktype", "locktypes",
     # toggle commands
-    "welcome", "goodbye", "rules",
+    "welcome", "goodbye", "rules", "bot",
 }
 ACTION_LOG_AUTO_DELETE = 60  # seconds
 
@@ -197,6 +197,7 @@ URL_DELETE_FILE       = f"{STORAGE_PATH}/url_delete.json"
 TTT_SCORES_FILE       = f"{STORAGE_PATH}/ttt_scores.json"
 TTT_STATE_FILE        = f"{STORAGE_PATH}/ttt_state.json"
 CHAT_TITLES_FILE      = f"{STORAGE_PATH}/chat_titles.json"
+BOT_STATUS_FILE = f"{STORAGE_PATH}/bot_status.json"
 
 FALLBACK_FILE_MAP = {
     AUTH_FILE:             f"{FALLBACK_STORAGE_PATH}/auth.json",
@@ -221,6 +222,7 @@ FALLBACK_FILE_MAP = {
     RULES_FILE:            f"{FALLBACK_STORAGE_PATH}/rules.json",
     LOCKS_FILE:            f"{FALLBACK_STORAGE_PATH}/chat_locks.json",
     CHAT_TITLES_FILE:      f"{FALLBACK_STORAGE_PATH}/chat_titles.json",
+    BOT_STATUS_FILE:       f"{FALLBACK_STORAGE_PATH}/bot_status.json",
 }
 
 ALL_FILES = list(FALLBACK_FILE_MAP.keys())
@@ -248,6 +250,7 @@ FILE_LABEL = {
     RULES_FILE:            "rules",
     LOCKS_FILE:            "chat_locks",
     CHAT_TITLES_FILE:      "chat_titles",
+    BOT_STATUS_FILE:       "bot_status",
 }
 
 MONGO_LOADERS = {
@@ -273,6 +276,7 @@ MONGO_LOADERS = {
     RULES_FILE:            mongo_db.load_rules,
     LOCKS_FILE:            mongo_db.load_chat_locks,
     CHAT_TITLES_FILE:      mongo_db.load_chat_titles,
+    BOT_STATUS_FILE:       mongo_db.load_bot_status,
 }
 
 MONGO_SAVERS = {
@@ -298,12 +302,14 @@ MONGO_SAVERS = {
     RULES_FILE:            mongo_db.save_rules,
     LOCKS_FILE:            mongo_db.save_chat_locks,
     CHAT_TITLES_FILE:      mongo_db.save_chat_titles,
+    BOT_STATUS_FILE:       mongo_db.save_bot_status,
 }
 
 MONGO_PERSISTENT_FILES = {
     CONNECTIONS_FILE,
     USER_CONNECTIONS_FILE,
     ACTIVE_CONN_FILE,
+    BOT_STATUS_FILE,
 }
 
 # =========================================================
@@ -1454,6 +1460,28 @@ def cache_chat_title(chat_id: int, title: str):
         data = {}
     data[str(chat_id)] = title
     save(CHAT_TITLES_FILE, data)
+
+ # =========================================================
+# BOT ON/OFF STATUS (per-chat)
+# =========================================================
+
+def is_bot_enabled(chat_id: int) -> bool:
+    """Return True if the bot is active in this chat (default: True)."""
+    cache_key = f"bot_enabled:{chat_id}"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return cached
+    data   = load(BOT_STATUS_FILE)
+    result = data.get(str(chat_id), True)   # default ON
+    _cache.set(cache_key, result)
+    return result
+
+def set_bot_enabled(chat_id: int, enabled: bool):
+    """Enable or disable the bot for a specific chat."""
+    data = load(BOT_STATUS_FILE)
+    data[str(chat_id)] = enabled
+    save(BOT_STATUS_FILE, data)
+    _cache.invalidate(f"bot_enabled:{chat_id}")   
 
 # =========================================================
 # WELCOME / GOODBYE / RULES / LOCKS
@@ -2986,6 +3014,13 @@ async def handle_message(bot: Client, msg: dict):
                 )
             action_chat_id = resolved
 
+       # ── Bot ON/OFF guard ──────────────────────────────────────────────
+        if raw_cmd != "bot":
+            effective_chat = chat_id
+            _caller_is_owner = (not is_anon_admin) and is_owner(uid)
+            if not is_bot_enabled(effective_chat) and not _caller_is_owner:
+                return
+
         # ── Actor helpers ─────────────────────────────────────────────────
         def is_owner_actor() -> bool:
             return (not is_anon_admin) and is_owner(uid)
@@ -3465,6 +3500,53 @@ async def handle_message(bot: Client, msg: dict):
             _save_lock_for_chat(action_chat_id, None)
             cancel_temp_action("lock", action_chat_id, action_chat_id)
             return await reply_text("🔓 Chat unlocked.")
+
+        # ── /bot on | /bot off ────────────────────────────────────────────
+        if raw_cmd == "bot":
+            if not is_owner_actor():
+                return await reply_text("❌ Only the bot owner can toggle bot status.")
+
+            if not args:
+                current = is_bot_enabled(action_chat_id)
+                status  = "🟢 ON" if current else "🔴 OFF"
+                return await reply_text(
+                    f"🤖 **Bot Status**\n\n"
+                    f"Current status: {status}\n\n"
+                    f"Usage:\n"
+                    f"`/bot on` — enable bot for moderators\n"
+                    f"`/bot off` — disable bot (owner-only mode)"
+                )
+
+            flag = args[0].lower()
+            if flag not in ("on", "off", "yes", "no", "enable", "disable"):
+                return await reply_text("❌ Usage: `/bot on` or `/bot off`")
+
+            enabled = flag in ("on", "yes", "enable")
+            set_bot_enabled(action_chat_id, enabled)
+
+            status_icon = "🟢" if enabled else "🔴"
+            status_word = "ON" if enabled else "OFF"
+
+            msg_text = (
+                f"{status_icon} **Bot turned {status_word}**\n\n"
+                + (
+                    "✅ Moderators can use all their commands again."
+                    if enabled else
+                    "🔒 Only the owner can use commands until bot is turned back on."
+                )
+            )
+            await reply_text(msg_text)
+
+            lg = get_log_group()
+            if lg:
+                await tg_send(
+                    lg,
+                    f"🤖 Bot status changed\n\n"
+                    f"Chat: `{action_chat_id}`\n"
+                    f"Status: {status_icon} {status_word}\n"
+                    f"Changed by: `{uid}`",
+                )
+            return
 
         # FIX-G: locktype / locktypes stub
         if raw_cmd in ("locktype", "locktypes"):

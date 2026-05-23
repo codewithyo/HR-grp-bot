@@ -43,6 +43,7 @@ class MongoDBHandler:
             "rules": "group_rules",
             "chat_locks": "chat_locks",
             "chat_titles": "chat_titles",
+            "bot_status": "bot_status",
         }
         
     def connect(self) -> bool:
@@ -310,6 +311,14 @@ class MongoDBHandler:
     def save_chat_titles(self, data: Dict[str, Any]) -> bool:
         """Save cached chat titles."""
         return self._save_collection_data("chat_titles", data)
+
+    def load_bot_status(self) -> Dict[str, Any]:
+        """Load per-chat bot enabled/disabled status."""
+        return self._load_collection_data("bot_status", {})
+
+    def save_bot_status(self, data: Dict[str, Any]) -> bool:
+        """Save per-chat bot enabled/disabled status."""
+        return self._save_collection_data("bot_status", data)   
     
     def disconnect(self):
         """Disconnect from MongoDB and close connection pool."""
