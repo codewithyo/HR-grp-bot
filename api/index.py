@@ -3014,7 +3014,7 @@ async def handle_message(bot: Client, msg: dict):
                 )
             action_chat_id = resolved
 
-       # ── Bot ON/OFF guard ──────────────────────────────────────────────
+      # ── Bot ON/OFF guard ──────────────────────────────────────────────
         if raw_cmd != "bot":
             effective_chat = chat_id
             _caller_is_owner = (not is_anon_admin) and is_owner(uid)
