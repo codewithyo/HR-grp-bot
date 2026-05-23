@@ -2251,7 +2251,7 @@ def moderation_help_markup(section: str = "home") -> dict:
         (("🔍 Filters", "cb:help_filters"), ("🔒 Blocklist", "cb:help_blocklist"), ("🔗 Connections", "cb:help_connections")),
         (("🔐 Authorization", "cb:help_auth"), ("📊 Stats", "cb:help_stats"), ("🎮 Games", "cb:help_games")),
         (("🎉 Welcome", "cb:help_welcome"), ("📜 Rules", "cb:help_rules"), ("🚨 Report", "cb:help_report")),
-        (("🔒 Lock", "cb:help_lock"),),
+        (("🔒 Lock", "cb:help_lock"), ("🤖 Bot Toggle", "cb:help_bot")),
     )
     if section == "home":
         return build_markup(*base_rows)
@@ -2477,6 +2477,20 @@ def moderation_help_text(section: str, uid: int) -> str:
             "• Track all mod actions in case logs.\n"
             "• View user info and ban/mute history.\n"
             "• Monitor moderator activity.\n"
+        )
+   if section == "bot":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🤖 **Bot On/Off Toggle**\n\n"
+            "`/bot` — Check current bot status\n"
+            "`/bot on` — Enable bot (moderators can use all commands)\n"
+            "`/bot off` — Disable bot (owner-only mode)\n\n"
+            "**Behaviour**\n"
+            "• When OFF: only the owner can use any command\n"
+            "• When ON: all moderators have full access as normal\n"
+            "• Status is per-group and persists across restarts\n"
+            "• The `/bot` command itself always works for the owner\n\n"
+            "**Owner only command.**\n"
         )
     if section == "auth":
         return (
