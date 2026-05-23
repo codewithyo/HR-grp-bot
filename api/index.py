@@ -1,6 +1,17 @@
 # =========================================================
 # ADVANCED TELEGRAM MODERATION BOT — KOYEB VERSION (FIXED)
 # =========================================================
+# FIXES APPLIED:
+#   FIX-A: Replaced ALL bot.get_chat_member() calls with direct Bot API
+#           (getChatMember) to avoid Pyrogram "Peer id invalid" errors
+#           caused by the empty in-memory peer cache after restarts.
+#   FIX-B: Added _BotApiMember wrapper + api_get_chat_member() helper.
+#   FIX-C: Removed dead code block in moderation_help_markup().
+#   FIX-D: Removed duplicate `if raw_cmd == "rules":` handler block.
+#   FIX-E: Fixed hlock/hunlock to allow PM-connected users.
+#   FIX-F: Added missing /hunauth command handler.
+#   FIX-G: Added stub handler for locktype/locktypes commands.
+# =========================================================
 
 import os, json, time, random, string, asyncio, httpx, re
 import traceback, sys, shutil, io, threading
@@ -73,7 +84,7 @@ BOT_COMMANDS = [
     {"command": "help",           "description": "📖 Display available commands for your role"},
     {"command": "hr",             "description": "🆔 Get user ID & profile information"},
     {"command": "hstats",         "description": "📊 Show group moderation stats"},
-]  
+]
 VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
 
 MODERATION_COMMANDS = {
@@ -86,7 +97,7 @@ MODERATION_COMMANDS = {
     "hprotect", "hp", "hunprotect", "hup", "hprotected", "protect", "unprotect", "protected",
     "setwelcome", "setgoodbye", "setrules", "hlock", "lock", "hunlock", "unlock",
     "locktype", "locktypes",
-    # new toggle commands
+    # toggle commands
     "welcome", "goodbye", "rules",
 }
 ACTION_LOG_AUTO_DELETE = 60  # seconds
@@ -337,8 +348,7 @@ def init_storage_files():
                 shutil.copy2(primary, fallback)
             except Exception as e:
                 log_msg(f"WARNING syncing fallback: {e}", "WARNING")
-    
-    # Ensure TEMP_ACTIONS_FILE uses a list by default (not an object).
+
     try:
         if os.path.exists(TEMP_ACTIONS_FILE):
             with open(TEMP_ACTIONS_FILE, "r") as f:
@@ -348,7 +358,6 @@ def init_storage_files():
                 except Exception:
                     data = None
             if isinstance(data, dict) or data is None:
-                # overwrite with an empty list to avoid type-mismatch bugs
                 try:
                     with open(TEMP_ACTIONS_FILE, "w") as f:
                         json.dump([], f, indent=2)
@@ -489,13 +498,6 @@ def sync_storage_with_mongo():
             _cache.invalidate(file)
 
 def verify_storage_restored():
-    """Verify and log what data was restored from storage on startup.
-
-    FIX 1: CASES_FILE typo → CASE_FILE (was a NameError crash at startup).
-    FIX 3: Notes/filters/blocklists/protections are stored as plain
-           {chat_id: {name: {...}}} dicts, not {chat_id: {"data": [...]}}.
-           Count the inner keys directly instead of looking for a "data" list.
-    """
     protected_data = _normalize_protected_store(load(PROTECT_FILE))
     protected_count = sum(
         len(v) for v in protected_data.values() if isinstance(v, dict)
@@ -512,12 +514,10 @@ def verify_storage_restored():
         "rules":       len(load(RULES_FILE)) if isinstance(load(RULES_FILE), dict) else 0,
         "locks":       len(load(LOCKS_FILE)) if isinstance(load(LOCKS_FILE), dict) else 0,
     }
-
     status_lines = []
     for key, count in stats.items():
         if count > 0:
             status_lines.append(f"  • {key.capitalize()}: {count} entries")
-
     if status_lines:
         log_msg("📦 Storage Restored:\n" + "\n".join(status_lines), "INFO")
     else:
@@ -573,7 +573,6 @@ async def tg_send(
         payload["entities"] = entities
     return await tg_api("sendMessage", json=payload)
 
-
 async def tg_edit_text(
     chat_id: int,
     message_id: int,
@@ -591,11 +590,9 @@ async def tg_edit_text(
         payload["entities"] = entities
     return await tg_api("editMessageText", json=payload)
 
-
 async def tg_send_media(chat_id: int, note: dict, reply_to: int = None):
-    """Send a saved media note (photo, document, video, audio, voice, sticker, animation)."""
-    ntype = note.get("type", "text")
-    fid   = note.get("file_id")
+    ntype   = note.get("type", "text")
+    fid     = note.get("file_id")
     caption = note.get("content") or ""
     entities = note.get("entities")
     payload = {"chat_id": chat_id}
@@ -645,7 +642,6 @@ async def tg_send_media(chat_id: int, note: dict, reply_to: int = None):
             return await tg_api("sendAnimation", json=payload)
     except Exception as e:
         log_msg(f"tg_send_media error: {e}", "ERROR")
-    # Fallback to text
     if caption:
         if entities is not None:
             return await tg_send(chat_id, caption, reply_to=reply_to, parse_mode=None, entities=entities)
@@ -746,6 +742,88 @@ async def api_kick(chat_id: int, user_id: int) -> tuple[bool, str]:
 async def api_delete_msg(chat_id: int, message_id: int) -> tuple[bool, str]:
     r = await tg_api("deleteMessage", json={"chat_id": chat_id, "message_id": message_id})
     return (True, "") if r.get("ok") else (False, r.get("description", "Unknown error"))
+
+# =========================================================
+# FIX-A + FIX-B: Bot API getChatMember — avoids Pyrogram peer-cache errors
+# =========================================================
+# Pyrogram uses in_memory=True, so its peer cache is empty after every restart.
+# Calling bot.get_chat_member() on an uncached peer raises:
+#   ValueError: Peer id invalid: -100XXXXXXXXXX
+# We bypass this entirely by calling the Bot API directly.
+# =========================================================
+
+# Status strings returned by Bot API getChatMember
+_BOT_API_ADMIN_STATUSES = {"creator", "administrator"}
+_BOT_API_MEMBER_STATUSES = {"creator", "administrator", "member", "restricted"}
+
+class _BotApiMember:
+    """Minimal wrapper around a Bot API getChatMember result dict.
+
+    Exposes a `.status` attribute mapped to pyrogram.enums.ChatMemberStatus
+    so existing status comparisons continue to work unchanged.
+    """
+    _STATUS_MAP = {
+        "creator":       enums.ChatMemberStatus.OWNER,
+        "administrator": enums.ChatMemberStatus.ADMINISTRATOR,
+        "member":        enums.ChatMemberStatus.MEMBER,
+        "restricted":    enums.ChatMemberStatus.RESTRICTED,
+        "left":          enums.ChatMemberStatus.LEFT,
+        "kicked":        enums.ChatMemberStatus.BANNED,
+    }
+
+    def __init__(self, data: dict):
+        self._data  = data or {}
+        raw_status  = self._data.get("status", "")
+        self.status = self._STATUS_MAP.get(raw_status, enums.ChatMemberStatus.MEMBER)
+        self._raw_status = raw_status  # keep original string for quick checks
+
+    def is_admin(self) -> bool:
+        return self._raw_status in _BOT_API_ADMIN_STATUSES
+
+
+async def api_get_chat_member(chat_id: int, user_id: int) -> tuple[dict | None, str | None]:
+    """Call Bot API getChatMember and return (result_dict, error_string).
+
+    Returns (None, "UserNotParticipant") when the user is not in the chat.
+    Returns (None, "❌ ...") for other failures.
+    """
+    r = await tg_api("getChatMember", json={"chat_id": int(chat_id), "user_id": int(user_id)})
+    if r.get("ok"):
+        return r.get("result", {}), None
+    desc = r.get("description", "")
+    desc_lower = desc.lower()
+    if any(x in desc_lower for x in (
+        "user not found", "not a member", "not found",
+        "participant", "user_not_participant", "member_status",
+    )):
+        return None, "UserNotParticipant"
+    return None, f"❌ {desc}"
+
+
+async def get_chat_member_safe(bot: Client, chat_id, user_identifier):
+    """FIX-A: Uses Bot API instead of Pyrogram to avoid peer-cache errors.
+
+    Returns: (_BotApiMember, None) on success,
+             (None, "UserNotParticipant") if user not in chat,
+             (None, "❌ ...") for other failures.
+    """
+    try:
+        uid = int(user_identifier)
+    except Exception:
+        return None, "❌ Invalid user ID."
+
+    data, err = await api_get_chat_member(int(chat_id), uid)
+    if err:
+        return None, err
+    return _BotApiMember(data), None
+
+
+async def is_chat_admin(bot: Client, chat_id: int, user_id: int) -> bool:
+    """FIX-A: Uses Bot API instead of Pyrogram to avoid peer-cache errors."""
+    data, err = await api_get_chat_member(int(chat_id), int(user_id))
+    if err or not data:
+        return False
+    return data.get("status") in _BOT_API_ADMIN_STATUSES
 
 # =========================================================
 # TELEGRAM BACKUP
@@ -889,7 +967,7 @@ def set_allow_connect_to_chat(chat_id: int, enabled: bool):
     save(CONNECTIONS_FILE, data)
 
 # =========================================================
-# MULTI-GROUP CONNECTION SYSTEM (Miss Rose style)
+# MULTI-GROUP CONNECTION SYSTEM
 # =========================================================
 
 def get_connected_chats(user_id: int) -> list[int]:
@@ -968,36 +1046,9 @@ def connect_user(user_id: int, chat_id: int) -> bool:
 def disconnect_user(user_id: int) -> bool:
     return remove_user_connection(user_id)
 
-async def is_chat_admin(bot: Client, chat_id: int, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(int(chat_id), user_id)
-        return member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
-    except Exception:
-        return False
-
-
-async def get_chat_member_safe(bot: Client, chat_id, user_identifier):
-    """Coerce `user_identifier` to int and call get_chat_member with clear errors.
-
-    Returns: (member, None) on success,
-             (None, "UserNotParticipant") if user not in chat,
-             (None, "❌ ...") for other failures.
-    """
-    try:
-        uid = int(user_identifier)
-    except Exception:
-        return None, "❌ Invalid user ID."
-    try:
-        member = await bot.get_chat_member(int(chat_id), uid)
-        return member, None
-    except UserNotParticipant:
-        return None, "UserNotParticipant"
-    except BadRequest as e:
-        return None, f"❌ Could not check the target user: {e}"
-    except Exception as e:
-        return None, f"❌ Could not check the target user: {e}"
 
 async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = True):
+    """FIX-A: Uses Bot API getChatMember instead of Pyrogram to avoid peer-cache errors."""
     if not isinstance(chat, dict) or chat.get("type") != "private":
         return False
     conn_id = get_active_connection(user_id)
@@ -1008,31 +1059,32 @@ async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = Tr
             set_active_connection(user_id, conn_id)
         else:
             return False
-    try:
-        member = await bot.get_chat_member(int(conn_id), user_id)
-    except Exception:
-        # Bot restarted or Telegram API hiccup — keep the stored connection
-        # rather than silently dropping it. Trust the persisted data.
+
+    data, err = await api_get_chat_member(conn_id, user_id)
+    if err:
+        # Bot API failure — keep stored connection rather than silently dropping it.
         log_msg(
-            f"Cannot verify member {user_id} in {conn_id} right now; "
+            f"Cannot verify member {user_id} in {conn_id} right now ({err}); "
             "keeping stored connection.",
             "WARNING",
         )
-        # For need_admin we cannot confirm privilege, so fall through
-        # only for non-admin paths (PM moderation commands pass need_admin=False).
-        if need_admin:
-            return conn_id  # trust stored data; worst case Telegram rejects the action
-        return conn_id
-    allowed = member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
-    if not allowed and not (allow_connect_to_chat(conn_id) and member.status == enums.ChatMemberStatus.MEMBER):
+        return conn_id  # trust stored data; worst case Telegram rejects the action
+
+    status = data.get("status", "")
+    is_admin_status = status in _BOT_API_ADMIN_STATUSES
+    is_member_status = status in _BOT_API_MEMBER_STATUSES
+
+    if not is_admin_status and not (allow_connect_to_chat(conn_id) and is_member_status):
         return False
-    if need_admin and not allowed:
+    if need_admin and not is_admin_status:
         return False
+
     try:
         create_group_defaults(conn_id)
     except Exception:
         pass
     return conn_id
+
 
 async def allow_connections(bot: Client, msg: dict, args: list[str]) -> str:
     chat = msg.get("chat", {})
@@ -1055,6 +1107,7 @@ async def allow_connections(bot: Client, msg: dict, args: list[str]) -> str:
         return "Enabled connections to this chat for users"
     return "Please enter on/yes/off/no in group!"
 
+
 async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
     chat    = msg.get("chat", {})
     user    = msg.get("from", {})
@@ -1072,24 +1125,27 @@ async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
     message = await connect_user_to_chat(bot, user_id, connect_id)
     return message or "Connection failed!"
 
+
 async def connect_user_to_chat(bot: Client, user_id: int, connect_id: int) -> str | None:
-    try:
-        member = await bot.get_chat_member(int(connect_id), user_id)
-    except UserNotParticipant:
+    """FIX-A: Uses Bot API getChatMember instead of Pyrogram."""
+    data, err = await api_get_chat_member(connect_id, user_id)
+    if err == "UserNotParticipant":
         return "Connections to this chat not allowed!"
-    except BadRequest:
+    if err:
         return "Invalid Chat ID provided!"
 
-    allowed = member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
+    status = data.get("status", "")
+    allowed = status in _BOT_API_ADMIN_STATUSES
     if not allowed:
-        allowed = allow_connect_to_chat(connect_id) and member.status == enums.ChatMemberStatus.MEMBER
+        allowed = allow_connect_to_chat(connect_id) and status in _BOT_API_MEMBER_STATUSES
+
     if not allowed:
         return "Connections to this chat not allowed!"
 
     try:
         target_chat = await bot.get_chat(connect_id)
         title = target_chat.title or f"Chat {connect_id}"
-        cache_chat_title(connect_id, title)          # ← persist for post-restart use
+        cache_chat_title(connect_id, title)
         add_user_connection(user_id, connect_id)
         try:
             create_group_defaults(connect_id)
@@ -1106,15 +1162,14 @@ async def connect_user_to_chat(bot: Client, user_id: int, connect_id: int) -> st
     except Exception:
         return "Connection failed!"
 
+
 async def disconnect_user_from_chat(bot: Client, user_id: int, disconnect_id: int) -> str | None:
     chats = get_connected_chats(user_id)
     if disconnect_id not in chats:
         return "❌ You were not connected to that group."
-
     removed = remove_user_connection(user_id, disconnect_id)
     if not removed:
         return "❌ You were not connected to that group."
-
     remaining = get_connected_chats(user_id)
     if remaining:
         new_active = get_active_connection(user_id)
@@ -1123,8 +1178,8 @@ async def disconnect_user_from_chat(bot: Client, user_id: int, disconnect_id: in
             return f"✅ Disconnected. Active group switched to *{chat_obj.title}*."
         except Exception:
             return f"✅ Disconnected. Active group: `{new_active}`."
-
     return "✅ Disconnected from active group."
+
 
 async def disconnect_chat(bot: Client, msg: dict, args: list[str]) -> str:
     chat    = msg.get("chat", {})
@@ -1270,7 +1325,7 @@ def filter_check(chat_id: int, text: str) -> tuple[str | None, dict | None]:
                 matched = bool(re.search(keyword, text, re.IGNORECASE))
             except re.error:
                 pass
-        else:  # contains (default)
+        else:
             matched = keyword in text_lower
         if matched:
             return keyword, fdata
@@ -1278,23 +1333,21 @@ def filter_check(chat_id: int, text: str) -> tuple[str | None, dict | None]:
 
 
 def create_group_defaults(chat_id: int):
-    # Ensure per-group storages exist with sensible defaults
     files_defaults = {
-        NOTES_FILE: {},
-        FILTERS_FILE: {},
-        BLOCKLIST_FILE: {},
-        WARN_FILE: {},
+        NOTES_FILE:       {},
+        FILTERS_FILE:     {},
+        BLOCKLIST_FILE:   {},
+        WARN_FILE:        {},
         WARN_CONFIG_FILE: {"threshold": 3, "action": "mute", "duration": 3600},
-        WELCOME_FILE: {},
-        GOODBYE_FILE: {},
-        RULES_FILE: {},
+        WELCOME_FILE:     {},
+        GOODBYE_FILE:     {},
+        RULES_FILE:       {},
     }
     for f, default in files_defaults.items():
         data = load(f)
         if isinstance(data, dict) and str(chat_id) not in data:
             data[str(chat_id)] = default
             save(f, data)
-    # Ensure blocklist mode default
     bm = load(BLOCKLIST_MODE_FILE)
     if str(chat_id) not in bm:
         bm[str(chat_id)] = "warn"
@@ -1302,7 +1355,6 @@ def create_group_defaults(chat_id: int):
 
 
 def group_load(file: str, chat_id: int):
-    """Load the group-scoped data from a global file."""
     data = load(file)
     if isinstance(data, dict):
         return data.get(str(chat_id), {})
@@ -1310,7 +1362,6 @@ def group_load(file: str, chat_id: int):
 
 
 def group_save(file: str, chat_id: int, group_data):
-    """Save `group_data` under the `chat_id` key in `file`."""
     data = load(file)
     if not isinstance(data, dict):
         data = {}
@@ -1319,7 +1370,6 @@ def group_save(file: str, chat_id: int, group_data):
 
 
 def group_delete(file: str, chat_id: int):
-    """Remove the group's entry from the given file."""
     data = load(file)
     if not isinstance(data, dict):
         return False
@@ -1388,7 +1438,6 @@ def set_blocklist_mode(chat_id: int, mode: str):
     data[str(chat_id)] = mode
     save(BLOCKLIST_MODE_FILE, data)
 
-
 # =========================================================
 # CHAT TITLE CACHE
 # =========================================================
@@ -1420,8 +1469,8 @@ def _user_display_name(user: dict) -> str:
     if not isinstance(user, dict):
         return "User"
     first = (user.get("first_name") or "").strip()
-    last = (user.get("last_name") or "").strip()
-    full = " ".join(x for x in (first, last) if x).strip()
+    last  = (user.get("last_name") or "").strip()
+    full  = " ".join(x for x in (first, last) if x).strip()
     if full:
         return full
     uname = (user.get("username") or "").strip()
@@ -1429,7 +1478,7 @@ def _user_display_name(user: dict) -> str:
 
 
 def _format_welcome_text(template: str, user: dict) -> str:
-    uid = user.get("id") if isinstance(user, dict) else None
+    uid  = user.get("id") if isinstance(user, dict) else None
     name = _user_display_name(user)
     safe_name = _escape_markdown(name)
     mention = safe_name
@@ -1448,7 +1497,7 @@ def _welcome_for_chat(chat_id: int) -> dict:
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
-    data = load(WELCOME_FILE)
+    data  = load(WELCOME_FILE)
     entry = data.get(str(chat_id), {}) if isinstance(data, dict) else {}
     _cache.set(cache_key, entry)
     return entry
@@ -1471,7 +1520,7 @@ def _goodbye_for_chat(chat_id: int) -> dict:
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
-    data = load(GOODBYE_FILE)
+    data  = load(GOODBYE_FILE)
     entry = data.get(str(chat_id), {}) if isinstance(data, dict) else {}
     _cache.set(cache_key, entry)
     return entry
@@ -1494,7 +1543,7 @@ def _rules_for_chat(chat_id: int) -> dict:
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
-    data = load(RULES_FILE)
+    data  = load(RULES_FILE)
     entry = data.get(str(chat_id), {}) if isinstance(data, dict) else {}
     _cache.set(cache_key, entry)
     return entry
@@ -1517,7 +1566,7 @@ def _lock_for_chat(chat_id: int) -> dict | None:
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
-    data = load(LOCKS_FILE)
+    data  = load(LOCKS_FILE)
     entry = data.get(str(chat_id)) if isinstance(data, dict) else None
     _cache.set(cache_key, entry)
     return entry
@@ -1572,8 +1621,8 @@ def is_protected(uid: int, chat_id: int | None = None) -> bool:
     cached = _cache.get(cache_key)
     if cached is not None:
         return cached
-    data = _load_protected_store()
-    key = str(uid)
+    data   = _load_protected_store()
+    key    = str(uid)
     result = False
     if chat_id is not None:
         group = data.get(str(chat_id))
@@ -1628,20 +1677,14 @@ def extract_actor_user_id(msg: dict) -> tuple[int | None, str | None, bool]:
 def extract_reply_user(reply: dict) -> tuple[dict, int | None]:
     if not isinstance(reply, dict):
         return {}, None
-    # If the replied message is from a channel (sender_chat), callers
-    # should not try to treat it as a user. Return the sender_chat dict
-    # and None for the id so higher-level code can reply with a clear error.
     sender_chat = reply.get("sender_chat")
     if isinstance(sender_chat, dict):
         return sender_chat, None
-
     target = reply.get("from")
     if not isinstance(target, dict):
         return {}, None
     tid = target.get("id")
     if not isinstance(tid, int) or tid <= 0:
-        # Keep the raw target dict (may contain username or other metadata)
-        # but indicate there's no valid positive user id.
         return target, None
     return target, tid
 
@@ -1654,7 +1697,6 @@ def parse_positive_user_id(value: str) -> int | None:
 
 def resolve_target(reply, args, idx) -> tuple[dict, int | None, str | None]:
     target, tid = extract_reply_user(reply)
-    # If reply came from a channel (sender_chat), give a specific error.
     if isinstance(reply, dict) and reply.get("sender_chat"):
         return {}, None, "❌ Channel messages are not supported for moderation commands."
     if tid:
@@ -1703,7 +1745,7 @@ def create_case(action, moderator, target, reason, extra: dict | None = None) ->
     cases[cid] = {
         "action": action, "moderator": moderator,
         "target": target, "reason": reason,
-        "time": str(datetime.now()),
+        "time":   str(datetime.now()),
     }
     if extra:
         cases[cid].update(extra)
@@ -1741,27 +1783,26 @@ def get_warn_config() -> dict:
 
 def warn(user_id: int, chat_id: int, reason: str, warner: str | None = None) -> dict:
     warns = load(WARN_FILE)
-    key = f"{chat_id}:{user_id}"
+    key   = f"{chat_id}:{user_id}"
     if key not in warns and str(user_id) in warns:
         warns[key] = warns.pop(str(user_id))
     warns.setdefault(key, 0)
     warns[key] += 1
     save(WARN_FILE, warns)
-    cfg = get_warn_config()
-    threshold   = int(cfg.get("threshold", 3))
-    auto_action = cfg.get("action", "mute")
+    cfg           = get_warn_config()
+    threshold     = int(cfg.get("threshold", 3))
+    auto_action   = cfg.get("action", "mute")
     moderator_tag = warner or "Automated warn filter"
-    num = warns[key]
+    num           = warns[key]
     if num >= threshold:
         warns[key] = 0
         save(WARN_FILE, warns)
-        action = auto_action
-        reply  = f"{threshold} warnings — auto-{action}!"
-        log    = (
+        reply = f"{threshold} warnings — auto-{auto_action}!"
+        log   = (
             f"#WARN_BAN\nAdmin: {moderator_tag}\nUser: {user_id}\n"
             f"Reason: {reason}\nCounts: {num}/{threshold}"
         )
-        return {"action": action, "reply": reply, "log": log, "num_warns": 0, "threshold": threshold}
+        return {"action": auto_action, "reply": reply, "log": log, "num_warns": 0, "threshold": threshold}
     else:
         reply = f"User {user_id} has {num}/{threshold} warnings."
         if reason:
@@ -1774,7 +1815,7 @@ def warn(user_id: int, chat_id: int, reason: str, warner: str | None = None) -> 
 
 def reset_warns(user_id: int, chat_id: int, admin_tag: str | None = None) -> str:
     warns = load(WARN_FILE)
-    key = f"{chat_id}:{user_id}"
+    key   = f"{chat_id}:{user_id}"
     if key not in warns and str(user_id) in warns:
         warns[key] = warns.pop(str(user_id))
     warns.pop(key, None)
@@ -1784,7 +1825,7 @@ def reset_warns(user_id: int, chat_id: int, admin_tag: str | None = None) -> str
 
 def warns_for(user_id: int, chat_id: int) -> dict:
     warns = load(WARN_FILE)
-    key = f"{chat_id}:{user_id}"
+    key   = f"{chat_id}:{user_id}"
     if key not in warns and str(user_id) in warns:
         warns[key] = warns.get(str(user_id), 0)
     num = int(warns.get(key, 0))
@@ -1856,17 +1897,10 @@ def _chat_permissions_payload(chat) -> dict:
     if perms is None:
         return _FULL_PERMISSIONS
     fields = [
-        "can_send_messages",
-        "can_send_audios",
-        "can_send_documents",
-        "can_send_photos",
-        "can_send_videos",
-        "can_send_video_notes",
-        "can_send_voice_notes",
-        "can_send_polls",
-        "can_send_other_messages",
-        "can_add_web_page_previews",
-        "can_invite_users",
+        "can_send_messages", "can_send_audios", "can_send_documents",
+        "can_send_photos", "can_send_videos", "can_send_video_notes",
+        "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+        "can_add_web_page_previews", "can_invite_users",
     ]
     return {field: bool(getattr(perms, field, True)) for field in fields}
 
@@ -1984,10 +2018,7 @@ async def scan_zombies(bot: Client, chat_id: int, bot_id: int) -> tuple[int, int
             or first_name.lower() == "deleted account"
             or first_name.lower().startswith("deleted")
         )
-        is_bot = bool(getattr(user, "is_bot", False))
         if not is_deleted:
-            continue
-        if is_bot:
             continue
         ok, err = await api_kick(chat_id, user.id)
         if ok:
@@ -2045,6 +2076,7 @@ def role_help_text(uid: int) -> str:
             "╚════════════════════════════════════════╝\n\n"
             "🔐 **Authorization Commands:**\n"
             "`/hauth <user_id>` - Authorize a moderator\n"
+            "`/hunauth <user_id>` - Remove moderator status\n"
             "`/hrevoke <perm|all> <user_id>` - Remove permission(s)\n"
             "`/hgrant <user_id>` - Grant all permissions\n"
             "`/hgrant <perm> <user_id>` - Grant one permission\n"
@@ -2183,6 +2215,7 @@ def build_markup(*rows) -> dict:
     return {"inline_keyboard": keyboard}
 
 
+# FIX-C: removed dead unreachable code block that appeared after the returns
 def moderation_help_markup(section: str = "home") -> dict:
     base_rows = (
         (("🚫 Ban", "cb:help_ban"), ("🔇 Mute", "cb:help_mute"), ("⚠ Warn", "cb:help_warn")),
@@ -2195,16 +2228,6 @@ def moderation_help_markup(section: str = "home") -> dict:
     if section == "home":
         return build_markup(*base_rows)
     return build_markup(*base_rows, (("⬅️ Back", "cb:help_home"),))
-
-    return build_markup(
-        (("🚫 Ban", "cb:help_ban"), ("🔇 Mute", "cb:help_mute"), ("⚠ Warn", "cb:help_warn")),
-        (("👢 Kick", "cb:help_kick"), ("🛡 Protect", "cb:help_protect"), ("📋 Notes", "cb:help_notes")),
-        (("🔍 Filters", "cb:help_filters"), ("🔒 Blocklist", "cb:help_blocklist"), ("🔗 Connections", "cb:help_connections")),
-        (("🔐 Authorization", "cb:help_auth"), ("📊 Stats", "cb:help_stats"), ("🎮 Games", "cb:help_games")),
-        (("🎉 Welcome", "cb:help_welcome"), ("📜 Rules", "cb:help_rules"), ("🚨 Report", "cb:help_report")),
-        (("🔒 Lock", "cb:help_lock"),),
-        (("⬅️ Back", "cb:help_home"),),
-    )
 
 
 def moderation_help_text(section: str, uid: int) -> str:
@@ -2257,7 +2280,6 @@ def moderation_help_text(section: str, uid: int) -> str:
             "• Reply to a user's message or pass their ID/username.\n"
             "• Warn system can auto-mute/ban after threshold warnings.\n"
             "• Example: `/hwarn @user off-topic`\n"
-            "• View total warns per user: `/warns @user`\n"
         )
     if section == "kick":
         return (
@@ -2305,8 +2327,6 @@ def moderation_help_text(section: str, uid: int) -> str:
             "**Examples**\n"
             "• `/setwelcome Hello {mention}, welcome to the group! 👋`\n"
             "• `/setgoodbye Goodbye {name}, we'll miss you!`\n"
-            "• `/welcome off` — Temporarily pause welcome messages\n"
-            "• `/welcome on` — Resume them\n"
         )
     if section == "rules":
         return (
@@ -2373,7 +2393,6 @@ def moderation_help_text(section: str, uid: int) -> str:
             "**Usage**\n"
             "• Filters auto-respond when keywords are mentioned.\n"
             "• Example: `/filter hello Hello there! 👋`\n"
-            "• Use `-exact`, `-start`, `-regex` for advanced matching.\n"
         )
     if section == "connections":
         return (
@@ -2401,7 +2420,6 @@ def moderation_help_text(section: str, uid: int) -> str:
             "• Blocked messages are auto-deleted.\n"
             "• Action can be: warn (default), mute, or ban user.\n"
             "• Example: `/addblocklist spam` then `/blocklistmode mute`\n"
-            "• Group-specific: blocklist doesn't affect other groups.\n"
         )
     if section == "games":
         return (
@@ -2437,7 +2455,7 @@ def moderation_help_text(section: str, uid: int) -> str:
             f"👮 **{role} Help Center**\n\n"
             "🔐 **Authorization & Permissions**\n\n"
             "`/hauth <user_id>` - Make someone a moderator (Owner only)\n"
-            "`/hunauth <user_id>` - Remove moderator status\n"
+            "`/hunauth <user_id>` - Remove moderator status (Owner only)\n"
             "`/hgrant <user_id> <perm>` - Grant a specific permission\n"
             "`/hrevoke <user_id> <perm>` - Revoke a specific permission\n"
             "`/hfreeze <user_id>` - Freeze a moderator's permissions\n"
@@ -2452,20 +2470,11 @@ def moderation_help_text(section: str, uid: int) -> str:
         "**Welcome to Moderation Commands!**\n\n"
         "Select a category below to learn about each feature:\n\n"
         "🔨 **Moderation**\n"
-        "  • Ban: Remove users permanently (with optional duration)\n"
-        "  • Mute: Restrict users from sending messages\n"
-        "  • Kick: Remove users from the group\n"
-        "  • Warn: Issue warnings with auto-action on threshold\n\n"
+        "  • Ban, Mute, Kick, Warn\n\n"
         "🛠️ **Management**\n"
-        "  • Protect: Whitelist trusted users from mod actions\n"
-        "  • Notes: Save group information and FAQs\n"
-        "  • Filters: Auto-respond to keywords\n"
-        "  • Blocklist: Block harmful keywords with auto-action\n\n"
+        "  • Protect, Notes, Filters, Blocklist\n\n"
         "🔧 **Advanced**\n"
-        "  • Connections: Manage multiple groups from PM\n"
-        "  • Authorization: Manage moderator roles & permissions\n"
-        "  • Stats: View moderation stats and case logs\n"
-        "  • Games: Play Tic-Tac-Toe with leaderboards\n\n"
+        "  • Connections, Authorization, Stats, Games\n\n"
         "💡 **Tips:**\n"
         "  • Reply to a message to avoid typing user IDs\n"
         "  • Duration: `30m`, `2h`, `1d`, etc.\n"
@@ -2645,9 +2654,6 @@ async def send_action_log(
     rows.append([("📜 View Case",       f"cb:case_{case_id}")])
     markup = build_markup(*rows)
 
-    # Coerce source_chat to an integer chat id where possible. Some callers
-    # accidentally pass a chat object or dict which later produces
-    # "Peer id invalid" errors when processed by the temp-action worker.
     chat_to_send = None
     try:
         if isinstance(source_chat, dict):
@@ -2661,7 +2667,6 @@ async def send_action_log(
     if resp.get("ok") and resp.get("result"):
         msg_id = resp["result"].get("message_id")
         if msg_id and chat_to_send is not None:
-            # Only schedule deletion when we have a sane chat id
             schedule_message_delete(chat_to_send, msg_id, ACTION_LOG_AUTO_DELETE)
 
     lg = get_log_group()
@@ -2700,11 +2705,11 @@ async def process_due_temp_actions(bot: Client):
     now_ts  = int(time.time())
     pending = []
     for action in actions:
-        until_ts  = int(action.get("until_ts", 0))
+        until_ts = int(action.get("until_ts", 0))
         if until_ts > now_ts:
             pending.append(action)
             continue
-        chat_id_raw = action.get("chat_id")
+        chat_id_raw   = action.get("chat_id")
         target_id_raw = action.get("target_id")
         try:
             chat_id = int(chat_id_raw)
@@ -2716,7 +2721,7 @@ async def process_due_temp_actions(bot: Client):
         except Exception:
             log_msg(f"Skipping temp action with invalid target_id: {target_id_raw}", "WARNING")
             continue
-        atype     = action["type"]
+        atype = action["type"]
         try:
             if atype == "mute":
                 permissions = _FULL_PERMISSIONS
@@ -2859,12 +2864,12 @@ async def webhook(request: Request):
 
 async def handle_message(bot: Client, msg: dict):
     try:
-        text     = msg.get("text", "")
-        chat_id  = msg["chat"]["id"]
-        msg_id   = msg["message_id"]
+        text       = msg.get("text", "")
+        chat_id    = msg["chat"]["id"]
+        msg_id     = msg["message_id"]
         is_private = msg.get("chat", {}).get("type") == "private"
         uid, err, is_anon_admin = extract_actor_user_id(msg)
-        reply    = msg.get("reply_to_message") or {}
+        reply      = msg.get("reply_to_message") or {}
 
         if not is_private:
             new_members = msg.get("new_chat_members") or []
@@ -2872,8 +2877,8 @@ async def handle_message(bot: Client, msg: dict):
                 new_members = [msg.get("new_chat_member")]
             if new_members:
                 welcome_entry = _welcome_for_chat(chat_id)
-                welcome_text = welcome_entry.get("text") if isinstance(welcome_entry, dict) else None
-                welcome_on   = welcome_entry.get("enabled", True) if isinstance(welcome_entry, dict) else False
+                welcome_text  = welcome_entry.get("text") if isinstance(welcome_entry, dict) else None
+                welcome_on    = welcome_entry.get("enabled", True) if isinstance(welcome_entry, dict) else False
                 if welcome_text and welcome_on:
                     for member in new_members:
                         if not isinstance(member, dict):
@@ -2887,8 +2892,8 @@ async def handle_message(bot: Client, msg: dict):
             if isinstance(left_member, dict):
                 if left_member.get("id") != _bot_id:
                     goodbye_entry = _goodbye_for_chat(chat_id)
-                    goodbye_text = goodbye_entry.get("text") if isinstance(goodbye_entry, dict) else None
-                    goodbye_on   = goodbye_entry.get("enabled", True) if isinstance(goodbye_entry, dict) else False
+                    goodbye_text  = goodbye_entry.get("text") if isinstance(goodbye_entry, dict) else None
+                    goodbye_on    = goodbye_entry.get("enabled", True) if isinstance(goodbye_entry, dict) else False
                     if goodbye_text and goodbye_on:
                         rendered = _format_welcome_text(goodbye_text, left_member)
                         await tg_send(chat_id, rendered, reply_to=msg_id)
@@ -2896,7 +2901,7 @@ async def handle_message(bot: Client, msg: dict):
         # ── Non-command messages: filters + #note triggers ────────────────
         if not text.startswith("/"):
             if not is_private and text:
-                # 1) Check for #notename trigger
+                # 1) #notename trigger
                 hashtags = re.findall(r'#(\w+)', text)
                 for tag in hashtags:
                     note = note_get(chat_id, tag.lower())
@@ -2913,38 +2918,34 @@ async def handle_message(bot: Client, msg: dict):
                                 await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None)
                         return
 
-                # 2) Check filters
-                # 2a) Check blocklists (enforce actions)
+                # 2a) Blocklist check
                 bkw = blocklist_check(chat_id, text)
                 if bkw:
-                    # skip protected users and owners
                     if not is_protected(uid, chat_id) and uid != OWNER_ID:
                         mode = get_blocklist_mode(chat_id)
-                        # delete message when matched
                         try:
                             await api_delete_msg(chat_id, msg_id)
                         except Exception:
                             pass
-                        actor = 0
+                        actor       = 0
                         case_reason = f"Blocked keyword: {bkw}"
                         if mode == "ban":
-                            ok, err = await api_ban(chat_id, uid)
+                            ok, _ = await api_ban(chat_id, uid)
                             if ok:
                                 cid = create_case("BAN", actor, uid, case_reason)
                                 await send_action_log(chat_id, msg_id, "BAN", {"id": uid}, case_reason, cid, {"badge": "🔒 Blocklist", "mod_id": "BLOCKLIST"})
                         elif mode == "mute":
-                            ok, err = await api_mute(chat_id, uid)
+                            ok, _ = await api_mute(chat_id, uid)
                             if ok:
                                 cid = create_case("MUTE", actor, uid, case_reason)
                                 await send_action_log(chat_id, msg_id, "MUTE", {"id": uid}, case_reason, cid, {"badge": "🔒 Blocklist", "mod_id": "BLOCKLIST"})
                         else:
-                            # warn
                             res = warn(uid, chat_id, case_reason, warner="BLOCKLIST")
                             cid = create_case("WARN", actor, uid, case_reason)
                             await send_action_log(chat_id, msg_id, "WARN", {"id": uid}, case_reason, cid, {"badge": "🔒 Blocklist", "mod_id": "BLOCKLIST"}, extra=f"📊 Total Warns: {res.get('num_warns', 0)}/{res.get('threshold', 0)}")
                     return
 
-                # 2b) Check filters
+                # 2b) Filters check
                 keyword, fdata = filter_check(chat_id, text)
                 if keyword and fdata:
                     await tg_send(chat_id, fdata["response"], reply_to=msg_id, parse_mode=None)
@@ -2965,7 +2966,6 @@ async def handle_message(bot: Client, msg: dict):
                 if rmid:
                     schedule_message_delete(chat_id, rmid)
 
-        # Auto-delete commands in groups
         if not is_private:
             schedule_message_delete(chat_id, msg_id)
 
@@ -3042,15 +3042,13 @@ async def handle_message(bot: Client, msg: dict):
                     except Exception:
                         title = None
                     if title:
-                        msg_text = f"🔗 Connect *{title}* (`{chat_id}`) in PM — tap the button below."
+                        msg_text  = f"🔗 Connect *{title}* (`{chat_id}`) in PM — tap the button below."
                         btn_label = f"Connect to {title[:30]}"
                     else:
-                        msg_text = "🔗 Tap the button below to connect this group in PM."
+                        msg_text  = "🔗 Tap the button below to connect this group in PM."
                         btn_label = "Connect to PM"
                     await tg_send(
-                        chat_id,
-                        msg_text,
-                        reply_to=msg_id,
+                        chat_id, msg_text, reply_to=msg_id,
                         markup=build_markup([(btn_label, f"url:{pm_link}")]),
                     )
                 except Exception:
@@ -3073,26 +3071,24 @@ async def handle_message(bot: Client, msg: dict):
                     except Exception:
                         title = None
                     if title:
-                        msg_text = f"🔗 Disconnect *{title}* (`{chat_id}`) in PM — tap the button below."
+                        msg_text  = f"🔗 Disconnect *{title}* (`{chat_id}`) in PM — tap the button below."
                         btn_label = f"Disconnect {title[:30]}"
                     else:
-                        msg_text = "🔗 Tap the button below to disconnect this group in PM."
+                        msg_text  = "🔗 Tap the button below to disconnect this group in PM."
                         btn_label = "Disconnect from PM"
                     await tg_send(
-                        chat_id,
-                        msg_text,
-                        reply_to=msg_id,
+                        chat_id, msg_text, reply_to=msg_id,
                         markup=build_markup([(btn_label, f"url:{pm_link}")]),
                     )
                 except Exception:
                     await reply_text("❌ Could not create the PM disconnect link.")
             return
 
-        # ── /connections — list all connected groups ───────────────────────
+        # ── /connections ──────────────────────────────────────────────────
         if raw_cmd == "connections":
             if not is_private:
                 return await reply_text("Use /connections in bot DM.")
-            chats = get_connected_chats(uid)
+            chats  = get_connected_chats(uid)
             active = get_active_connection(uid)
             if not chats:
                 return await reply_text(
@@ -3102,7 +3098,6 @@ async def handle_message(bot: Client, msg: dict):
             lines = ["🔗 **Your Connected Groups**\n"]
             rows  = []
             for cid in chats:
-                # Try live fetch first; fall back to persisted title
                 title = None
                 try:
                     chat_obj = await bot.get_chat(cid)
@@ -3111,9 +3106,8 @@ async def handle_message(bot: Client, msg: dict):
                         cache_chat_title(cid, title)
                 except Exception:
                     title = get_cached_chat_title(cid)
-
-                star = " ⭐" if cid == active else ""
-                display_id = f"`{cid}`"
+                star         = " ⭐" if cid == active else ""
+                display_id   = f"`{cid}`"
                 if title:
                     lines.append(f"• *{title}*{star} ({display_id})")
                     display_label = title[:20]
@@ -3178,8 +3172,7 @@ async def handle_message(bot: Client, msg: dict):
                 await reply_text(role_help_text(uid))
             return
 
-        # ── Welcome / Goodbye / Rules / Report / Lock ───────────────────
-        # ── Welcome / Goodbye / Rules / Report / Lock ──────────────────────
+        # ── /setwelcome ───────────────────────────────────────────────────
         if raw_cmd == "setwelcome":
             if not is_authorized_actor():
                 return await security_fail()
@@ -3217,7 +3210,6 @@ async def handle_message(bot: Client, msg: dict):
                 return await security_fail()
             entry = _welcome_for_chat(action_chat_id)
             if not args:
-                # Show current status
                 if isinstance(entry, dict) and entry.get("text"):
                     status = "🟢 On" if entry.get("enabled", True) else "🔴 Off"
                     return await reply_text(
@@ -3238,7 +3230,7 @@ async def handle_message(bot: Client, msg: dict):
                     "❌ No welcome message saved yet.\n"
                     "Use `/setwelcome <text>` first."
                 )
-            entry["enabled"] = enabled
+            entry["enabled"]    = enabled
             entry["updated_at"] = str(datetime.now())
             _save_welcome_for_chat(action_chat_id, entry)
             status_icon = "🟢" if enabled else "🔴"
@@ -3300,7 +3292,7 @@ async def handle_message(bot: Client, msg: dict):
                     "❌ No goodbye message saved yet.\n"
                     "Use `/setgoodbye <text>` first."
                 )
-            entry["enabled"] = enabled
+            entry["enabled"]    = enabled
             entry["updated_at"] = str(datetime.now())
             _save_goodbye_for_chat(action_chat_id, entry)
             status_icon = "🟢" if enabled else "🔴"
@@ -3332,10 +3324,10 @@ async def handle_message(bot: Client, msg: dict):
             )
             return await reply_text("✅ Rules saved.")
 
+        # FIX-D: single unified /rules handler (removed duplicate dead-code block)
         if raw_cmd == "rules":
             entry = _rules_for_chat(action_chat_id if is_private else chat_id)
             if is_authorized_actor() and args:
-                # Mod toggling rules on/off
                 flag = args[0].lower()
                 if flag not in ("on", "off", "yes", "no", "enable", "disable"):
                     return await reply_text("❌ Usage: `/rules on` or `/rules off`")
@@ -3344,13 +3336,12 @@ async def handle_message(bot: Client, msg: dict):
                     return await reply_text(
                         "❌ No rules saved yet.\nUse `/setrules <text>` first."
                     )
-                entry["enabled"] = enabled
+                entry["enabled"]    = enabled
                 entry["updated_at"] = str(datetime.now())
                 _save_rules_for_chat(action_chat_id if is_private else chat_id, entry)
                 status_icon = "🟢" if enabled else "🔴"
                 return await reply_text(f"{status_icon} Rules turned **{'on' if enabled else 'off'}**.")
-
-            # Regular /rules display
+            # Public display
             if is_private:
                 return await reply_text("Use /rules in a group.")
             rules_text = entry.get("text") if isinstance(entry, dict) else None
@@ -3362,31 +3353,21 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(f"📜 **Group Rules**\n\n{rules_text}")
             return
 
-        if raw_cmd == "rules":
-            if is_private:
-                return await reply_text("Use /rules in a group.")
-            entry = _rules_for_chat(chat_id)
-            rules_text = entry.get("text") if isinstance(entry, dict) else None
-            if not rules_text:
-                return await reply_text("📜 No rules set for this group yet.")
-            await reply_text(f"📜 **Group Rules**\n\n{rules_text}")
-            return
-
         if raw_cmd == "report":
             if is_private:
                 return await reply_text("Use /report in a group.")
-            reporter = msg.get("from", {})
-            reason = " ".join(args).strip() or "No reason provided"
-            target = None
-            target_id = None
+            reporter      = msg.get("from", {})
+            reason        = " ".join(args).strip() or "No reason provided"
+            target        = None
+            target_id     = None
             target_msg_id = msg_id
             if reply:
-                target = reply.get("from", {})
-                target_id = target.get("id")
+                target        = reply.get("from", {})
+                target_id     = target.get("id")
                 target_msg_id = reply.get("message_id") or msg_id
-            chat = msg.get("chat", {})
+            chat       = msg.get("chat", {})
             chat_title = chat.get("title") or "Group"
-            link = _message_link(chat, target_msg_id)
+            link       = _message_link(chat, target_msg_id)
             report_lines = [
                 "🚨 **New Report**",
                 f"Chat: *{_escape_markdown(chat_title)}* (`{chat_id}`)",
@@ -3398,11 +3379,9 @@ async def handle_message(bot: Client, msg: dict):
             if link:
                 report_lines.append(f"Message: {link}")
             report_text = "\n".join(report_lines)
-
             lg = get_log_group()
             if lg:
                 await tg_send(lg, report_text)
-
             try:
                 async for member in bot.get_chat_members(chat_id, filter=enums.ChatMembersFilter.ADMINISTRATORS):
                     user = getattr(member, "user", None)
@@ -3414,14 +3393,15 @@ async def handle_message(bot: Client, msg: dict):
                         pass
             except Exception as admin_err:
                 log_msg(f"report admin notify failed: {admin_err}", "WARNING")
-
             await reply_text("✅ Report sent to admins.")
             return
 
+        # FIX-E: hlock/hunlock now work from PM when a group is connected
         if raw_cmd in ("hlock", "lock"):
             if not await check_mod("mute"):
                 return
-            if is_private:
+            # Only block when truly no connected group (action_chat_id == chat_id in PM)
+            if is_private and action_chat_id == chat_id:
                 return await reply_text("Use /hlock in a group or via a connected group.")
             dur = parse_duration_token(args[0]) if args else None
             if args and dur is None:
@@ -3439,26 +3419,23 @@ async def handle_message(bot: Client, msg: dict):
                     )
                     return await reply_text(f"🔒 Chat lock extended to {format_duration(dur)}.")
                 return await reply_text("🔒 Chat is already locked.")
-
             original_perms = _FULL_PERMISSIONS
             try:
                 chat_obj = await bot.get_chat(action_chat_id)
                 original_perms = _chat_permissions_payload(chat_obj)
             except Exception as perm_err:
                 log_msg(f"lock permissions load failed for {action_chat_id}: {perm_err}", "WARNING")
-
             ok, err = await api_set_chat_permissions(action_chat_id, _MUTE_PERMISSIONS)
             if not ok:
                 return await reply_text(f"❌ Lock failed: {err}")
-
             until_ts = int(time.time()) + dur if dur else 0
             _save_lock_for_chat(
                 action_chat_id,
                 {
-                    "locked": True,
-                    "set_by": uid,
-                    "set_at": str(datetime.now()),
-                    "until_ts": until_ts,
+                    "locked":      True,
+                    "set_by":      uid,
+                    "set_at":      str(datetime.now()),
+                    "until_ts":    until_ts,
                     "permissions": original_perms,
                 },
             )
@@ -3473,9 +3450,10 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hunlock", "unlock"):
             if not await check_mod("mute"):
                 return
-            if is_private:
+            # Only block when truly no connected group (action_chat_id == chat_id in PM)
+            if is_private and action_chat_id == chat_id:
                 return await reply_text("Use /hunlock in a group or via a connected group.")
-            lock_entry = _lock_for_chat(action_chat_id)
+            lock_entry    = _lock_for_chat(action_chat_id)
             restore_perms = None
             if isinstance(lock_entry, dict):
                 restore_perms = lock_entry.get("permissions")
@@ -3487,6 +3465,17 @@ async def handle_message(bot: Client, msg: dict):
             _save_lock_for_chat(action_chat_id, None)
             cancel_temp_action("lock", action_chat_id, action_chat_id)
             return await reply_text("🔓 Chat unlocked.")
+
+        # FIX-G: locktype / locktypes stub
+        if raw_cmd in ("locktype", "locktypes"):
+            if not is_authorized_actor():
+                return await security_fail()
+            return await reply_text(
+                "🔒 **Lock Types**\n\n"
+                "Use `/hlock [duration]` to lock the entire chat.\n"
+                "Use `/hunlock` to restore original permissions.\n\n"
+                "Duration examples: `10m`, `2h`, `1d`"
+            )
 
         # ── /hr ───────────────────────────────────────────────────────────
         if raw_cmd == "hr":
@@ -3537,19 +3526,15 @@ async def handle_message(bot: Client, msg: dict):
                 last_name  = target_user.last_name  if target_user and target_user.last_name  else ""
                 uname      = target_user.username   if target_user and target_user.username   else None
 
-                response  = f"👤 **User Profile**\n\n🆔 ID: `{target_id}`\n📝 Name: {first_name}"
+                response = f"👤 **User Profile**\n\n🆔 ID: `{target_id}`\n📝 Name: {first_name}"
                 if last_name:
                     response += f" {last_name}"
                 response += "\n"
                 if uname:
                     response += f"🔗 Username: @{uname}\n"
                 response += f"📌 Link: [Profile](tg://user?id={target_id})"
-
                 if not is_private:
-                    try:
-                        response += f"\n\nGroup ID: `{chat_id}`"
-                    except Exception:
-                        pass
+                    response += f"\n\nGroup ID: `{chat_id}`"
 
                 if is_owner_actor() and not is_private:
                     await notify_owner(response)
@@ -3611,7 +3596,6 @@ async def handle_message(bot: Client, msg: dict):
             note_name = args[0].lower().strip()
             if len(note_name) > 64:
                 return await reply_text("❌ Note name too long (max 64 chars).")
-
             entities  = None
             note_type = "text"
             file_id   = None
@@ -3623,26 +3607,19 @@ async def handle_message(bot: Client, msg: dict):
                     return await reply_text("❌ Replied message has no text or media to save.")
                 entities = reply.get("caption_entities") or reply.get("entities")
                 if "photo" in reply and isinstance(reply.get("photo"), list) and reply["photo"]:
-                    note_type = "photo"
-                    file_id = reply["photo"][-1].get("file_id")
+                    note_type = "photo";   file_id = reply["photo"][-1].get("file_id")
                 elif "document" in reply and isinstance(reply.get("document"), dict):
-                    note_type = "document"
-                    file_id = reply["document"].get("file_id")
+                    note_type = "document"; file_id = reply["document"].get("file_id")
                 elif "video" in reply and isinstance(reply.get("video"), dict):
-                    note_type = "video"
-                    file_id = reply["video"].get("file_id")
+                    note_type = "video";   file_id = reply["video"].get("file_id")
                 elif "audio" in reply and isinstance(reply.get("audio"), dict):
-                    note_type = "audio"
-                    file_id = reply["audio"].get("file_id")
+                    note_type = "audio";   file_id = reply["audio"].get("file_id")
                 elif "voice" in reply and isinstance(reply.get("voice"), dict):
-                    note_type = "voice"
-                    file_id = reply["voice"].get("file_id")
+                    note_type = "voice";   file_id = reply["voice"].get("file_id")
                 elif "sticker" in reply and isinstance(reply.get("sticker"), dict):
-                    note_type = "sticker"
-                    file_id = reply["sticker"].get("file_id")
+                    note_type = "sticker"; file_id = reply["sticker"].get("file_id")
                 elif "animation" in reply and isinstance(reply.get("animation"), dict):
-                    note_type = "animation"
-                    file_id = reply["animation"].get("file_id")
+                    note_type = "animation"; file_id = reply["animation"].get("file_id")
             else:
                 return await reply_text(
                     "❌ Provide content after the name, or reply to a message.\n"
@@ -3733,7 +3710,7 @@ async def handle_message(bot: Client, msg: dict):
             match_type = "contains"
             arg_start  = 0
             if args[0].startswith("-"):
-                flag = args[0].lower()
+                flag     = args[0].lower()
                 flag_map = {
                     "-exact":    "exact",
                     "-start":    "startswith",
@@ -3776,10 +3753,7 @@ async def handle_message(bot: Client, msg: dict):
             if filter_remove(action_chat_id, keyword):
                 await reply_text(f"✅ Filter `{keyword}` removed.")
             else:
-                await reply_text(
-                    f"❌ No filter found for `{keyword}`.\n"
-                    "Use `/filters` to see all active filters."
-                )
+                await reply_text(f"❌ No filter found for `{keyword}`.\nUse `/filters` to see all active filters.")
             return
 
         if raw_cmd == "filters":
@@ -3796,9 +3770,7 @@ async def handle_message(bot: Client, msg: dict):
                 mt   = fd.get("match_type", "contains")
                 resp = fd.get("response", "")[:50]
                 lines.append(f"• `{kw}` [{mt}] → _{resp}_")
-            await reply_text(
-                "\n".join(lines) + "\n\nUse `/stop <keyword>` to remove a filter."
-            )
+            await reply_text("\n".join(lines) + "\n\nUse `/stop <keyword>` to remove a filter.")
             return
 
         if raw_cmd == "addblocklist":
@@ -3812,7 +3784,7 @@ async def handle_message(bot: Client, msg: dict):
                 if kw_text:
                     keyword = kw_text.strip().lower()[:128]
             if not keyword:
-                return await reply_text("❌ Usage: /addblocklist <keyword> (or reply to a message to add its text)")
+                return await reply_text("❌ Usage: /addblocklist <keyword>")
             if len(keyword) > 128:
                 return await reply_text("❌ Keyword too long (max 128 chars).")
             blocklist_add(action_chat_id, keyword, created_by=uid)
@@ -3882,6 +3854,25 @@ async def handle_message(bot: Client, msg: dict):
                 await tg_send(lg, f"✅ Moderator authorized\n👤 {make_mention(target)} (`{tid}`)\n🛡 By: `{uid}`")
             return
 
+        # FIX-F: /hunauth — remove moderator status (was completely missing)
+        if raw_cmd == "hunauth":
+            if not is_owner_actor():
+                return await reply_text("❌ Owner only.")
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /hunauth <user_id>")
+            data = load(AUTH_FILE)
+            key  = str(tid)
+            if key not in data:
+                return await reply_text(f"ℹ️ {make_mention(target)} is not a moderator.")
+            del data[key]
+            await save_and_backup(AUTH_FILE, data)
+            await reply_text(f"✅ {make_mention(target)} has been removed as moderator.")
+            lg = get_log_group()
+            if lg:
+                await tg_send(lg, f"🗑 Moderator removed\n👤 {make_mention(target)} (`{tid}`)\n🛡 By: `{uid}`")
+            return
+
         if raw_cmd in ("hgrant", "hg"):
             if not is_owner_actor():
                 return
@@ -3894,7 +3885,6 @@ async def handle_message(bot: Client, msg: dict):
             target = {}
             tid    = None
             terr   = None
-
             if args[0].lower() in VALID_PERMISSIONS:
                 perm = args[0].lower()
                 target, tid, terr = await resolve_target_ext(bot, reply, args, 1)
@@ -3905,11 +3895,8 @@ async def handle_message(bot: Client, msg: dict):
                 if not tid:
                     return await reply_text(terr)
                 if len(args) > 1 and args[1].lower() not in VALID_PERMISSIONS:
-                    return await reply_text(
-                        f"❌ Invalid permission. Valid: {', '.join(sorted(VALID_PERMISSIONS))}"
-                    )
+                    return await reply_text(f"❌ Invalid permission. Valid: {', '.join(sorted(VALID_PERMISSIONS))}")
                 perm = "all"
-
             data = load(AUTH_FILE)
             if str(tid) not in data:
                 return await reply_text("❌ User not authorized. Run /hauth first.")
@@ -3932,9 +3919,7 @@ async def handle_message(bot: Client, msg: dict):
                 )
             perm = args[0].lower()
             if perm not in VALID_PERMISSIONS and perm != "all":
-                return await reply_text(
-                    f"❌ Invalid. Valid: {', '.join(sorted(VALID_PERMISSIONS))}, all"
-                )
+                return await reply_text(f"❌ Invalid. Valid: {', '.join(sorted(VALID_PERMISSIONS))}, all")
             target, tid, terr = await resolve_target_ext(bot, reply, args, 1)
             if not tid:
                 return await reply_text(terr)
@@ -4066,12 +4051,10 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hban <user_id/@user> [duration] [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot ban yourself.")
+            # FIX-A: use Bot API member check
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
             if gm_err:
-                if gm_err == "UserNotParticipant":
-                    # user not in chat — allow ban attempt (Telegram will handle)
-                    pass
-                else:
+                if gm_err != "UserNotParticipant":
                     log_msg(f"get_chat_member failed for ban check: {gm_err}", "WARNING")
             else:
                 if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
@@ -4104,6 +4087,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hkick <user_id/@user> [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot kick yourself.")
+            # FIX-A: use Bot API member check
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
             if gm_err:
                 if gm_err == "UserNotParticipant":
@@ -4134,6 +4118,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hmute <user_id/@user> [duration] [reason]")
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
+            # FIX-A: use Bot API member check
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
             if gm_err:
                 if gm_err == "UserNotParticipant":
@@ -4188,6 +4173,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hunmute <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
+            # FIX-A: use Bot API member check
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
             if gm_err:
                 if gm_err == "UserNotParticipant":
@@ -4271,7 +4257,7 @@ async def handle_message(bot: Client, msg: dict):
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /hwarn <user_id/@user> [reason]")
-            rs = 0 if reply else 1
+            rs     = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
             if is_protected(tid, action_chat_id):
                 return await reply_text("🛡 That user is protected.")
@@ -4321,16 +4307,14 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         if raw_cmd == "warns":
-            explicit = False
+            explicit    = False
             user_lookup = uid
             if args:
                 explicit = True
-                # Prefer reply / @username / numeric ID uniformly
                 target_tmp, tid_tmp, terr_tmp = await resolve_target_ext(bot, reply, args, 0)
                 if tid_tmp:
                     user_lookup = tid_tmp
                 else:
-                    # If resolve_target_ext couldn't find a user, fall back to reply-only lookup
                     if reply:
                         _, rid = extract_reply_user(reply)
                         if rid:
@@ -4344,7 +4328,6 @@ async def handle_message(bot: Client, msg: dict):
                 _, rid = extract_reply_user(reply)
                 if rid:
                     user_lookup = rid
-
             threshold = get_warn_config().get("threshold", 3)
             if explicit:
                 warns_data = load(WARN_FILE)
@@ -4355,9 +4338,9 @@ async def handle_message(bot: Client, msg: dict):
                         if isinstance(k, str) and k == str(user_lookup):
                             total += int(v)
                         elif isinstance(k, str) and k.endswith(f":{user_lookup}"):
-                            parts = k.split(":", 1)
-                            cid = int(parts[0])
-                            cnt = int(v)
+                            parts2 = k.split(":", 1)
+                            cid    = int(parts2[0])
+                            cnt    = int(v)
                             total += cnt
                             per_chat[cid] = per_chat.get(cid, 0) + cnt
                     except Exception:
@@ -4400,10 +4383,7 @@ async def handle_message(bot: Client, msg: dict):
             if not ok:
                 return await reply_text(f"❌ Delete failed: {err}")
             case_id = create_case("DELETE", uid, tid, "Message Deleted")
-            await send_action_log(
-                chat_id, msg_id, "DELETE", target,
-                "Message Deleted", case_id, actor_mod_info(),
-            )
+            await send_action_log(chat_id, msg_id, "DELETE", target, "Message Deleted", case_id, actor_mod_info())
             return
 
         if raw_cmd in ("hprotect", "hp", "protect"):
@@ -4412,16 +4392,16 @@ async def handle_message(bot: Client, msg: dict):
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /hprotect <user_id/@user>")
-            data = _load_protected_store()
+            data     = _load_protected_store()
             chat_key = str(action_chat_id)
-            group = data.get(chat_key)
+            group    = data.get(chat_key)
             if not isinstance(group, dict):
                 group = {}
             key = str(tid)
             if key in group:
                 return await reply_text(f"ℹ️ {make_mention(target)} is already protected.")
-            group[key] = True
-            data[chat_key] = group
+            group[key]       = True
+            data[chat_key]   = group
             await save_and_backup(PROTECT_FILE, data)
             await reply_text(f"🛡 {make_mention(target)} is now protected.")
             return
@@ -4432,9 +4412,9 @@ async def handle_message(bot: Client, msg: dict):
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /hunprotect <user_id/@user>")
-            data = _load_protected_store()
-            chat_key = str(action_chat_id)
-            group = data.get(chat_key)
+            data       = _load_protected_store()
+            chat_key   = str(action_chat_id)
+            group      = data.get(chat_key)
             if not isinstance(group, dict):
                 group = {}
             global_map = data.get("__global__") if isinstance(data.get("__global__"), dict) else {}
@@ -4458,13 +4438,13 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hprotected", "protected"):
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
-            data = _load_protected_store()
-            chat_key = str(action_chat_id)
-            group = data.get(chat_key)
+            data       = _load_protected_store()
+            chat_key   = str(action_chat_id)
+            group      = data.get(chat_key)
             if not isinstance(group, dict):
                 group = {}
             global_map = data.get("__global__") if isinstance(data.get("__global__"), dict) else {}
-            group_ids = sorted(group.keys(), key=lambda x: int(x) if x.lstrip("-").isdigit() else x)
+            group_ids  = sorted(group.keys(), key=lambda x: int(x) if x.lstrip("-").isdigit() else x)
             lines = [f"🛡 **Protected Users** — `{len(group_ids)}`"]
             if group_ids:
                 for uid_str in group_ids[:50]:
@@ -4554,9 +4534,6 @@ async def handle_callback(bot: Client, cb: dict):
         message   = cb.get("message", {})
         chat_id   = message.get("chat", {}).get("id")
 
-        # FIX 2: actor_mod_info() is a closure defined only inside handle_message
-        # and is NOT in scope here. This local helper provides the equivalent,
-        # allowing warn/unwarn/removewarn callbacks to function correctly.
         def _mod_info() -> dict:
             return get_mod_info(uid) or {"badge": "🛡 Moderator", "mod_id": str(uid)}
 
@@ -4566,7 +4543,7 @@ async def handle_callback(bot: Client, cb: dict):
                 await handle_ttt_callback(cb_id, data, uid, from_user, chat_id, message)
                 return
 
-        # ── setactive_<chat_id> — switch active group ─────────────────────
+        # setactive_<chat_id>
         if data.startswith("setactive_"):
             try:
                 new_active = int(data.split("_", 1)[1])
@@ -4583,10 +4560,10 @@ async def handle_callback(bot: Client, cb: dict):
                 await tg_answer_cb(cb_id, f"✅ Active group set to {new_active}.", alert=False)
             return
 
-        # ── getnote_<chat_id>_<name> — retrieve a note via inline button ──
+        # getnote_<chat_id>_<name>
         if data.startswith("getnote_"):
-            rest = data[len("getnote_"):]
-            note_chat_id = chat_id  # default fallback
+            rest         = data[len("getnote_"):]
+            note_chat_id = chat_id
             note_name    = rest
             underscore_pos = rest.find("_")
             if underscore_pos > 0:
@@ -4596,7 +4573,6 @@ async def handle_callback(bot: Client, cb: dict):
                     note_name    = rest[underscore_pos + 1:]
                 except ValueError:
                     pass
-
             note = note_get(note_chat_id, note_name)
             if note:
                 content = note.get("content", "")
@@ -4624,15 +4600,14 @@ async def handle_callback(bot: Client, cb: dict):
                 return
             section = data.split("_", 1)[1]
             await tg_edit_text(
-                chat_id,
-                message_id,
+                chat_id, message_id,
                 moderation_help_text(section, uid),
                 markup=moderation_help_markup(section),
             )
             await tg_answer_cb(cb_id, "✅ Help updated.")
             return
 
-        # ── Mod-only callbacks ────────────────────────────────────────────
+        # Mod-only callbacks
         if not is_authorized(uid):
             await tg_answer_cb(cb_id, "⛔ Only moderators can use this.", alert=True)
             return
@@ -4662,12 +4637,11 @@ async def handle_callback(bot: Client, cb: dict):
         elif data.startswith("warn_"):
             if not has_permission(uid, "warn"):
                 return await tg_answer_cb(cb_id, "❌ No warn permission.", alert=True)
-            tid = int(data.split("_", 1)[1])
-            # FIX 2: use local _mod_info() instead of the out-of-scope actor_mod_info()
+            tid        = int(data.split("_", 1)[1])
             warner_tag = _mod_info().get("mod_id", str(uid))
-            res = warn(tid, chat_id, "Warned via button", warner=warner_tag)
-            case_id = create_case("WARN", uid, tid, "Warned via button")
-            target = {"id": tid}
+            res        = warn(tid, chat_id, "Warned via button", warner=warner_tag)
+            case_id    = create_case("WARN", uid, tid, "Warned via button")
+            target     = {"id": tid}
             await send_action_log(
                 chat_id, message.get("message_id"), "WARN", target,
                 "Warned via button", case_id, _mod_info(),
@@ -4675,9 +4649,9 @@ async def handle_callback(bot: Client, cb: dict):
             )
             action = res.get("action")
             if action:
-                ok = False
+                ok  = False
                 err = ""
-                until_ts = int(time.time()) + get_warn_config().get("duration", 3600)
+                until_ts     = int(time.time()) + get_warn_config().get("duration", 3600)
                 action_label = action.upper()
                 if action == "ban":
                     ok, err = await api_ban(chat_id, tid, until_date=until_ts)
@@ -4687,7 +4661,7 @@ async def handle_callback(bot: Client, cb: dict):
                     ok, err = await api_mute(chat_id, tid, until_date=until_ts)
                 if ok:
                     auto_reason = f"Warn threshold ({res.get('threshold')}) reached"
-                    auto_case = create_case(action_label, uid, tid, auto_reason)
+                    auto_case   = create_case(action_label, uid, tid, auto_reason)
                     await send_action_log(
                         chat_id, message.get("message_id"), action_label, target,
                         auto_reason, auto_case, _mod_info(),
@@ -4701,10 +4675,9 @@ async def handle_callback(bot: Client, cb: dict):
             if not has_permission(uid, "warn"):
                 return await tg_answer_cb(cb_id, "❌ No warn permission.", alert=True)
             tid = int(data.split("_", 1)[1])
-            # FIX 2: use local _mod_info() instead of the out-of-scope actor_mod_info()
             reset_warns(tid, chat_id, admin_tag=_mod_info().get("mod_id", str(uid)))
             case_id = create_case("RESETWARNS", uid, tid, "Unwarn via button")
-            target = {"id": tid}
+            target  = {"id": tid}
             await send_action_log(chat_id, message.get("message_id"), "RESETWARNS", target, "Warnings reset via button", case_id, _mod_info())
             await tg_answer_cb(cb_id, "✅ Warnings reset.")
 

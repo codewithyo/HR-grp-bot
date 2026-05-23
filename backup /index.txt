@@ -84,7 +84,8 @@ MODERATION_COMMANDS = {
     "filter", "stop", "filters",
     "addblocklist", "deleteblocklist", "removeblocklist", "blocklists", "blocklistmode",
     "hprotect", "hp", "hunprotect", "hup", "hprotected", "protect", "unprotect", "protected",
-    "setwelcome", "setgoodbye", "setrules", "hlock", "hunlock", "unlock",
+    "setwelcome", "setgoodbye", "setrules", "hlock", "lock", "hunlock", "unlock",
+    "locktype", "locktypes",
     # new toggle commands
     "welcome", "goodbye", "rules",
 }
@@ -180,6 +181,8 @@ WELCOME_FILE          = f"{STORAGE_PATH}/welcome.json"
 GOODBYE_FILE          = f"{STORAGE_PATH}/goodbye.json"
 RULES_FILE            = f"{STORAGE_PATH}/rules.json"
 LOCKS_FILE            = f"{STORAGE_PATH}/chat_locks.json"
+LOCK_TYPES_FILE       = f"{STORAGE_PATH}/lock_types.json"
+URL_DELETE_FILE       = f"{STORAGE_PATH}/url_delete.json"
 TTT_SCORES_FILE       = f"{STORAGE_PATH}/ttt_scores.json"
 TTT_STATE_FILE        = f"{STORAGE_PATH}/ttt_state.json"
 CHAT_TITLES_FILE      = f"{STORAGE_PATH}/chat_titles.json"
@@ -334,6 +337,26 @@ def init_storage_files():
                 shutil.copy2(primary, fallback)
             except Exception as e:
                 log_msg(f"WARNING syncing fallback: {e}", "WARNING")
+    
+    # Ensure TEMP_ACTIONS_FILE uses a list by default (not an object).
+    try:
+        if os.path.exists(TEMP_ACTIONS_FILE):
+            with open(TEMP_ACTIONS_FILE, "r") as f:
+                data = None
+                try:
+                    data = json.load(f)
+                except Exception:
+                    data = None
+            if isinstance(data, dict) or data is None:
+                # overwrite with an empty list to avoid type-mismatch bugs
+                try:
+                    with open(TEMP_ACTIONS_FILE, "w") as f:
+                        json.dump([], f, indent=2)
+                    log_msg(f"Normalized {TEMP_ACTIONS_FILE} to an empty list", "INFO")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 init_storage_files()
 log_msg(f"Storage: {STORAGE_PATH}  Fallback: {FALLBACK_STORAGE_PATH}", "INFO")
@@ -947,10 +970,32 @@ def disconnect_user(user_id: int) -> bool:
 
 async def is_chat_admin(bot: Client, chat_id: int, user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(int(chat_id), user_id)
         return member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
     except Exception:
         return False
+
+
+async def get_chat_member_safe(bot: Client, chat_id, user_identifier):
+    """Coerce `user_identifier` to int and call get_chat_member with clear errors.
+
+    Returns: (member, None) on success,
+             (None, "UserNotParticipant") if user not in chat,
+             (None, "❌ ...") for other failures.
+    """
+    try:
+        uid = int(user_identifier)
+    except Exception:
+        return None, "❌ Invalid user ID."
+    try:
+        member = await bot.get_chat_member(int(chat_id), uid)
+        return member, None
+    except UserNotParticipant:
+        return None, "UserNotParticipant"
+    except BadRequest as e:
+        return None, f"❌ Could not check the target user: {e}"
+    except Exception as e:
+        return None, f"❌ Could not check the target user: {e}"
 
 async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = True):
     if not isinstance(chat, dict) or chat.get("type") != "private":
@@ -964,7 +1009,7 @@ async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = Tr
         else:
             return False
     try:
-        member = await bot.get_chat_member(conn_id, user_id)
+        member = await bot.get_chat_member(int(conn_id), user_id)
     except Exception:
         # Bot restarted or Telegram API hiccup — keep the stored connection
         # rather than silently dropping it. Trust the persisted data.
@@ -1029,7 +1074,7 @@ async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
 
 async def connect_user_to_chat(bot: Client, user_id: int, connect_id: int) -> str | None:
     try:
-        member = await bot.get_chat_member(connect_id, user_id)
+        member = await bot.get_chat_member(int(connect_id), user_id)
     except UserNotParticipant:
         return "Connections to this chat not allowed!"
     except BadRequest:
@@ -1583,11 +1628,20 @@ def extract_actor_user_id(msg: dict) -> tuple[int | None, str | None, bool]:
 def extract_reply_user(reply: dict) -> tuple[dict, int | None]:
     if not isinstance(reply, dict):
         return {}, None
+    # If the replied message is from a channel (sender_chat), callers
+    # should not try to treat it as a user. Return the sender_chat dict
+    # and None for the id so higher-level code can reply with a clear error.
+    sender_chat = reply.get("sender_chat")
+    if isinstance(sender_chat, dict):
+        return sender_chat, None
+
     target = reply.get("from")
     if not isinstance(target, dict):
         return {}, None
     tid = target.get("id")
     if not isinstance(tid, int) or tid <= 0:
+        # Keep the raw target dict (may contain username or other metadata)
+        # but indicate there's no valid positive user id.
         return target, None
     return target, tid
 
@@ -1600,6 +1654,9 @@ def parse_positive_user_id(value: str) -> int | None:
 
 def resolve_target(reply, args, idx) -> tuple[dict, int | None, str | None]:
     target, tid = extract_reply_user(reply)
+    # If reply came from a channel (sender_chat), give a specific error.
+    if isinstance(reply, dict) and reply.get("sender_chat"):
+        return {}, None, "❌ Channel messages are not supported for moderation commands."
     if tid:
         return target, tid, None
     if len(args) > idx:
@@ -1613,6 +1670,8 @@ async def resolve_target_ext(
     bot: Client, reply, args, idx
 ) -> tuple[dict, int | None, str | None]:
     target, tid = extract_reply_user(reply)
+    if isinstance(reply, dict) and reply.get("sender_chat"):
+        return {}, None, "❌ Channel messages are not supported for moderation commands."
     if tid:
         return target, tid, None
     if len(args) > idx:
@@ -2586,11 +2645,24 @@ async def send_action_log(
     rows.append([("📜 View Case",       f"cb:case_{case_id}")])
     markup = build_markup(*rows)
 
-    resp = await tg_send(source_chat, text, reply_to=reply_to, markup=markup)
+    # Coerce source_chat to an integer chat id where possible. Some callers
+    # accidentally pass a chat object or dict which later produces
+    # "Peer id invalid" errors when processed by the temp-action worker.
+    chat_to_send = None
+    try:
+        if isinstance(source_chat, dict):
+            chat_to_send = source_chat.get("id")
+        else:
+            chat_to_send = int(source_chat)
+    except Exception:
+        chat_to_send = None
+
+    resp = await tg_send(chat_to_send if chat_to_send is not None else source_chat, text, reply_to=reply_to, markup=markup)
     if resp.get("ok") and resp.get("result"):
         msg_id = resp["result"].get("message_id")
-        if msg_id:
-            schedule_message_delete(source_chat, msg_id, ACTION_LOG_AUTO_DELETE)
+        if msg_id and chat_to_send is not None:
+            # Only schedule deletion when we have a sane chat id
+            schedule_message_delete(chat_to_send, msg_id, ACTION_LOG_AUTO_DELETE)
 
     lg = get_log_group()
     if lg and lg != source_chat:
@@ -2632,8 +2704,18 @@ async def process_due_temp_actions(bot: Client):
         if until_ts > now_ts:
             pending.append(action)
             continue
-        chat_id   = action["chat_id"]
-        target_id = action["target_id"]
+        chat_id_raw = action.get("chat_id")
+        target_id_raw = action.get("target_id")
+        try:
+            chat_id = int(chat_id_raw)
+        except Exception:
+            log_msg(f"Skipping temp action with invalid chat_id: {chat_id_raw}", "WARNING")
+            continue
+        try:
+            target_id = int(target_id_raw)
+        except Exception:
+            log_msg(f"Skipping temp action with invalid target_id: {target_id_raw}", "WARNING")
+            continue
         atype     = action["type"]
         try:
             if atype == "mute":
@@ -3984,14 +4066,16 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hban <user_id/@user> [duration] [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot ban yourself.")
-            try:
-                member = await bot.get_chat_member(action_chat_id, tid)
+            member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
+            if gm_err:
+                if gm_err == "UserNotParticipant":
+                    # user not in chat — allow ban attempt (Telegram will handle)
+                    pass
+                else:
+                    log_msg(f"get_chat_member failed for ban check: {gm_err}", "WARNING")
+            else:
                 if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                     return await reply_text("❌ Cannot ban an admin or the group owner.")
-            except UserNotParticipant:
-                pass
-            except Exception:
-                pass
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
             if is_protected(tid, action_chat_id):
@@ -4020,14 +4104,15 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hkick <user_id/@user> [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot kick yourself.")
-            try:
-                member = await bot.get_chat_member(action_chat_id, tid)
+            member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
+            if gm_err:
+                if gm_err == "UserNotParticipant":
+                    return await reply_text("❌ This user is not in the chat.")
+                else:
+                    log_msg(f"get_chat_member failed for kick check: {gm_err}", "WARNING")
+            else:
                 if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                     return await reply_text("❌ Cannot kick an admin or the group owner.")
-            except UserNotParticipant:
-                return await reply_text("❌ This user is not in the chat.")
-            except Exception:
-                pass
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No Reason")
             if is_protected(tid, action_chat_id):
@@ -4049,12 +4134,12 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hmute <user_id/@user> [duration] [reason]")
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
-            try:
-                member = await bot.get_chat_member(action_chat_id, tid)
-            except UserNotParticipant:
-                return await reply_text("This user isn't in the chat!")
-            except BadRequest as exc:
-                return await reply_text(f"❌ Could not check the target user: {exc}")
+            member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
+            if gm_err:
+                if gm_err == "UserNotParticipant":
+                    return await reply_text("This user isn't in the chat!")
+                else:
+                    return await reply_text(gm_err)
             if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                 return await reply_text("Afraid I can't stop an admin from talking!")
             if tid == _bot_id:
@@ -4103,12 +4188,12 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hunmute <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
-            try:
-                member = await bot.get_chat_member(action_chat_id, tid)
-            except UserNotParticipant:
-                return await reply_text("This user isn't even in the chat!")
-            except BadRequest as exc:
-                return await reply_text(f"❌ Could not check the target user: {exc}")
+            member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
+            if gm_err:
+                if gm_err == "UserNotParticipant":
+                    return await reply_text("This user isn't even in the chat!")
+                else:
+                    return await reply_text(gm_err)
             if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                 return await reply_text("This user already has the right to speak.")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
@@ -4240,20 +4325,20 @@ async def handle_message(bot: Client, msg: dict):
             user_lookup = uid
             if args:
                 explicit = True
-                if args[0].startswith("@"):
-                    try:
-                        user_obj = await bot.get_user(args[0][1:])
-                        user_lookup = user_obj.id
-                    except Exception:
-                        pass
+                # Prefer reply / @username / numeric ID uniformly
+                target_tmp, tid_tmp, terr_tmp = await resolve_target_ext(bot, reply, args, 0)
+                if tid_tmp:
+                    user_lookup = tid_tmp
                 else:
-                    try:
-                        user_lookup = int(args[0])
-                    except Exception:
-                        if reply:
-                            _, rid = extract_reply_user(reply)
-                            if rid:
-                                user_lookup = rid
+                    # If resolve_target_ext couldn't find a user, fall back to reply-only lookup
+                    if reply:
+                        _, rid = extract_reply_user(reply)
+                        if rid:
+                            user_lookup = rid
+                        else:
+                            return await reply_text(f"{terr_tmp}")
+                    else:
+                        return await reply_text(f"{terr_tmp}")
             elif reply:
                 explicit = True
                 _, rid = extract_reply_user(reply)
@@ -4431,15 +4516,11 @@ async def handle_message(bot: Client, msg: dict):
                 )
                 return
             lookup = uid
-            if reply:
-                _, rid = extract_reply_user(reply)
-                if rid:
-                    lookup = rid
-            elif args:
-                p = parse_positive_user_id(args[0])
-                if not p:
-                    return await reply_text("❌ Invalid user ID.")
-                lookup = p
+            if reply or args:
+                target_tmp, tid_tmp, terr_tmp = await resolve_target_ext(bot, reply, args, 0)
+                if not tid_tmp:
+                    return await reply_text(terr_tmp)
+                lookup = tid_tmp
             mod = get_mod_info(lookup)
             if not mod:
                 return await reply_text("❌ That user is not a moderator.")
