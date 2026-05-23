@@ -84,8 +84,7 @@ MODERATION_COMMANDS = {
     "filter", "stop", "filters",
     "addblocklist", "deleteblocklist", "removeblocklist", "blocklists", "blocklistmode",
     "hprotect", "hp", "hunprotect", "hup", "hprotected", "protect", "unprotect", "protected",
-    "setwelcome", "setgoodbye", "setrules", "hlock", "lock", "hunlock", "unlock",
-    "locktype", "locktypes",
+    "setwelcome", "setgoodbye", "setrules", "hlock", "hunlock", "unlock",
     # new toggle commands
     "welcome", "goodbye", "rules",
 }
@@ -181,8 +180,6 @@ WELCOME_FILE          = f"{STORAGE_PATH}/welcome.json"
 GOODBYE_FILE          = f"{STORAGE_PATH}/goodbye.json"
 RULES_FILE            = f"{STORAGE_PATH}/rules.json"
 LOCKS_FILE            = f"{STORAGE_PATH}/chat_locks.json"
-LOCK_TYPES_FILE       = f"{STORAGE_PATH}/lock_types.json"
-URL_DELETE_FILE       = f"{STORAGE_PATH}/url_delete.json"
 TTT_SCORES_FILE       = f"{STORAGE_PATH}/ttt_scores.json"
 TTT_STATE_FILE        = f"{STORAGE_PATH}/ttt_state.json"
 CHAT_TITLES_FILE      = f"{STORAGE_PATH}/chat_titles.json"
@@ -337,26 +334,6 @@ def init_storage_files():
                 shutil.copy2(primary, fallback)
             except Exception as e:
                 log_msg(f"WARNING syncing fallback: {e}", "WARNING")
-    
-    # Ensure TEMP_ACTIONS_FILE uses a list by default (not an object).
-    try:
-        if os.path.exists(TEMP_ACTIONS_FILE):
-            with open(TEMP_ACTIONS_FILE, "r") as f:
-                data = None
-                try:
-                    data = json.load(f)
-                except Exception:
-                    data = None
-            if isinstance(data, dict) or data is None:
-                # overwrite with an empty list to avoid type-mismatch bugs
-                try:
-                    with open(TEMP_ACTIONS_FILE, "w") as f:
-                        json.dump([], f, indent=2)
-                    log_msg(f"Normalized {TEMP_ACTIONS_FILE} to an empty list", "INFO")
-                except Exception:
-                    pass
-    except Exception:
-        pass
 
 init_storage_files()
 log_msg(f"Storage: {STORAGE_PATH}  Fallback: {FALLBACK_STORAGE_PATH}", "INFO")
@@ -2609,24 +2586,11 @@ async def send_action_log(
     rows.append([("📜 View Case",       f"cb:case_{case_id}")])
     markup = build_markup(*rows)
 
-    # Coerce source_chat to an integer chat id where possible. Some callers
-    # accidentally pass a chat object or dict which later produces
-    # "Peer id invalid" errors when processed by the temp-action worker.
-    chat_to_send = None
-    try:
-        if isinstance(source_chat, dict):
-            chat_to_send = source_chat.get("id")
-        else:
-            chat_to_send = int(source_chat)
-    except Exception:
-        chat_to_send = None
-
-    resp = await tg_send(chat_to_send if chat_to_send is not None else source_chat, text, reply_to=reply_to, markup=markup)
+    resp = await tg_send(source_chat, text, reply_to=reply_to, markup=markup)
     if resp.get("ok") and resp.get("result"):
         msg_id = resp["result"].get("message_id")
-        if msg_id and chat_to_send is not None:
-            # Only schedule deletion when we have a sane chat id
-            schedule_message_delete(chat_to_send, msg_id, ACTION_LOG_AUTO_DELETE)
+        if msg_id:
+            schedule_message_delete(source_chat, msg_id, ACTION_LOG_AUTO_DELETE)
 
     lg = get_log_group()
     if lg and lg != source_chat:
@@ -2668,18 +2632,8 @@ async def process_due_temp_actions(bot: Client):
         if until_ts > now_ts:
             pending.append(action)
             continue
-        chat_id_raw = action.get("chat_id")
-        target_id_raw = action.get("target_id")
-        try:
-            chat_id = int(chat_id_raw)
-        except Exception:
-            log_msg(f"Skipping temp action with invalid chat_id: {chat_id_raw}", "WARNING")
-            continue
-        try:
-            target_id = int(target_id_raw)
-        except Exception:
-            log_msg(f"Skipping temp action with invalid target_id: {target_id_raw}", "WARNING")
-            continue
+        chat_id   = action["chat_id"]
+        target_id = action["target_id"]
         atype     = action["type"]
         try:
             if atype == "mute":
