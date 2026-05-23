@@ -970,7 +970,7 @@ def disconnect_user(user_id: int) -> bool:
 
 async def is_chat_admin(bot: Client, chat_id: int, user_id: int) -> bool:
     try:
-        member = await bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(int(chat_id), user_id)
         return member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
     except Exception:
         return False
@@ -1009,7 +1009,7 @@ async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = Tr
         else:
             return False
     try:
-        member = await bot.get_chat_member(conn_id, user_id)
+        member = await bot.get_chat_member(int(conn_id), user_id)
     except Exception:
         # Bot restarted or Telegram API hiccup — keep the stored connection
         # rather than silently dropping it. Trust the persisted data.
@@ -1074,7 +1074,7 @@ async def connect_chat(bot: Client, msg: dict, args: list[str]) -> str:
 
 async def connect_user_to_chat(bot: Client, user_id: int, connect_id: int) -> str | None:
     try:
-        member = await bot.get_chat_member(connect_id, user_id)
+        member = await bot.get_chat_member(int(connect_id), user_id)
     except UserNotParticipant:
         return "Connections to this chat not allowed!"
     except BadRequest:
