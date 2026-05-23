@@ -2478,7 +2478,7 @@ def moderation_help_text(section: str, uid: int) -> str:
             "• View user info and ban/mute history.\n"
             "• Monitor moderator activity.\n"
         )
-   if section == "bot":
+if section == "bot":
         return (
             f"👮 **{role} Help Center**\n\n"
             "🤖 **Bot On/Off Toggle**\n\n"
