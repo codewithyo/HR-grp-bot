@@ -11,6 +11,10 @@
 #   FIX-E: Fixed hlock/hunlock to allow PM-connected users.
 #   FIX-F: Added missing /hunauth command handler.
 #   FIX-G: Added stub handler for locktype/locktypes commands.
+#   FIX-H: Fixed SyntaxError — missing # on comment in Bot ON/OFF guard.
+#   FIX-I: Fixed broken indentation in Bot ON/OFF guard block.
+#   FIX-J: Added "bot" to MODERATION_COMMANDS set.
+#   FIX-K: Skip auto-delete for informational command replies.
 # =========================================================
 
 import os, json, time, random, string, asyncio, httpx, re
@@ -98,9 +102,16 @@ MODERATION_COMMANDS = {
     "setwelcome", "setgoodbye", "setrules", "hlock", "lock", "hunlock", "unlock",
     "locktype", "locktypes",
     # toggle commands
-    "welcome", "goodbye", "rules", "bot",
+    "welcome", "goodbye", "rules", "bot",  # FIX-J: "bot" added
 }
 ACTION_LOG_AUTO_DELETE = 60  # seconds
+
+# FIX-K: Commands whose replies should NOT be auto-deleted (users need to read them)
+_NO_AUTODELETE_CMDS = {
+    "notes", "filters", "blocklists", "rules", "hmod", "hstats",
+    "hprotected", "hcase", "hmodinfo", "help", "hr", "warns",
+    "connections", "hbans", "hmutes",
+}
 
 # =========================================================
 # LOGGING
@@ -197,7 +208,7 @@ URL_DELETE_FILE       = f"{STORAGE_PATH}/url_delete.json"
 TTT_SCORES_FILE       = f"{STORAGE_PATH}/ttt_scores.json"
 TTT_STATE_FILE        = f"{STORAGE_PATH}/ttt_state.json"
 CHAT_TITLES_FILE      = f"{STORAGE_PATH}/chat_titles.json"
-BOT_STATUS_FILE = f"{STORAGE_PATH}/bot_status.json"
+BOT_STATUS_FILE       = f"{STORAGE_PATH}/bot_status.json"
 
 FALLBACK_FILE_MAP = {
     AUTH_FILE:             f"{FALLBACK_STORAGE_PATH}/auth.json",
@@ -568,6 +579,9 @@ async def tg_send(
     parse_mode: str = "Markdown",
     entities: list = None,
 ) -> dict:
+    """Send a message. If Markdown parsing fails (HTTP 400 from Telegram),
+    automatically retry once with parse_mode disabled so the user still
+    sees something instead of silence."""
     payload: dict = {"chat_id": chat_id, "text": text}
     if reply_to:
         payload["reply_to_message_id"] = reply_to
@@ -577,7 +591,32 @@ async def tg_send(
         payload["parse_mode"] = parse_mode
     if entities is not None:
         payload["entities"] = entities
-    return await tg_api("sendMessage", json=payload)
+
+    resp = await tg_api("sendMessage", json=payload)
+
+    # Auto-fallback: if Telegram rejected our Markdown, resend as plain text
+    if (
+        not resp.get("ok")
+        and parse_mode
+        and entities is None
+        and isinstance(resp.get("description"), str)
+        and (
+            "can't parse entities" in resp["description"].lower()
+            or "can't find end" in resp["description"].lower()
+            or "unsupported start tag" in resp["description"].lower()
+            or "byte offset" in resp["description"].lower()
+        )
+    ):
+        log_msg(
+            f"tg_send Markdown parse failed → retrying as plain text. "
+            f"desc={resp.get('description')}",
+            "WARNING",
+        )
+        payload.pop("parse_mode", None)
+        resp = await tg_api("sendMessage", json=payload)
+
+    return resp
+
 
 async def tg_edit_text(
     chat_id: int,
@@ -594,7 +633,21 @@ async def tg_edit_text(
         payload["parse_mode"] = parse_mode
     if entities is not None:
         payload["entities"] = entities
-    return await tg_api("editMessageText", json=payload)
+
+    resp = await tg_api("editMessageText", json=payload)
+
+    if (
+        not resp.get("ok")
+        and parse_mode
+        and entities is None
+        and isinstance(resp.get("description"), str)
+        and "can't parse entities" in resp["description"].lower()
+    ):
+        payload.pop("parse_mode", None)
+        resp = await tg_api("editMessageText", json=payload)
+
+    return resp
+
 
 async def tg_send_media(chat_id: int, note: dict, reply_to: int = None):
     ntype   = note.get("type", "text")
@@ -752,22 +805,12 @@ async def api_delete_msg(chat_id: int, message_id: int) -> tuple[bool, str]:
 # =========================================================
 # FIX-A + FIX-B: Bot API getChatMember — avoids Pyrogram peer-cache errors
 # =========================================================
-# Pyrogram uses in_memory=True, so its peer cache is empty after every restart.
-# Calling bot.get_chat_member() on an uncached peer raises:
-#   ValueError: Peer id invalid: -100XXXXXXXXXX
-# We bypass this entirely by calling the Bot API directly.
-# =========================================================
 
-# Status strings returned by Bot API getChatMember
 _BOT_API_ADMIN_STATUSES = {"creator", "administrator"}
 _BOT_API_MEMBER_STATUSES = {"creator", "administrator", "member", "restricted"}
 
 class _BotApiMember:
-    """Minimal wrapper around a Bot API getChatMember result dict.
-
-    Exposes a `.status` attribute mapped to pyrogram.enums.ChatMemberStatus
-    so existing status comparisons continue to work unchanged.
-    """
+    """Minimal wrapper around a Bot API getChatMember result dict."""
     _STATUS_MAP = {
         "creator":       enums.ChatMemberStatus.OWNER,
         "administrator": enums.ChatMemberStatus.ADMINISTRATOR,
@@ -781,18 +824,13 @@ class _BotApiMember:
         self._data  = data or {}
         raw_status  = self._data.get("status", "")
         self.status = self._STATUS_MAP.get(raw_status, enums.ChatMemberStatus.MEMBER)
-        self._raw_status = raw_status  # keep original string for quick checks
+        self._raw_status = raw_status
 
     def is_admin(self) -> bool:
         return self._raw_status in _BOT_API_ADMIN_STATUSES
 
 
 async def api_get_chat_member(chat_id: int, user_id: int) -> tuple[dict | None, str | None]:
-    """Call Bot API getChatMember and return (result_dict, error_string).
-
-    Returns (None, "UserNotParticipant") when the user is not in the chat.
-    Returns (None, "❌ ...") for other failures.
-    """
     r = await tg_api("getChatMember", json={"chat_id": int(chat_id), "user_id": int(user_id)})
     if r.get("ok"):
         return r.get("result", {}), None
@@ -807,12 +845,7 @@ async def api_get_chat_member(chat_id: int, user_id: int) -> tuple[dict | None, 
 
 
 async def get_chat_member_safe(bot: Client, chat_id, user_identifier):
-    """FIX-A: Uses Bot API instead of Pyrogram to avoid peer-cache errors.
-
-    Returns: (_BotApiMember, None) on success,
-             (None, "UserNotParticipant") if user not in chat,
-             (None, "❌ ...") for other failures.
-    """
+    """FIX-A: Uses Bot API instead of Pyrogram to avoid peer-cache errors."""
     try:
         uid = int(user_identifier)
     except Exception:
@@ -1068,13 +1101,12 @@ async def connected(bot: Client, chat: dict, user_id: int, need_admin: bool = Tr
 
     data, err = await api_get_chat_member(conn_id, user_id)
     if err:
-        # Bot API failure — keep stored connection rather than silently dropping it.
         log_msg(
             f"Cannot verify member {user_id} in {conn_id} right now ({err}); "
             "keeping stored connection.",
             "WARNING",
         )
-        return conn_id  # trust stored data; worst case Telegram rejects the action
+        return conn_id
 
     status = data.get("status", "")
     is_admin_status = status in _BOT_API_ADMIN_STATUSES
@@ -1461,7 +1493,7 @@ def cache_chat_title(chat_id: int, title: str):
     data[str(chat_id)] = title
     save(CHAT_TITLES_FILE, data)
 
- # =========================================================
+# =========================================================
 # BOT ON/OFF STATUS (per-chat)
 # =========================================================
 
@@ -1481,7 +1513,7 @@ def set_bot_enabled(chat_id: int, enabled: bool):
     data = load(BOT_STATUS_FILE)
     data[str(chat_id)] = enabled
     save(BOT_STATUS_FILE, data)
-    _cache.invalidate(f"bot_enabled:{chat_id}")   
+    _cache.invalidate(f"bot_enabled:{chat_id}")
 
 # =========================================================
 # WELCOME / GOODBYE / RULES / LOCKS
@@ -3001,9 +3033,10 @@ async def handle_message(bot: Client, msg: dict):
         actor_label = f"anon_admin:{chat_id}" if is_anon_admin else str(uid)
         log_msg(f"/{raw_cmd} from actor={actor_label} chat={chat_id}", "INFO")
 
+        # FIX-K: reply_text skips auto-delete for informational commands
         async def reply_text(t: str, markup: dict = None, parse_mode: str = "Markdown"):
             sent = await tg_send(chat_id, t, reply_to=msg_id, markup=markup, parse_mode=parse_mode)
-            if not is_private and sent.get("ok"):
+            if not is_private and sent.get("ok") and raw_cmd not in _NO_AUTODELETE_CMDS:
                 rmid = sent.get("result", {}).get("message_id")
                 if rmid:
                     schedule_message_delete(chat_id, rmid)
@@ -3028,9 +3061,12 @@ async def handle_message(bot: Client, msg: dict):
                 )
             action_chat_id = resolved
 
-      # ── Bot ON/OFF guard ──────────────────────────────────────────────
-        if raw_cmd != "bot":
-            effective_chat = chat_id
+        # ── Bot ON/OFF guard ──────────────────────────────────────────────
+        # /start, /help and /bot must ALWAYS work, otherwise users have no
+        # way to discover the bot is intentionally disabled.
+        _always_allowed = {"bot", "start", "help"}
+        if raw_cmd not in _always_allowed:
+            effective_chat = action_chat_id if is_private else chat_id
             _caller_is_owner = (not is_anon_admin) and is_owner(uid)
             if not is_bot_enabled(effective_chat) and not _caller_is_owner:
                 return
@@ -3158,7 +3194,7 @@ async def handle_message(bot: Client, msg: dict):
                 star         = " ⭐" if cid == active else ""
                 display_id   = f"`{cid}`"
                 if title:
-                    lines.append(f"• *{title}*{star} ({display_id})")
+                    lines.append(f"• *{_escape_markdown(title)}*{star} ({display_id})")
                     display_label = title[:20]
                 else:
                     lines.append(f"• {display_id}{star}")
@@ -3204,8 +3240,8 @@ async def handle_message(bot: Client, msg: dict):
                 "• `/filters` - Active filters\n"
                 "• `/ttt` - Tic-Tac-Toe battle\n"
                 "• `/happeal` - Appeal in DM\n\n"
-                "👨‍💻 Developed by @dreamm\_ca\n"
-                "⚙️ Sudo Dev: @developer\_hr\n\n"
+                "👨‍💻 Developed by @dreamm\\_ca\n"
+                "⚙️ Sudo Dev: @developer\\_hr\n\n"
                 "⚡ Active. Secure. Ready."
             )
             return
@@ -3373,7 +3409,7 @@ async def handle_message(bot: Client, msg: dict):
             )
             return await reply_text("✅ Rules saved.")
 
-        # FIX-D: single unified /rules handler (removed duplicate dead-code block)
+        # FIX-D: single unified /rules handler
         if raw_cmd == "rules":
             entry = _rules_for_chat(action_chat_id if is_private else chat_id)
             if is_authorized_actor() and args:
@@ -3449,7 +3485,6 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hlock", "lock"):
             if not await check_mod("mute"):
                 return
-            # Only block when truly no connected group (action_chat_id == chat_id in PM)
             if is_private and action_chat_id == chat_id:
                 return await reply_text("Use /hlock in a group or via a connected group.")
             dur = parse_duration_token(args[0]) if args else None
@@ -3499,7 +3534,6 @@ async def handle_message(bot: Client, msg: dict):
         if raw_cmd in ("hunlock", "unlock"):
             if not await check_mod("mute"):
                 return
-            # Only block when truly no connected group (action_chat_id == chat_id in PM)
             if is_private and action_chat_id == chat_id:
                 return await reply_text("Use /hunlock in a group or via a connected group.")
             lock_entry    = _lock_for_chat(action_chat_id)
@@ -3950,7 +3984,7 @@ async def handle_message(bot: Client, msg: dict):
                 await tg_send(lg, f"✅ Moderator authorized\n👤 {make_mention(target)} (`{tid}`)\n🛡 By: `{uid}`")
             return
 
-        # FIX-F: /hunauth — remove moderator status (was completely missing)
+        # FIX-F: /hunauth — remove moderator status
         if raw_cmd == "hunauth":
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
@@ -4147,7 +4181,6 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hban <user_id/@user> [duration] [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot ban yourself.")
-            # FIX-A: use Bot API member check
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
             if gm_err:
                 if gm_err != "UserNotParticipant":
@@ -4183,7 +4216,6 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hkick <user_id/@user> [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot kick yourself.")
-            # FIX-A: use Bot API member check
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
             if gm_err:
                 if gm_err == "UserNotParticipant":
@@ -4214,7 +4246,6 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hmute <user_id/@user> [duration] [reason]")
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
-            # FIX-A: use Bot API member check
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
             if gm_err:
                 if gm_err == "UserNotParticipant":
@@ -4269,7 +4300,6 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hunmute <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
-            # FIX-A: use Bot API member check
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
             if gm_err:
                 if gm_err == "UserNotParticipant":
