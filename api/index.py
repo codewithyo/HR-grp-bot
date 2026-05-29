@@ -99,7 +99,7 @@ MODERATION_COMMANDS = {
     "hfilter", "hstop", "hfilters",
     "haddblocklist", "hdeleteblocklist", "hblocklists", "hblocklistmode",
     "hprotect", "hunprotect", "hprotected",
-    "hsetwelcome", "hsetgoodbye", "hsetrules", "hlock", "hunlock", "hlocktype",
+    "hsetwelcome", "hsetgoodbye", "hsetrules", "hlock", "hunlock", "hlocktype", "hlocktypelist",
     "hlocklist", "hlockbot", "hlocklink", "hunlockbot", "hunlocklink",
     # toggle commands
     "hwelcome", "hgoodbye", "hrules", "hbot",
@@ -2396,7 +2396,7 @@ def moderation_help_markup(section: str = "home") -> dict:
         (("🔍 Filters", "cb:help_filters"), ("🔒 Blocklist", "cb:help_blocklist"), ("🔗 Connections", "cb:help_connections")),
         (("🔐 Authorization", "cb:help_auth"), ("📊 Stats", "cb:help_stats"), ("🎮 Games", "cb:help_games")),
         (("🎉 Welcome", "cb:help_welcome"), ("📜 Rules", "cb:help_rules"), ("🚨 Report", "cb:help_report")),
-        (("🔒 Lock", "cb:help_lock"), ("🤖 Bot Toggle", "cb:help_bot")),
+        (("🔒 Lock", "cb:help_lock"), ("🔓 Lock Types", "cb:help_locktypes"), ("🤖 Bot Toggle", "cb:help_bot")),
     )
     if section == "home":
         return build_markup(*base_rows)
@@ -2527,16 +2527,59 @@ def moderation_help_text(section: str, uid: int) -> str:
     if section == "lock":
         return (
             f"👮 **{role} Help Center**\n\n"
-            "🔒 **Chat Lock**\n\n"
-            "`/hlock` — Lock chat until manually unlocked\n"
-            "`/hlock <duration>` — Lock for a fixed time, then auto-unlock\n"
-            "`/hunlock` — Restore original chat permissions\n\n"
+            "🔒 **Chat Lock & Control**\n\n"
+            "**Permission-Based Locks:**\n"
+            "`/hlock [type] [duration]` — Lock chat by type\n"
+            "`/hunlock` — Restore original permissions\n\n"
+            "**Command-Based Locks:**\n"
+            "`/hlockbot [duration]` — Block bot commands\n"
+            "`/hlocklink [duration]` — Block links\n"
+            "`/hunlockbot` — Unblock bot commands\n"
+            "`/hunlocklink` — Unblock links\n\n"
+            "**Lock Management:**\n"
+            "`/hlocklist` — View all active locks\n"
+            "`/hlocktype` — Show lock types\n"
+            "`/hlocktypelist` — List all types with descriptions\n\n"
             "**Duration Format:** `10m`, `2h`, `1d`\n\n"
+            "**Examples:**\n"
+            "• `/hlock media 2h` - Block media for 2 hours\n"
+            "• `/hlock all 30m` - Full lock for 30 minutes\n"
+            "• `/hlockbot 1h` - Block bot commands for 1 hour\n"
+            "• `/hlocklink` - Permanently block links\n"
+            "• `/hlocklist` - See all active locks\n\n"
             "**Notes**\n"
             "• Original permissions are saved and fully restored on unlock.\n"
             "• Admins are unaffected.\n"
-            "• If the bot restarts during a timed lock, the lock expires "
-            "automatically when the temp-action worker next runs.\n"
+            "• Timed locks auto-expire.\n"
+        )
+    if section == "locktypes":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "🔒 **All Available Lock Types**\n\n"
+            "**Global Control:**\n"
+            "• `all` — Block everything (messages + all media)\n"
+            "• `messages` — Block text messages only\n"
+            "• `media` — Block all media at once\n\n"
+            "**Individual Media Types:**\n"
+            "• `photos` — Block photo sharing\n"
+            "• `videos` — Block video sharing\n"
+            "• `audio` — Block audio/music\n"
+            "• `documents` — Block document sharing\n"
+            "• `videonotes` — Block video notes\n"
+            "• `voicenotes` — Block voice notes\n"
+            "• `gifs` — Block GIFs\n\n"
+            "**Interactive Content:**\n"
+            "• `stickers` — Block stickers\n"
+            "• `animations` — Block animations\n"
+            "• `games` — Block games\n"
+            "• `inline` — Block inline content\n"
+            "• `webpages` — Block web page previews\n"
+            "• `polls` — Block polls\n\n"
+            "**Command-Based Locks:**\n"
+            "• `bot` — Block bot commands\n"
+            "• `link` — Block links/URLs\n\n"
+            "**Usage:** `/hlock <type> [duration]`\n"
+            "**List all:** `/hlocktypelist`\n"
         )
     if section == "notes":
         return (
@@ -3775,6 +3818,42 @@ async def handle_message(bot: Client, msg: dict):
             if lock_type not in _LOCK_TYPES:
                 return await reply_text(f"❌ Unknown lock type: `{lock_type}`\nAvailable: {', '.join(_LOCK_TYPES.keys())}")
             await reply_text(f"✅ Lock type `{lock_type}` details: {list(_LOCK_TYPES[lock_type].keys())}")
+
+        if raw_cmd == "hlocktypelist":
+            if not is_authorized_actor():
+                return await security_fail()
+            lock_type_info = (
+                "🔒 **All Available Lock Types**\n\n"
+                "**Global Control:**\n"
+                "• `all` — Block everything\n"
+                "• `messages` — Block text messages only\n"
+                "• `media` — Block all media at once\n\n"
+                "**Individual Media Types:**\n"
+                "• `photos` — Block photo sharing\n"
+                "• `videos` — Block video sharing\n"
+                "• `audio` — Block audio/music\n"
+                "• `documents` — Block document sharing\n"
+                "• `videonotes` — Block video notes\n"
+                "• `voicenotes` — Block voice notes\n"
+                "• `gifs` — Block GIFs\n\n"
+                "**Interactive Content:**\n"
+                "• `stickers` — Block stickers\n"
+                "• `animations` — Block animations\n"
+                "• `games` — Block games\n"
+                "• `inline` — Block inline content\n"
+                "• `webpages` — Block web page previews\n"
+                "• `polls` — Block polls\n\n"
+                "**Command-Based Locks:**\n"
+                "• `bot` — Block bot commands\n"
+                "• `link` — Block links/URLs\n\n"
+                "**Usage Examples:**\n"
+                "`/hlock photos 2h` — Block photos for 2 hours\n"
+                "`/hlock media` — Permanently block all media\n"
+                "`/hlockbot 1h` — Block bot commands for 1 hour\n"
+                "`/hlocklink` — Permanently block links\n"
+            )
+            await reply_text(lock_type_info)
+            return
 
         if raw_cmd == "hlocklist":
             if not is_authorized_actor():
