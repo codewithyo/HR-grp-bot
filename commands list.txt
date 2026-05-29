@@ -39,3 +39,18 @@
     {"command": "hunprotect",     "description": "🔓 Remove user protection (Owner)"},
     {"command": "hcase",          "description": "📋 View moderation case details"},
     {"command": "happeal",        "description": "📢 Appeal a moderation case (DM only)"},
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    add a abroadcast commands work in like ask for send in bot or if using bot broadcast message to specific group in which bot is admin using group chat id 
