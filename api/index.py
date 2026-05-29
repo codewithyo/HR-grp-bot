@@ -7,13 +7,13 @@
 #           caused by the empty in-memory peer cache after restarts.
 #   FIX-B: Added _BotApiMember wrapper + api_get_chat_member() helper.
 #   FIX-C: Removed dead code block in moderation_help_markup().
-#   FIX-D: Removed duplicate `if raw_cmd == "rules":` handler block.
+#   FIX-D: Removed duplicate `if raw_cmd == "hrules":` handler block.
 #   FIX-E: Fixed hlock/hunlock to allow PM-connected users.
 #   FIX-F: Added missing /hunauth command handler.
 #   FIX-G: Added stub handler for locktype/locktypes commands.
 #   FIX-H: Fixed SyntaxError — missing # on comment in Bot ON/OFF guard.
 #   FIX-I: Fixed broken indentation in Bot ON/OFF guard block.
-#   FIX-J: Added "bot" to MODERATION_COMMANDS set.
+#   FIX-J: Added "hbot" to MODERATION_COMMANDS set.
 #   FIX-K: Skip auto-delete for informational command replies.
 # =========================================================
 
@@ -94,14 +94,14 @@ VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete",
 MODERATION_COMMANDS = {
     "hban", "hkick", "hmute",
     "hunban", "hunmute", "hwarn",
-    "resetwarns", "hdel", "pin", "unpin",
-    "save", "get", "clear", "notes",
-    "filter", "stop", "filters",
-    "addblocklist", "deleteblocklist", "blocklists", "blocklistmode",
+    "hresetwarns", "hdel", "hpin", "hunpin",
+    "hsave", "hget", "hclear", "hnotes",
+    "hfilter", "hstop", "hfilters",
+    "haddblocklist", "hdeleteblocklist", "hblocklists", "hblocklistmode",
     "hprotect", "hunprotect", "hprotected",
-    "setwelcome", "setgoodbye", "setrules", "hlock", "hunlock", "locktype",
+    "hsetwelcome", "hsetgoodbye", "hsetrules", "hlock", "hunlock", "hlocktype",
     # toggle commands
-    "welcome", "goodbye", "rules", "bot",
+    "hwelcome", "hgoodbye", "hrules", "hbot",
 }
 ACTION_LOG_AUTO_DELETE = 60  # seconds
 
@@ -745,6 +745,50 @@ _FULL_PERMISSIONS = {
     "can_send_other_messages":   True,
     "can_add_web_page_previews": True,
     "can_invite_users":          True,
+}
+
+_LOCK_TYPES = {
+    "all": {
+        "can_send_messages": False,
+        "can_send_audios": False,
+        "can_send_documents": False,
+        "can_send_photos": False,
+        "can_send_videos": False,
+        "can_send_video_notes": False,
+        "can_send_voice_notes": False,
+        "can_send_polls": False,
+        "can_send_other_messages": False,
+        "can_add_web_page_previews": False,
+    },
+    "messages": {
+        "can_send_messages": False,
+    },
+    "media": {
+        "can_send_audios": False,
+        "can_send_documents": False,
+        "can_send_photos": False,
+        "can_send_videos": False,
+        "can_send_video_notes": False,
+        "can_send_voice_notes": False,
+    },
+    "stickers": {
+        "can_send_other_messages": False,
+    },
+    "animations": {
+        "can_send_other_messages": False,
+    },
+    "games": {
+        "can_send_other_messages": False,
+    },
+    "inline": {
+        "can_send_other_messages": False,
+    },
+    "webpages": {
+        "can_add_web_page_previews": False,
+    },
+    "polls": {
+        "can_send_polls": False,
+    },
 }
 
 async def api_ban(chat_id: int, user_id: int, until_date: int = None) -> tuple[bool, str]:
@@ -2165,12 +2209,12 @@ def role_help_text(uid: int) -> str:
             "`/hunprotect <user_id>` - Remove user protection\n"
             "`/hprotected` - List protected users\n\n"
             "🎉 **Welcome / Goodbye:**\n"
-            "`/setwelcome <text>` - Set welcome message\n"
-            "`/setgoodbye <text>` - Set goodbye message\n"
-            "`/welcome on|off` - Toggle welcome on/off\n"
-            "`/goodbye on|off` - Toggle goodbye on/off\n"
-            "`/setrules <text>` - Set group rules\n"
-            "`/rules on|off` - Toggle rules command\n\n"
+            "`/hsetwelcome <text>` - Set welcome message\n"
+            "`/hsetgoodbye <text>` - Set goodbye message\n"
+            "`/hwelcome on|off` - Toggle welcome on/off\n"
+            "`/hgoodbye on|off` - Toggle goodbye on/off\n"
+            "`/hsetrules <text>` - Set group rules\n"
+            "`/hrules on|off` - Toggle rules command\n\n"
             "🚨 **Report / Lock:**\n"
             "`/report [reason]` - Report a message to admins\n"
             "`/hlock [duration]` - Lock the chat\n"
@@ -2333,8 +2377,8 @@ def moderation_help_text(section: str, uid: int) -> str:
             f"👮 **{role} Help Center**\n\n"
             "⚠ **Warn System**\n\n"
             "`/hwarn [user_id/@user] [reason]` - Issue a warning to a user\n"
-            "`/warns [user_id/@user]` - Check total warnings for a user\n"
-            "`/resetwarns [user_id/@user]` - Reset warnings for a user\n"
+            "`/hwarns [user_id/@user]` - Check total warnings for a user\n"
+            "`/hresetwarns [user_id/@user]` - Reset warnings for a user\n"
             "`/hwarnconfig` - Configure auto-action thresholds\n\n"
             "**Usage**\n"
             "• Reply to a user's message or pass their ID/username.\n"
@@ -2374,31 +2418,31 @@ def moderation_help_text(section: str, uid: int) -> str:
         return (
             f"👮 **{role} Help Center**\n\n"
             "🎉 **Welcome & Goodbye**\n\n"
-            "`/setwelcome <text>` — Set welcome message\n"
-            "`/setgoodbye <text>` — Set goodbye message\n"
-            "`/welcome on|off` — Enable or disable welcome\n"
-            "`/goodbye on|off` — Enable or disable goodbye\n"
-            "`/welcome` — View current welcome message & status\n"
-            "`/goodbye` — View current goodbye message & status\n\n"
+            "`/hsetwelcome <text>` — Set welcome message\n"
+            "`/hsetgoodbye <text>` — Set goodbye message\n"
+            "`/hwelcome on|off` — Enable or disable welcome\n"
+            "`/hgoodbye on|off` — Enable or disable goodbye\n"
+            "`/hwelcome` — View current welcome message & status\n"
+            "`/hgoodbye` — View current goodbye message & status\n\n"
             "**Variables**\n"
             "• `{mention}` — Clickable user mention\n"
             "• `{name}` — User display name\n"
             "• `{id}` — User ID\n\n"
             "**Examples**\n"
-            "• `/setwelcome Hello {mention}, welcome to the group! 👋`\n"
-            "• `/setgoodbye Goodbye {name}, we'll miss you!`\n"
+            "• `/hsetwelcome Hello {mention}, welcome to the group! 👋`\n"
+            "• `/hsetgoodbye Goodbye {name}, we'll miss you!`\n"
         )
     if section == "rules":
         return (
             f"👮 **{role} Help Center**\n\n"
             "📜 **Rules**\n\n"
-            "`/setrules <text>` — Set or update group rules\n"
-            "`/rules` — Show current rules (members)\n"
-            "`/rules on|off` — Enable or disable the rules command\n\n"
+            "`/hsetrules <text>` — Set or update group rules\n"
+            "`/hrules` — Show current rules (members)\n"
+            "`/hrules on|off` — Enable or disable the rules command\n\n"
             "**Usage**\n"
-            "• Use `/setrules off` to clear rules entirely.\n"
-            "• Use `/rules off` to hide rules without deleting them.\n"
-            "• Example: `/setrules 1) Be respectful 2) No spam 3) Stay on topic`\n"
+            "• Use `/hsetrules off` to clear rules entirely.\n"
+            "• Use `/hrules off` to hide rules without deleting them.\n"
+            "• Example: `/hsetrules 1) Be respectful 2) No spam 3) Stay on topic`\n"
         )
     if section == "report":
         return (
@@ -3102,14 +3146,14 @@ async def handle_message(bot: Client, msg: dict):
             return True
 
         # ── /allowconnections ─────────────────────────────────────────────
-        if raw_cmd == "allowconnections":
+        if raw_cmd == "hallowconnections":
             message = await allow_connections(bot, msg, args)
             if message:
                 await reply_text(message)
             return
 
         # ── /connect ──────────────────────────────────────────────────────
-        if raw_cmd == "connect":
+        if raw_cmd == "hconnect":
             if is_private:
                 message = await connect_chat(bot, msg, args)
                 if message:
@@ -3138,7 +3182,7 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # ── /disconnect ───────────────────────────────────────────────────
-        if raw_cmd == "disconnect":
+        if raw_cmd == "hdisconnect":
             if is_private:
                 message = await disconnect_chat(bot, msg, args)
                 if message:
@@ -3167,7 +3211,7 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # ── /connections ──────────────────────────────────────────────────
-        if raw_cmd == "connections":
+        if raw_cmd == "hconnections":
             if not is_private:
                 return await reply_text("Use /connections in bot DM.")
             chats  = get_connected_chats(uid)
@@ -3255,7 +3299,7 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # ── /setwelcome ───────────────────────────────────────────────────
-        if raw_cmd == "setwelcome":
+        if raw_cmd == "hsetwelcome":
             if not is_authorized_actor():
                 return await security_fail()
             raw_text = parts[1].strip() if len(parts) > 1 else ""
@@ -3263,9 +3307,9 @@ async def handle_message(bot: Client, msg: dict):
                 raw_text = (reply.get("text") or reply.get("caption") or "").strip()
             if not raw_text:
                 return await reply_text(
-                    "❌ Usage: `/setwelcome <text>`\n"
+                    "❌ Usage: `/hsetwelcome <text>`\n"
                     "Variables: `{mention}`, `{name}`, `{id}`\n"
-                    "Toggle: `/welcome on` or `/welcome off`"
+                    "Toggle: `/hwelcome on` or `/welcome off`"
                 )
             if raw_text.lower() in ("off", "disable", "clear", "none"):
                 _save_welcome_for_chat(action_chat_id, None)
@@ -3287,7 +3331,7 @@ async def handle_message(bot: Client, msg: dict):
             )
             return
 
-        if raw_cmd == "welcome":
+        if raw_cmd == "hwelcome":
             if not is_authorized_actor():
                 return await security_fail()
             entry = _welcome_for_chat(action_chat_id)
@@ -3297,20 +3341,20 @@ async def handle_message(bot: Client, msg: dict):
                     return await reply_text(
                         f"🎉 **Welcome Message**\nStatus: {status}\n\n"
                         f"{entry['text']}\n\n"
-                        f"Toggle: `/welcome on` or `/welcome off`\n"
-                        f"Change text: `/setwelcome <text>`"
+                        f"Toggle: `/hwelcome on` or `/welcome off`\n"
+                        f"Change text: `/hsetwelcome <text>`"
                     )
                 return await reply_text(
-                    "🎉 No welcome message set.\nUse `/setwelcome <text>` to add one."
+                    "🎉 No welcome message set.\nUse `/hsetwelcome <text>` to add one."
                 )
             flag = args[0].lower()
             if flag not in ("on", "off", "yes", "no", "enable", "disable"):
-                return await reply_text("❌ Usage: `/welcome on` or `/welcome off`")
+                return await reply_text("❌ Usage: `/hwelcome on` or `/welcome off`")
             enabled = flag in ("on", "yes", "enable")
             if not isinstance(entry, dict) or not entry.get("text"):
                 return await reply_text(
                     "❌ No welcome message saved yet.\n"
-                    "Use `/setwelcome <text>` first."
+                    "Use `/hsetwelcome <text>` first."
                 )
             entry["enabled"]    = enabled
             entry["updated_at"] = str(datetime.now())
@@ -3318,7 +3362,7 @@ async def handle_message(bot: Client, msg: dict):
             status_icon = "🟢" if enabled else "🔴"
             return await reply_text(f"{status_icon} Welcome message turned **{'on' if enabled else 'off'}**.")
 
-        if raw_cmd == "setgoodbye":
+        if raw_cmd == "hsetgoodbye":
             if not is_authorized_actor():
                 return await security_fail()
             raw_text = parts[1].strip() if len(parts) > 1 else ""
@@ -3326,9 +3370,9 @@ async def handle_message(bot: Client, msg: dict):
                 raw_text = (reply.get("text") or reply.get("caption") or "").strip()
             if not raw_text:
                 return await reply_text(
-                    "❌ Usage: `/setgoodbye <text>`\n"
+                    "❌ Usage: `/hsetgoodbye <text>`\n"
                     "Variables: `{mention}`, `{name}`, `{id}`\n"
-                    "Toggle: `/goodbye on` or `/goodbye off`"
+                    "Toggle: `/hgoodbye on` or `/goodbye off`"
                 )
             if raw_text.lower() in ("off", "disable", "clear", "none"):
                 _save_goodbye_for_chat(action_chat_id, None)
@@ -3349,7 +3393,7 @@ async def handle_message(bot: Client, msg: dict):
             )
             return
 
-        if raw_cmd == "goodbye":
+        if raw_cmd == "hgoodbye":
             if not is_authorized_actor():
                 return await security_fail()
             entry = _goodbye_for_chat(action_chat_id)
@@ -3359,20 +3403,20 @@ async def handle_message(bot: Client, msg: dict):
                     return await reply_text(
                         f"👋 **Goodbye Message**\nStatus: {status}\n\n"
                         f"{entry['text']}\n\n"
-                        f"Toggle: `/goodbye on` or `/goodbye off`\n"
-                        f"Change text: `/setgoodbye <text>`"
+                        f"Toggle: `/hgoodbye on` or `/goodbye off`\n"
+                        f"Change text: `/hsetgoodbye <text>`"
                     )
                 return await reply_text(
-                    "👋 No goodbye message set.\nUse `/setgoodbye <text>` to add one."
+                    "👋 No goodbye message set.\nUse `/hsetgoodbye <text>` to add one."
                 )
             flag = args[0].lower()
             if flag not in ("on", "off", "yes", "no", "enable", "disable"):
-                return await reply_text("❌ Usage: `/goodbye on` or `/goodbye off`")
+                return await reply_text("❌ Usage: `/hgoodbye on` or `/goodbye off`")
             enabled = flag in ("on", "yes", "enable")
             if not isinstance(entry, dict) or not entry.get("text"):
                 return await reply_text(
                     "❌ No goodbye message saved yet.\n"
-                    "Use `/setgoodbye <text>` first."
+                    "Use `/hsetgoodbye <text>` first."
                 )
             entry["enabled"]    = enabled
             entry["updated_at"] = str(datetime.now())
@@ -3380,7 +3424,7 @@ async def handle_message(bot: Client, msg: dict):
             status_icon = "🟢" if enabled else "🔴"
             return await reply_text(f"{status_icon} Goodbye message turned **{'on' if enabled else 'off'}**.")
 
-        if raw_cmd == "setrules":
+        if raw_cmd == "hsetrules":
             if not is_authorized_actor():
                 return await security_fail()
             raw_text = parts[1].strip() if len(parts) > 1 else ""
@@ -3388,8 +3432,8 @@ async def handle_message(bot: Client, msg: dict):
                 raw_text = (reply.get("text") or reply.get("caption") or "").strip()
             if not raw_text:
                 return await reply_text(
-                    "❌ Usage: `/setrules <text>`\n"
-                    "Toggle: `/rules on` or `/rules off`"
+                    "❌ Usage: `/hsetrules <text>`\n"
+                    "Toggle: `/hrules on` or `/rules off`"
                 )
             if raw_text.lower() in ("off", "disable", "clear", "none"):
                 _save_rules_for_chat(action_chat_id, None)
@@ -3407,16 +3451,16 @@ async def handle_message(bot: Client, msg: dict):
             return await reply_text("✅ Rules saved.")
 
         # FIX-D: single unified /rules handler
-        if raw_cmd == "rules":
+        if raw_cmd == "hrules":
             entry = _rules_for_chat(action_chat_id if is_private else chat_id)
             if is_authorized_actor() and args:
                 flag = args[0].lower()
                 if flag not in ("on", "off", "yes", "no", "enable", "disable"):
-                    return await reply_text("❌ Usage: `/rules on` or `/rules off`")
+                    return await reply_text("❌ Usage: `/hrules on` or `/rules off`")
                 enabled = flag in ("on", "yes", "enable")
                 if not isinstance(entry, dict) or not entry.get("text"):
                     return await reply_text(
-                        "❌ No rules saved yet.\nUse `/setrules <text>` first."
+                        "❌ No rules saved yet.\nUse `/hsetrules <text>` first."
                     )
                 entry["enabled"]    = enabled
                 entry["updated_at"] = str(datetime.now())
@@ -3435,7 +3479,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(f"📜 **Group Rules**\n\n{rules_text}")
             return
 
-        if raw_cmd == "report":
+        if raw_cmd == "hreport":
             if is_private:
                 return await reply_text("Use /report in a group.")
             reporter      = msg.get("from", {})
@@ -3484,14 +3528,28 @@ async def handle_message(bot: Client, msg: dict):
                 return
             if is_private and action_chat_id == chat_id:
                 return await reply_text("Use /hlock in a group or via a connected group.")
-            dur = parse_duration_token(args[0]) if args else None
-            if args and dur is None:
+            
+            lock_type = "all"
+            lock_perms = _LOCK_TYPES["all"].copy()
+            dur = None
+            
+            if args:
+                if args[0].lower() in _LOCK_TYPES:
+                    lock_type = args[0].lower()
+                    lock_perms = _LOCK_TYPES[lock_type].copy()
+                    dur = parse_duration_token(args[1]) if len(args) > 1 else None
+                else:
+                    dur = parse_duration_token(args[0])
+            
+            if args and dur is None and args[0].lower() not in _LOCK_TYPES:
                 return await reply_text("❌ Invalid duration. Examples: 10m, 1h, 1d")
+            
             lock_entry = _lock_for_chat(action_chat_id)
             if lock_entry and lock_entry.get("locked"):
                 if dur:
                     until_ts = int(time.time()) + dur
                     lock_entry["until_ts"] = until_ts
+                    lock_entry["lock_type"] = lock_type
                     _save_lock_for_chat(action_chat_id, lock_entry)
                     cancel_temp_action("lock", action_chat_id, action_chat_id)
                     schedule_temp_action(
@@ -3500,15 +3558,21 @@ async def handle_message(bot: Client, msg: dict):
                     )
                     return await reply_text(f"🔒 Chat lock extended to {format_duration(dur)}.")
                 return await reply_text("🔒 Chat is already locked.")
+            
             original_perms = _FULL_PERMISSIONS
             try:
                 chat_obj = await bot.get_chat(action_chat_id)
                 original_perms = _chat_permissions_payload(chat_obj)
             except Exception as perm_err:
                 log_msg(f"lock permissions load failed for {action_chat_id}: {perm_err}", "WARNING")
-            ok, err = await api_set_chat_permissions(action_chat_id, _MUTE_PERMISSIONS)
+            
+            restricted_perms = original_perms.copy()
+            restricted_perms.update(lock_perms)
+            
+            ok, err = await api_set_chat_permissions(action_chat_id, restricted_perms)
             if not ok:
                 return await reply_text(f"❌ Lock failed: {err}")
+            
             until_ts = int(time.time()) + dur if dur else None
             _save_lock_for_chat(
                 action_chat_id,
@@ -3517,16 +3581,18 @@ async def handle_message(bot: Client, msg: dict):
                     "set_by":      uid,
                     "set_at":      str(datetime.now()),
                     "until_ts":    until_ts,
+                    "lock_type":   lock_type,
                     "permissions": original_perms,
                 },
             )
+            
             if dur and until_ts:
                 schedule_temp_action(
                     "lock", action_chat_id, action_chat_id, until_ts, uid,
                     "Chat lock", extra={"permissions": original_perms},
                 )
-                return await reply_text(f"🔒 Chat locked for {format_duration(dur)}.")
-            return await reply_text("🔒 Chat locked until manually unlocked.")
+                return await reply_text(f"🔒 Chat locked ({lock_type}) for {format_duration(dur)}.")
+            return await reply_text(f"🔒 Chat locked ({lock_type}) until manually unlocked.")
 
         if raw_cmd == "hunlock":
             if not await check_mod("mute"):
@@ -3547,7 +3613,7 @@ async def handle_message(bot: Client, msg: dict):
             return await reply_text("🔓 Chat unlocked.")
 
         # ── /bot on | /bot off ────────────────────────────────────────────
-        if raw_cmd == "bot":
+        if raw_cmd == "hbot":
             if not is_owner_actor():
                 return await reply_text("❌ Only the bot owner can toggle bot status.")
 
@@ -3594,15 +3660,35 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # FIX-G: locktype / locktypes stub
-        if raw_cmd == "locktype":
+        if raw_cmd == "hlocktype":
             if not is_authorized_actor():
                 return await security_fail()
-            return await reply_text(
-                "🔒 **Lock Types**\n\n"
-                "Use `/hlock [duration]` to lock the entire chat.\n"
-                "Use `/hunlock` to restore original permissions.\n\n"
-                "Duration examples: `10m`, `2h`, `1d`"
-            )
+            if not args:
+                lock_info = (
+                    "🔒 **Lock Types**\n\n"
+                    "**Available Lock Types:**\n"
+                    "• `all` - Lock all media and messages\n"
+                    "• `messages` - Disable text messages only\n"
+                    "• `media` - Disable audio, video, photos, documents\n"
+                    "• `stickers` - Disable stickers\n"
+                    "• `animations` - Disable animations/GIFs\n"
+                    "• `games` - Disable game sharing\n"
+                    "• `inline` - Disable inline content\n"
+                    "• `webpages` - Disable web page previews\n"
+                    "• `polls` - Disable polls\n\n"
+                    "**Usage:**\n"
+                    "`/hlock <type> [duration]` - Lock by type\n"
+                    "`/hunlock` - Restore full permissions\n\n"
+                    "**Examples:**\n"
+                    "`/hlock messages` - Mute chat\n"
+                    "`/hlock media 1h` - Lock media for 1 hour\n"
+                    "`/hlock all 30m` - Full lock for 30 minutes\n"
+                )
+                return await reply_text(lock_info)
+            lock_type = args[0].lower()
+            if lock_type not in _LOCK_TYPES:
+                return await reply_text(f"❌ Unknown lock type: `{lock_type}`\nAvailable: {', '.join(_LOCK_TYPES.keys())}")
+            await reply_text(f"✅ Lock type `{lock_type}` details: {list(_LOCK_TYPES[lock_type].keys())}")
 
         # ── /hr ───────────────────────────────────────────────────────────
         if raw_cmd == "hr":
@@ -3673,16 +3759,16 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"❌ Error: {e}")
 
         # ── /ttt commands ─────────────────────────────────────────────────
-        if raw_cmd == "ttt":
+        if raw_cmd == "httt":
             await handle_ttt_command(bot, msg, args, reply, uid, chat_id, msg_id)
             return
-        if raw_cmd == "tttleaderboard":
+        if raw_cmd == "htttleaderboard":
             await handle_ttt_leaderboard(chat_id, msg_id)
             return
-        if raw_cmd == "tttmystats":
+        if raw_cmd == "htttmystats":
             await handle_ttt_mystats(uid, chat_id, msg_id)
             return
-        if raw_cmd == "tttend":
+        if raw_cmd == "htttend":
             await handle_ttt_end(uid, chat_id, msg_id, is_owner=is_owner_actor())
             return
 
@@ -3711,7 +3797,7 @@ async def handle_message(bot: Client, msg: dict):
         # NOTES COMMANDS
         # ══════════════════════════════════════════════════════════════════
 
-        if raw_cmd == "save":
+        if raw_cmd == "hsave":
             if not is_authorized_actor():
                 return await security_fail()
             if not args:
@@ -3756,7 +3842,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(f"📋 Note `{note_name}` saved! Get it with `/get {note_name}` or `#{note_name}`.")
             return
 
-        if raw_cmd == "get":
+        if raw_cmd == "hget":
             if not args:
                 return await reply_text("Usage: `/get <name>`")
             note_name = args[0].lower().strip()
@@ -3778,7 +3864,7 @@ async def handle_message(bot: Client, msg: dict):
                         await tg_send(chat_id, content, reply_to=msg_id, parse_mode=None)
             return
 
-        if raw_cmd == "clear":
+        if raw_cmd == "hclear":
             if not is_authorized_actor():
                 return await security_fail()
             if not args:
@@ -3790,7 +3876,7 @@ async def handle_message(bot: Client, msg: dict):
                 await reply_text(f"❌ Note `{note_name}` not found.")
             return
 
-        if raw_cmd == "notes":
+        if raw_cmd == "hnotes":
             names = note_list(action_chat_id)
             if not names:
                 return await reply_text(
@@ -3822,7 +3908,7 @@ async def handle_message(bot: Client, msg: dict):
         # FILTERS COMMANDS
         # ══════════════════════════════════════════════════════════════════
 
-        if raw_cmd == "filter":
+        if raw_cmd == "hfilter":
             if not is_authorized_actor():
                 return await security_fail()
             if len(args) < 2:
@@ -3871,7 +3957,7 @@ async def handle_message(bot: Client, msg: dict):
             )
             return
 
-        if raw_cmd == "stop":
+        if raw_cmd == "hstop":
             if not is_authorized_actor():
                 return await security_fail()
             if not args:
@@ -3883,7 +3969,7 @@ async def handle_message(bot: Client, msg: dict):
                 await reply_text(f"❌ No filter found for `{keyword}`.\nUse `/filters` to see all active filters.")
             return
 
-        if raw_cmd == "filters":
+        if raw_cmd == "hfilters":
             keywords = filter_list(action_chat_id)
             if not keywords:
                 return await reply_text(
@@ -3900,7 +3986,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text("\n".join(lines) + "\n\nUse `/stop <keyword>` to remove a filter.")
             return
 
-        if raw_cmd == "addblocklist":
+        if raw_cmd == "haddblocklist":
             if not is_authorized_actor():
                 return await security_fail()
             keyword = None
@@ -3918,7 +4004,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(f"✅ Blocklist keyword `{keyword}` added for this group.")
             return
 
-        if raw_cmd == "deleteblocklist":
+        if raw_cmd == "hdeleteblocklist":
             if not is_authorized_actor():
                 return await security_fail()
             if not args:
@@ -3930,7 +4016,7 @@ async def handle_message(bot: Client, msg: dict):
                 await reply_text(f"❌ No blocklist entry for `{keyword}`.")
             return
 
-        if raw_cmd == "blocklists":
+        if raw_cmd == "hblocklists":
             keys = blocklist_list(action_chat_id)
             if not keys:
                 return await reply_text("🔒 No blocklist keywords set for this group.")
@@ -3940,7 +4026,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text("\n".join(lines))
             return
 
-        if raw_cmd == "blocklistmode":
+        if raw_cmd == "hblocklistmode":
             if not is_authorized_actor():
                 return await security_fail()
             if not args:
@@ -4319,7 +4405,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "UNMUTE", target, reason, case_id, actor_mod_info())
             return
 
-        if raw_cmd == "pin":
+        if raw_cmd == "hpin":
             if not await check_mod("pin"):
                 return
             if not reply:
@@ -4333,7 +4419,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text("📌 Message pinned.")
             return
 
-        if raw_cmd == "unpin":
+        if raw_cmd == "hunpin":
             if not await check_mod("pin"):
                 return
             ok, err = await api_unpin(action_chat_id)
@@ -4342,13 +4428,13 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text("📍 Pinned message removed.")
             return
 
-        if raw_cmd == "adminlist":
+        if raw_cmd == "hadminlist":
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
             await reply_text(await build_admin_list_text(bot, action_chat_id))
             return
 
-        if raw_cmd == "zombies":
+        if raw_cmd == "hzombies":
             if not await check_mod("kick"):
                 return
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
@@ -4421,7 +4507,7 @@ async def handle_message(bot: Client, msg: dict):
                         schedule_temp_action(action, action_chat_id, tid, until_ts, uid, auto_reason, case_id=auto_case)
             return
 
-        if raw_cmd == "resetwarns":
+        if raw_cmd == "hresetwarns":
             if not await check_mod("warn"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
@@ -4433,7 +4519,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "RESETWARNS", target, "Warnings reset", case_id, actor_mod_info())
             return
 
-        if raw_cmd == "warns":
+        if raw_cmd == "hwarns":
             explicit    = False
             user_lookup = uid
             if args:
