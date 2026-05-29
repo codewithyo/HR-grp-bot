@@ -92,17 +92,16 @@ BOT_COMMANDS = [
 VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
 
 MODERATION_COMMANDS = {
-    "hban", "hb", "hkick", "hk", "hmute", "hm",
-    "hunban", "hub", "hunmute", "hum", "hwarn", "hw",
-    "resetwarns", "hdel", "hd", "pin", "unpin",
+    "hban", "hkick", "hmute",
+    "hunban", "hunmute", "hwarn",
+    "resetwarns", "hdel", "pin", "unpin",
     "save", "get", "clear", "notes",
     "filter", "stop", "filters",
     "addblocklist", "deleteblocklist", "removeblocklist", "blocklists", "blocklistmode",
-    "hprotect", "hp", "hunprotect", "hup", "hprotected", "protect", "unprotect", "protected",
-    "setwelcome", "setgoodbye", "setrules", "hlock", "lock", "hunlock", "unlock",
-    "locktype", "locktypes",
+    "hprotect", "hunprotect", "hprotected", "protect", "unprotect", "protected",
+    "setwelcome", "setgoodbye", "setrules", "hlock", "hunlock", "locktype",
     # toggle commands
-    "welcome", "goodbye", "rules", "bot",  # FIX-J: "bot" added
+    "welcome", "goodbye", "rules", "bot",
 }
 ACTION_LOG_AUTO_DELETE = 60  # seconds
 
@@ -3480,7 +3479,7 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # FIX-E: hlock/hunlock now work from PM when a group is connected
-        if raw_cmd in ("hlock", "lock"):
+        if raw_cmd == "hlock":
             if not await check_mod("mute"):
                 return
             if is_private and action_chat_id == chat_id:
@@ -3529,7 +3528,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"🔒 Chat locked for {format_duration(dur)}.")
             return await reply_text("🔒 Chat locked until manually unlocked.")
 
-        if raw_cmd in ("hunlock", "unlock"):
+        if raw_cmd == "hunlock":
             if not await check_mod("mute"):
                 return
             if is_private and action_chat_id == chat_id:
@@ -3595,7 +3594,7 @@ async def handle_message(bot: Client, msg: dict):
             return
 
         # FIX-G: locktype / locktypes stub
-        if raw_cmd in ("locktype", "locktypes"):
+        if raw_cmd == "locktype":
             if not is_authorized_actor():
                 return await security_fail()
             return await reply_text(
@@ -3674,7 +3673,7 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"❌ Error: {e}")
 
         # ── /ttt commands ─────────────────────────────────────────────────
-        if raw_cmd in ("ttt", "ttt_game"):
+        if raw_cmd == "ttt":
             await handle_ttt_command(bot, msg, args, reply, uid, chat_id, msg_id)
             return
         if raw_cmd == "tttleaderboard":
@@ -3919,7 +3918,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(f"✅ Blocklist keyword `{keyword}` added for this group.")
             return
 
-        if raw_cmd in ("deleteblocklist", "removeblocklist"):
+        if raw_cmd == "deleteblocklist":
             if not is_authorized_actor():
                 return await security_fail()
             if not args:
@@ -3958,7 +3957,7 @@ async def handle_message(bot: Client, msg: dict):
         # OWNER COMMANDS
         # ══════════════════════════════════════════════════════════════════
 
-        if raw_cmd in ("hauth", "ha"):
+        if raw_cmd == "hauth":
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
@@ -4001,7 +4000,7 @@ async def handle_message(bot: Client, msg: dict):
                 await tg_send(lg, f"🗑 Moderator removed\n👤 {make_mention(target)} (`{tid}`)\n🛡 By: `{uid}`")
             return
 
-        if raw_cmd in ("hgrant", "hg"):
+        if raw_cmd == "hgrant":
             if not is_owner_actor():
                 return
             if not args:
@@ -4037,7 +4036,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_grant_log(chat_id, msg_id, uid, target, perm, case_id)
             return
 
-        if raw_cmd in ("hrevoke", "hrev"):
+        if raw_cmd == "hrevoke":
             if not is_owner_actor():
                 return
             if not args:
@@ -4171,7 +4170,7 @@ async def handle_message(bot: Client, msg: dict):
         # MODERATION COMMANDS
         # ══════════════════════════════════════════════════════════════════
 
-        if raw_cmd in ("hban", "hb"):
+        if raw_cmd == "hban":
             if not await check_mod("ban"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
@@ -4208,7 +4207,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "BAN", target, reason, case_id, actor_mod_info())
             return
 
-        if raw_cmd in ("hkick", "hk"):
+        if raw_cmd == "hkick":
             if not await check_mod("kick"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
@@ -4238,7 +4237,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "KICK", target, reason, case_id, actor_mod_info())
             return
 
-        if raw_cmd in ("hmute", "hm"):
+        if raw_cmd == "hmute":
             if not await check_mod("mute"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
@@ -4276,7 +4275,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "MUTE", target, reason, case_id, actor_mod_info())
             return
 
-        if raw_cmd in ("hunban", "hub"):
+        if raw_cmd == "hunban":
             if not await check_mod("unban"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
@@ -4294,7 +4293,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "UNBAN", target, reason, case_id, actor_mod_info())
             return
 
-        if raw_cmd in ("hunmute", "hum"):
+        if raw_cmd == "hunmute":
             if not await check_mod("unmute"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
@@ -4379,7 +4378,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(build_moderator_list_text())
             return
 
-        if raw_cmd in ("hwarn", "hw"):
+        if raw_cmd == "hwarn":
             if not await check_mod("warn"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
@@ -4494,7 +4493,7 @@ async def handle_message(bot: Client, msg: dict):
                     await reply_text("This user hasn't got any warnings!")
             return
 
-        if raw_cmd in ("hdel", "hd"):
+        if raw_cmd == "hdel":
             if not await check_mod("delete"):
                 return
             if not reply:
@@ -4514,7 +4513,7 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "DELETE", target, "Message Deleted", case_id, actor_mod_info())
             return
 
-        if raw_cmd in ("hprotect", "hp", "protect"):
+        if raw_cmd == "hprotect":
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
@@ -4534,7 +4533,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(f"🛡 {make_mention(target)} is now protected.")
             return
 
-        if raw_cmd in ("hunprotect", "hup", "unprotect"):
+        if raw_cmd == "hunprotect":
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
@@ -4563,7 +4562,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text(f"🔓 Protection removed from {make_mention(target)}.")
             return
 
-        if raw_cmd in ("hprotected", "protected"):
+        if raw_cmd == "hprotected":
             if not is_owner_actor():
                 return await reply_text("❌ Owner only.")
             data       = _load_protected_store()
@@ -4592,7 +4591,7 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text("\n".join(lines))
             return
 
-        if raw_cmd in ("hcase", "hc"):
+        if raw_cmd == "hcase":
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
             if not args:
@@ -4612,7 +4611,7 @@ async def handle_message(bot: Client, msg: dict):
             )
             return
 
-        if raw_cmd in ("hmodinfo", "hmi"):
+        if raw_cmd == "hmodinfo":
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
             if is_anon_admin and not reply and not args:
