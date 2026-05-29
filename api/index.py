@@ -1859,7 +1859,7 @@ def warn(user_id: int, chat_id: int, reason: str, warner: str | None = None) -> 
         save(WARN_FILE, warns)
         reply = f"{threshold} warnings — auto-{auto_action}!"
         log   = (
-            f"#WARN_BAN\nAdmin: {moderator_tag}\nUser: {user_id}\n"
+            f"#WARN_THRESHOLD\nAdmin: {moderator_tag}\nUser: {user_id}\n"
             f"Reason: {reason}\nCounts: {num}/{threshold}"
         )
         return {"action": auto_action, "reply": reply, "log": log, "num_warns": 0, "threshold": threshold}
@@ -1887,7 +1887,8 @@ def warns_for(user_id: int, chat_id: int) -> dict:
     warns = load(WARN_FILE)
     key   = f"{chat_id}:{user_id}"
     if key not in warns and str(user_id) in warns:
-        warns[key] = warns.get(str(user_id), 0)
+        warns[key] = warns.pop(str(user_id))
+        save(WARN_FILE, warns)
     num = int(warns.get(key, 0))
     return {"num_warns": num, "reasons": []}
 
@@ -2780,7 +2781,7 @@ async def process_due_temp_actions(bot: Client):
     pending = []
     for action in actions:
         until_ts = int(action.get("until_ts", 0))
-        if until_ts > now_ts:
+        if until_ts <= 0 or until_ts > now_ts:
             pending.append(action)
             continue
         chat_id_raw   = action.get("chat_id")
@@ -2795,7 +2796,7 @@ async def process_due_temp_actions(bot: Client):
         except Exception:
             log_msg(f"Skipping temp action with invalid target_id: {target_id_raw}", "WARNING")
             continue
-        atype = action["type"]
+        atype = action.get("type")
         try:
             if atype == "mute":
                 permissions = _FULL_PERMISSIONS
@@ -2818,7 +2819,6 @@ async def process_due_temp_actions(bot: Client):
                 else:
                     pending.append(action)
                     log_msg(f"auto-unmute failed for {target_id}: {err}", "WARNING")
-                    continue
             elif atype == "ban":
                 ok, err = await api_unban(chat_id, target_id)
                 if ok:
@@ -2834,7 +2834,6 @@ async def process_due_temp_actions(bot: Client):
                 else:
                     pending.append(action)
                     log_msg(f"auto-unban failed for {target_id}: {err}", "WARNING")
-                    continue
             elif atype == "delete":
                 retry_count = action.get("retry_count", 0)
                 try:
@@ -2859,7 +2858,6 @@ async def process_due_temp_actions(bot: Client):
                 else:
                     pending.append(action)
                     log_msg(f"auto-unlock failed for {chat_id}: {err}", "WARNING")
-                    continue
         except Exception as e:
             log_msg(f"temp action error {action}: {e}", "ERROR")
             pending.append(action)
@@ -4181,6 +4179,8 @@ async def handle_message(bot: Client, msg: dict):
                 return await reply_text(f"{terr}\nUsage: /hban <user_id/@user> [duration] [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot ban yourself.")
+            if tid == _bot_id:
+                return await reply_text("❌ I can't ban myself!")
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
             if gm_err:
                 if gm_err != "UserNotParticipant":
@@ -4244,6 +4244,8 @@ async def handle_message(bot: Client, msg: dict):
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
                 return await reply_text(f"{terr}\nUsage: /hmute <user_id/@user> [duration] [reason]")
+            if not is_anon_admin and tid == uid:
+                return await reply_text("❌ You cannot mute yourself.")
             rs = 0 if reply else 1
             dur, reason = parse_duration_and_reason(args, rs)
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
