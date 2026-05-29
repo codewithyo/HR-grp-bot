@@ -3510,7 +3510,7 @@ async def handle_message(bot: Client, msg: dict):
             ok, err = await api_set_chat_permissions(action_chat_id, _MUTE_PERMISSIONS)
             if not ok:
                 return await reply_text(f"❌ Lock failed: {err}")
-            until_ts = int(time.time()) + dur if dur else 0
+            until_ts = int(time.time()) + dur if dur else None
             _save_lock_for_chat(
                 action_chat_id,
                 {
@@ -3521,7 +3521,7 @@ async def handle_message(bot: Client, msg: dict):
                     "permissions": original_perms,
                 },
             )
-            if dur:
+            if dur and until_ts:
                 schedule_temp_action(
                     "lock", action_chat_id, action_chat_id, until_ts, uid,
                     "Chat lock", extra={"permissions": original_perms},
@@ -4743,7 +4743,10 @@ async def handle_callback(bot: Client, cb: dict):
         if data.startswith("unban_"):
             if not has_permission(uid, "unban"):
                 return await tg_answer_cb(cb_id, "❌ No unban permission.", alert=True)
-            tid     = int(data.split("_", 1)[1])
+            try:
+                tid = int(data.split("_", 1)[1])
+            except (ValueError, IndexError):
+                return await tg_answer_cb(cb_id, "❌ Invalid callback data.", alert=True)
             ok, err = await api_unban(chat_id, tid)
             if ok:
                 cancel_temp_action("ban", chat_id, tid)
@@ -4754,7 +4757,10 @@ async def handle_callback(bot: Client, cb: dict):
         elif data.startswith("unmute_"):
             if not has_permission(uid, "unmute"):
                 return await tg_answer_cb(cb_id, "❌ No unmute permission.", alert=True)
-            tid     = int(data.split("_", 1)[1])
+            try:
+                tid = int(data.split("_", 1)[1])
+            except (ValueError, IndexError):
+                return await tg_answer_cb(cb_id, "❌ Invalid callback data.", alert=True)
             ok, err = await api_unmute(chat_id, tid)
             if ok:
                 cancel_temp_action("mute", chat_id, tid)
@@ -4765,7 +4771,10 @@ async def handle_callback(bot: Client, cb: dict):
         elif data.startswith("warn_"):
             if not has_permission(uid, "warn"):
                 return await tg_answer_cb(cb_id, "❌ No warn permission.", alert=True)
-            tid        = int(data.split("_", 1)[1])
+            try:
+                tid = int(data.split("_", 1)[1])
+            except (ValueError, IndexError):
+                return await tg_answer_cb(cb_id, "❌ Invalid callback data.", alert=True)
             warner_tag = _mod_info().get("mod_id", str(uid))
             res        = warn(tid, chat_id, "Warned via button", warner=warner_tag)
             case_id    = create_case("WARN", uid, tid, "Warned via button")
@@ -4802,7 +4811,10 @@ async def handle_callback(bot: Client, cb: dict):
         elif data.startswith("unwarn_"):
             if not has_permission(uid, "warn"):
                 return await tg_answer_cb(cb_id, "❌ No warn permission.", alert=True)
-            tid = int(data.split("_", 1)[1])
+            try:
+                tid = int(data.split("_", 1)[1])
+            except (ValueError, IndexError):
+                return await tg_answer_cb(cb_id, "❌ Invalid callback data.", alert=True)
             reset_warns(tid, chat_id, admin_tag=_mod_info().get("mod_id", str(uid)))
             case_id = create_case("RESETWARNS", uid, tid, "Unwarn via button")
             target  = {"id": tid}
@@ -4812,7 +4824,10 @@ async def handle_callback(bot: Client, cb: dict):
         elif data.startswith("removewarn_"):
             if not has_permission(uid, "warn"):
                 return await tg_answer_cb(cb_id, "❌ No warn permission.", alert=True)
-            tid        = int(data.split("_", 1)[1])
+            try:
+                tid = int(data.split("_", 1)[1])
+            except (ValueError, IndexError):
+                return await tg_answer_cb(cb_id, "❌ Invalid callback data.", alert=True)
             warns_data = load(WARN_FILE)
             key        = f"{chat_id}:{tid}"
             if key in warns_data and warns_data[key] > 0:
