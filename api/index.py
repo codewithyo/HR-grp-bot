@@ -771,6 +771,24 @@ _LOCK_TYPES = {
         "can_send_video_notes": False,
         "can_send_voice_notes": False,
     },
+    "photos": {
+        "can_send_photos": False,
+    },
+    "videos": {
+        "can_send_videos": False,
+    },
+    "audio": {
+        "can_send_audios": False,
+    },
+    "documents": {
+        "can_send_documents": False,
+    },
+    "videonotes": {
+        "can_send_video_notes": False,
+    },
+    "voicenotes": {
+        "can_send_voice_notes": False,
+    },
     "stickers": {
         "can_send_other_messages": False,
     },
@@ -3666,10 +3684,18 @@ async def handle_message(bot: Client, msg: dict):
             if not args:
                 lock_info = (
                     "🔒 **Lock Types**\n\n"
-                    "**Available Lock Types:**\n"
+                    "**Message & Media:**\n"
                     "• `all` - Lock all media and messages\n"
                     "• `messages` - Disable text messages only\n"
-                    "• `media` - Disable audio, video, photos, documents\n"
+                    "• `media` - Disable all media at once\n\n"
+                    "**Individual Media Types:**\n"
+                    "• `photos` - Disable photo sharing\n"
+                    "• `videos` - Disable video sharing\n"
+                    "• `audio` - Disable audio/music sharing\n"
+                    "• `documents` - Disable document sharing\n"
+                    "• `videonotes` - Disable video notes\n"
+                    "• `voicenotes` - Disable voice notes\n\n"
+                    "**Other Content:**\n"
                     "• `stickers` - Disable stickers\n"
                     "• `animations` - Disable animations/GIFs\n"
                     "• `games` - Disable game sharing\n"
@@ -3681,7 +3707,9 @@ async def handle_message(bot: Client, msg: dict):
                     "`/hunlock` - Restore full permissions\n\n"
                     "**Examples:**\n"
                     "`/hlock messages` - Mute chat\n"
-                    "`/hlock media 1h` - Lock media for 1 hour\n"
+                    "`/hlock photos 2h` - Block photos for 2 hours\n"
+                    "`/hlock audio` - Permanently block audio\n"
+                    "`/hlock media 1h` - Lock all media for 1 hour\n"
                     "`/hlock all 30m` - Full lock for 30 minutes\n"
                 )
                 return await reply_text(lock_info)
