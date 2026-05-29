@@ -100,6 +100,7 @@ MODERATION_COMMANDS = {
     "haddblocklist", "hdeleteblocklist", "hblocklists", "hblocklistmode",
     "hprotect", "hunprotect", "hprotected",
     "hsetwelcome", "hsetgoodbye", "hsetrules", "hlock", "hunlock", "hlocktype",
+    "hlocklist", "hlockbot", "hlocklink", "hunlockbot", "hunlocklink",
     # toggle commands
     "hwelcome", "hgoodbye", "hrules", "hbot",
 }
@@ -789,6 +790,9 @@ _LOCK_TYPES = {
     "voicenotes": {
         "can_send_voice_notes": False,
     },
+    "gifs": {
+        "can_send_other_messages": False,
+    },
     "stickers": {
         "can_send_other_messages": False,
     },
@@ -808,6 +812,12 @@ _LOCK_TYPES = {
         "can_send_polls": False,
     },
 }
+
+_COMMAND_LOCKS = {
+    "bot": "for blocking bot commands",
+    "link": "for blocking links and URLs",
+}
+
 
 async def api_ban(chat_id: int, user_id: int, until_date: int = None) -> tuple[bool, str]:
     payload = {"chat_id": chat_id, "user_id": user_id}
@@ -1703,6 +1713,47 @@ def _save_lock_for_chat(chat_id: int, entry: dict | None):
         data.pop(str(chat_id), None)
     save(LOCKS_FILE, data)
     _cache.invalidate(f"lock:{chat_id}")
+
+def _is_lock_active(chat_id: int) -> bool:
+    """Check if chat has an active lock"""
+    lock_entry = _lock_for_chat(chat_id)
+    if not lock_entry or not lock_entry.get("locked"):
+        return False
+    until_ts = lock_entry.get("until_ts")
+    if until_ts is None:
+        return True
+    return until_ts > int(time.time())
+
+def _get_lock_type(chat_id: int) -> str:
+    """Get current lock type for chat"""
+    lock_entry = _lock_for_chat(chat_id)
+    if lock_entry:
+        return lock_entry.get("lock_type", "all")
+    return None
+
+def _get_command_lock_status(chat_id: int) -> dict:
+    """Get status of all command locks (bot, link)"""
+    lock_entry = _lock_for_chat(chat_id)
+    if not lock_entry:
+        return {}
+    return {
+        "bot": lock_entry.get("lock_bot", False),
+        "link": lock_entry.get("lock_link", False),
+    }
+
+def _set_command_lock(chat_id: int, cmd_type: str, enabled: bool, duration: int = None):
+    """Enable/disable a command lock (bot or link)"""
+    lock_entry = _lock_for_chat(chat_id) or {"locked": False}
+    until_ts = int(time.time()) + duration if duration else None
+    
+    if cmd_type == "bot":
+        lock_entry["lock_bot"] = enabled
+        lock_entry["lock_bot_until"] = until_ts
+    elif cmd_type == "link":
+        lock_entry["lock_link"] = enabled
+        lock_entry["lock_link_until"] = until_ts
+    
+    _save_lock_for_chat(chat_id, lock_entry)
 
 # =========================================================
 # MISC HELPERS
@@ -3696,27 +3747,112 @@ async def handle_message(bot: Client, msg: dict):
                     "• `videonotes` - Disable video notes\n"
                     "• `voicenotes` - Disable voice notes\n\n"
                     "**Other Content:**\n"
+                    "• `gifs` - Disable GIFs\n"
                     "• `stickers` - Disable stickers\n"
                     "• `animations` - Disable animations/GIFs\n"
                     "• `games` - Disable game sharing\n"
                     "• `inline` - Disable inline content\n"
                     "• `webpages` - Disable web page previews\n"
                     "• `polls` - Disable polls\n\n"
+                    "**Command Locks (see /hlockbot and /hlocklink):**\n"
+                    "• `bot` - Block all bot commands\n"
+                    "• `link` - Block links and URLs\n\n"
                     "**Usage:**\n"
                     "`/hlock <type> [duration]` - Lock by type\n"
+                    "`/hlockbot [duration]` - Block bot commands\n"
+                    "`/hlocklink [duration]` - Block links\n"
+                    "`/hlocklist` - View current locks\n"
                     "`/hunlock` - Restore full permissions\n\n"
                     "**Examples:**\n"
                     "`/hlock messages` - Mute chat\n"
                     "`/hlock photos 2h` - Block photos for 2 hours\n"
-                    "`/hlock audio` - Permanently block audio\n"
-                    "`/hlock media 1h` - Lock all media for 1 hour\n"
-                    "`/hlock all 30m` - Full lock for 30 minutes\n"
+                    "`/hlock gifs` - Block GIFs permanently\n"
+                    "`/hlockbot 1h` - Block bot commands for 1 hour\n"
+                    "`/hlocklink` - Permanently block links\n"
                 )
                 return await reply_text(lock_info)
             lock_type = args[0].lower()
             if lock_type not in _LOCK_TYPES:
                 return await reply_text(f"❌ Unknown lock type: `{lock_type}`\nAvailable: {', '.join(_LOCK_TYPES.keys())}")
             await reply_text(f"✅ Lock type `{lock_type}` details: {list(_LOCK_TYPES[lock_type].keys())}")
+
+        if raw_cmd == "hlocklist":
+            if not is_authorized_actor():
+                return await security_fail()
+            lock_entry = _lock_for_chat(action_chat_id)
+            if not lock_entry or not lock_entry.get("locked"):
+                return await reply_text("✅ No active locks on this chat.")
+            
+            lock_type = lock_entry.get("lock_type", "unknown")
+            until_ts = lock_entry.get("until_ts")
+            set_by = lock_entry.get("set_by", "Unknown")
+            set_at = lock_entry.get("set_at", "Unknown")
+            
+            lock_info = f"🔒 **Current Lock Status**\n\n"
+            lock_info += f"**Lock Type:** `{lock_type}`\n"
+            lock_info += f"**Status:** 🔴 Active\n"
+            lock_info += f"**Set By:** `{set_by}`\n"
+            lock_info += f"**Set At:** {set_at}\n"
+            
+            if until_ts:
+                remaining = until_ts - int(time.time())
+                if remaining > 0:
+                    lock_info += f"**Expires In:** {format_duration(remaining)}\n"
+                else:
+                    lock_info += f"**Expires:** Expired (will be auto-unlocked)\n"
+            else:
+                lock_info += f"**Expires:** Never (permanent lock)\n"
+            
+            cmd_locks = _get_command_lock_status(action_chat_id)
+            if cmd_locks.get("bot"):
+                lock_info += f"**Bot Commands:** 🚫 Blocked\n"
+            if cmd_locks.get("link"):
+                lock_info += f"**Links:** 🚫 Blocked\n"
+            
+            await reply_text(lock_info)
+            return
+
+        if raw_cmd == "hlockbot":
+            if not await check_mod("mute"):
+                return
+            if is_private and action_chat_id == chat_id:
+                return await reply_text("Use /hlockbot in a group or via a connected group.")
+            
+            dur = parse_duration_token(args[0]) if args else None
+            if args and dur is None:
+                return await reply_text("❌ Invalid duration. Examples: 10m, 1h, 1d")
+            
+            _set_command_lock(action_chat_id, "bot", True, dur)
+            if dur:
+                return await reply_text(f"🚫 Bot commands blocked for {format_duration(dur)}.")
+            return await reply_text("🚫 Bot commands permanently blocked.")
+
+        if raw_cmd == "hlocklink":
+            if not await check_mod("mute"):
+                return
+            if is_private and action_chat_id == chat_id:
+                return await reply_text("Use /hlocklink in a group or via a connected group.")
+            
+            dur = parse_duration_token(args[0]) if args else None
+            if args and dur is None:
+                return await reply_text("❌ Invalid duration. Examples: 10m, 1h, 1d")
+            
+            _set_command_lock(action_chat_id, "link", True, dur)
+            if dur:
+                return await reply_text(f"🔗 Links blocked for {format_duration(dur)}.")
+            return await reply_text("🔗 Links permanently blocked.")
+
+        if raw_cmd == "hunlockbot":
+            if not await check_mod("mute"):
+                return
+            _set_command_lock(action_chat_id, "bot", False, None)
+            return await reply_text("✅ Bot commands unblocked.")
+
+        if raw_cmd == "hunlocklink":
+            if not await check_mod("mute"):
+                return
+            _set_command_lock(action_chat_id, "link", False, None)
+            return await reply_text("✅ Links unblocked.")
 
         # ── /hr ───────────────────────────────────────────────────────────
         if raw_cmd == "hr":
