@@ -97,8 +97,8 @@ MODERATION_COMMANDS = {
     "resetwarns", "hdel", "pin", "unpin",
     "save", "get", "clear", "notes",
     "filter", "stop", "filters",
-    "addblocklist", "deleteblocklist", "removeblocklist", "blocklists", "blocklistmode",
-    "hprotect", "hunprotect", "hprotected", "protect", "unprotect", "protected",
+    "addblocklist", "deleteblocklist", "blocklists", "blocklistmode",
+    "hprotect", "hunprotect", "hprotected",
     "setwelcome", "setgoodbye", "setrules", "hlock", "hunlock", "locktype",
     # toggle commands
     "welcome", "goodbye", "rules", "bot",
