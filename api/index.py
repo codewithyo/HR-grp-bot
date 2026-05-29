@@ -2262,17 +2262,17 @@ def role_help_text(uid: int) -> str:
             "`/hwarnconfig duration <e.g. 1h>` - Set auto-action duration\n"
             "`/hwarnconfig show` - Show current config\n\n"
             "📋 **Notes (group-scoped):**\n"
-            "`/save <name> <text>` - Save a text note\n"
+            "`/hsave <name> <text>` - Save a text note\n"
             "`/hsave <name>` (reply) - Save replied message as note\n"
             "`/hget <name>` or `#name` - Retrieve a note\n"
             "`/hclear <name>` - Delete a note\n"
-            "`/notes` - List all notes\n\n"
+            "`/hnotes` - List all notes\n\n"
             "🔍 **Filters (auto-reply keywords):**\n"
-            "`/filter <keyword> <response>` - Add a filter\n"
+            "`/hfilter <keyword> <response>` - Add a filter\n"
             "`/hfilter -regex <pattern> <response>` - Regex filter\n"
             "`/hfilter -exact <keyword> <response>` - Exact-match filter\n"
             "`/hstop <keyword>` - Remove a filter\n"
-            "`/filters` - List all filters\n\n"
+            "`/hfilters` - List all filters\n\n"
             "🛡️ **Protection Commands:**\n"
             "`/hprotect <user_id>` - Protect user from moderation\n"
             "`/hunprotect <user_id>` - Remove user protection\n"
@@ -2303,7 +2303,7 @@ def role_help_text(uid: int) -> str:
             "🔗 **Connections (PM multi-group):**\n"
             "`/hallowconnections yes|no` - Allow PM connection to this group\n"
             "`/hconnect <chat_id>` - Connect PM to a group\n"
-            "`/connections` - List & switch connected groups\n"
+            "`/hconnections` - List & switch connected groups\n"
             "`/hdisconnect [chat_id|all]` - Disconnect from a group\n\n"
             "🎮 **Games:**\n"
             "`/ttt [user_id]` - Start Tic-Tac-Toe\n"
@@ -2331,11 +2331,11 @@ def role_help_text(uid: int) -> str:
             "`/hsave <name> <text>` - Save a note\n"
             "`/hget <name>` or `#name` - Get a note\n"
             "`/hclear <name>` - Delete a note\n"
-            "`/notes` - List all notes\n\n"
+            "`/hnotes` - List all notes\n\n"
             "🔍 **Filters:**\n"
-            "`/filter <keyword> <response>` - Add keyword auto-reply\n"
+            "`/hfilter <keyword> <response>` - Add keyword auto-reply\n"
             "`/hstop <keyword>` - Remove a filter\n"
-            "`/filters` - List all filters\n\n"
+            "`/hfilters` - List all filters\n\n"
             "📋 **Information Commands:**\n"
             "`/hcase <case_id>` - View case details\n"
             "`/hmod list` - List authorized moderators\n"
@@ -2343,7 +2343,7 @@ def role_help_text(uid: int) -> str:
             "`/hr` - Get user information\n\n"
             "🔗 **Connections:**\n"
             "`/hconnect <chat_id>` - Connect PM to a group\n"
-            "`/connections` - List & switch connected groups\n"
+            "`/hconnections` - List & switch connected groups\n"
             "`/hdisconnect [chat_id|all]` - Disconnect\n\n"
             "🎮 **Games:**\n"
             "`/ttt [user_id]` - Start Tic-Tac-Toe\n"
@@ -2364,7 +2364,7 @@ def role_help_text(uid: int) -> str:
         "`/tttend` - Forfeit active game\n\n"
         "📋 **Notes:**\n"
         "`/hget <name>` or `#name` - Get a saved note\n"
-        "`/notes` - List available notes\n\n"
+        "`/hnotes` - List available notes\n\n"
         "📢 **Appeals:**\n"
         "`/happeal <case_id> <message>` in bot DM\n\n"
         "📞 **Support:**\n"
@@ -3210,7 +3210,7 @@ async def handle_message(bot: Client, msg: dict):
             if not resolved:
                 return await reply_text(
                     "❌ You are not connected to any group.\n"
-                    "Use `/connect <chat_id>` to connect."
+                    "Use `/hconnect <chat_id>` to connect."
                 )
             action_chat_id = resolved
 
@@ -3331,7 +3331,7 @@ async def handle_message(bot: Client, msg: dict):
             if not chats:
                 return await reply_text(
                     "You are not connected to any group.\n"
-                    "Use `/connect <chat_id>` to connect."
+                    "Use `/hconnect <chat_id>` to connect."
                 )
             lines = ["🔗 **Your Connected Groups**\n"]
             rows  = []
@@ -3389,8 +3389,8 @@ async def handle_message(bot: Client, msg: dict):
                 "**Quick Commands**\n"
                 "• `/help` - Role-based commands\n"
                 "• `/hr` - User insights\n"
-                "• `/notes` - Group notes\n"
-                "• `/filters` - Active filters\n"
+                "• `/hnotes` - Group notes\n"
+                "• `/hfilters` - Active filters\n"
                 "• `/ttt` - Tic-Tac-Toe battle\n"
                 "• `/happeal` - Appeal in DM\n\n"
                 "👨‍💻 Developed by @dreamm\\_ca\n"
@@ -4046,8 +4046,8 @@ async def handle_message(bot: Client, msg: dict):
             if not args:
                 return await reply_text(
                     "❌ Usage:\n"
-                    "`/save <name> <content>` — save text as note\n"
-                    "`/save <name>` + reply — save replied message as note"
+                    "`/hsave <name> <content>` — save text as note\n"
+                    "`/hsave <name>` + reply — save replied message as note"
                 )
             note_name = args[0].lower().strip()
             if len(note_name) > 64:
@@ -4082,16 +4082,16 @@ async def handle_message(bot: Client, msg: dict):
                     "Example: `/hsave rules No spamming!`"
                 )
             note_save(action_chat_id, note_name, content, note_type, file_id, created_by=uid, entities=entities if reply else None)
-            await reply_text(f"📋 Note `{note_name}` saved! Get it with `/get {note_name}` or `#{note_name}`.")
+            await reply_text(f"📋 Note `{note_name}` saved! Get it with `/hget {note_name}` or `#{note_name}`.")
             return
 
         if raw_cmd == "hget":
             if not args:
-                return await reply_text("Usage: `/get <name>`")
+                return await reply_text("Usage: `/hget <name>`")
             note_name = args[0].lower().strip()
             note = note_get(action_chat_id, note_name)
             if not note:
-                return await reply_text(f"❌ Note `{note_name}` not found.\nUse `/notes` to see all saved notes.")
+                return await reply_text(f"❌ Note `{note_name}` not found.\nUse `/hnotes` to see all saved notes.")
             if note.get("type") and note.get("type") != "text" and note.get("file_id"):
                 await tg_send_media(chat_id, note, reply_to=msg_id)
             else:
@@ -4111,7 +4111,7 @@ async def handle_message(bot: Client, msg: dict):
             if not is_authorized_actor():
                 return await security_fail()
             if not args:
-                return await reply_text("Usage: `/clear <name>`")
+                return await reply_text("Usage: `/hclear <name>`")
             note_name = args[0].lower().strip()
             if note_delete(action_chat_id, note_name):
                 await reply_text(f"🗑️ Note `{note_name}` deleted.")
@@ -4124,7 +4124,7 @@ async def handle_message(bot: Client, msg: dict):
             if not names:
                 return await reply_text(
                     "📋 No notes saved in this group yet.\n"
-                    "Use `/save <name> <text>` to add one."
+                    "Use `/hsave <name> <text>` to add one."
                 )
             note_rows = []
             row = []
@@ -4157,11 +4157,11 @@ async def handle_message(bot: Client, msg: dict):
             if len(args) < 2:
                 return await reply_text(
                     "❌ Usage:\n"
-                    "`/filter <keyword> <response>` — contains match (default)\n"
+                    "`/hfilter <keyword> <response>` — contains match (default)\n"
                     "`/hfilter -exact <keyword> <response>` — exact message match\n"
                     "`/hfilter -start <keyword> <response>` — message starts with\n"
                     "`/hfilter -regex <pattern> <response>` — regex match\n\n"
-                    "Example: `/filter spam You cannot spam here!`"
+                    "Example: `/hfilter spam You cannot spam here!`"
                 )
             match_type = "contains"
             arg_start  = 0
@@ -4204,12 +4204,12 @@ async def handle_message(bot: Client, msg: dict):
             if not is_authorized_actor():
                 return await security_fail()
             if not args:
-                return await reply_text("Usage: `/stop <keyword>`")
+                return await reply_text("Usage: `/hstop <keyword>`")
             keyword = args[0].lower().strip()
             if filter_remove(action_chat_id, keyword):
                 await reply_text(f"✅ Filter `{keyword}` removed.")
             else:
-                await reply_text(f"❌ No filter found for `{keyword}`.\nUse `/filters` to see all active filters.")
+                await reply_text(f"❌ No filter found for `{keyword}`.\nUse `/hfilters` to see all active filters.")
             return
 
         if raw_cmd == "hfilters":
@@ -4217,7 +4217,7 @@ async def handle_message(bot: Client, msg: dict):
             if not keywords:
                 return await reply_text(
                     "🔍 No filters active in this group.\n"
-                    "Use `/filter <keyword> <response>` to add one."
+                    "Use `/hfilter <keyword> <response>` to add one."
                 )
             fdata_all = _filters_for_chat(action_chat_id)
             lines     = [f"🔍 **Active Filters** — `{len(keywords)}`\n"]
@@ -4226,7 +4226,7 @@ async def handle_message(bot: Client, msg: dict):
                 mt   = fd.get("match_type", "contains")
                 resp = fd.get("response", "")[:50]
                 lines.append(f"• `{kw}` [{mt}] → _{resp}_")
-            await reply_text("\n".join(lines) + "\n\nUse `/stop <keyword>` to remove a filter.")
+            await reply_text("\n".join(lines) + "\n\nUse `/hstop <keyword>` to remove a filter.")
             return
 
         if raw_cmd == "haddblocklist":
