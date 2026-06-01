@@ -103,6 +103,8 @@ MODERATION_COMMANDS = {
     "hlocklist", "hlockbot", "hlocklink", "hunlockbot", "hunlocklink",
     # toggle commands
     "hwelcome", "hgoodbye", "hrules", "hbot",
+    # broadcast command
+    "hbroadcast",
 }
 ACTION_LOG_AUTO_DELETE = 60  # seconds
 
@@ -110,7 +112,7 @@ ACTION_LOG_AUTO_DELETE = 60  # seconds
 _NO_AUTODELETE_CMDS = {
     "notes", "filters", "blocklists", "rules", "hmod", "hstats",
     "hprotected", "hcase", "hmodinfo", "help", "hr", "warns",
-    "connections", "hbans", "hmutes",
+    "connections", "hbans", "hmutes", "hbroadcast",
 }
 
 # =========================================================
@@ -209,6 +211,7 @@ TTT_SCORES_FILE       = f"{STORAGE_PATH}/ttt_scores.json"
 TTT_STATE_FILE        = f"{STORAGE_PATH}/ttt_state.json"
 CHAT_TITLES_FILE      = f"{STORAGE_PATH}/chat_titles.json"
 BOT_STATUS_FILE       = f"{STORAGE_PATH}/bot_status.json"
+BROADCAST_STATE_FILE  = f"{STORAGE_PATH}/broadcast_state.json"
 
 FALLBACK_FILE_MAP = {
     AUTH_FILE:             f"{FALLBACK_STORAGE_PATH}/auth.json",
@@ -234,6 +237,7 @@ FALLBACK_FILE_MAP = {
     LOCKS_FILE:            f"{FALLBACK_STORAGE_PATH}/chat_locks.json",
     CHAT_TITLES_FILE:      f"{FALLBACK_STORAGE_PATH}/chat_titles.json",
     BOT_STATUS_FILE:       f"{FALLBACK_STORAGE_PATH}/bot_status.json",
+    BROADCAST_STATE_FILE:  f"{FALLBACK_STORAGE_PATH}/broadcast_state.json",
 }
 
 ALL_FILES = list(FALLBACK_FILE_MAP.keys())
@@ -1587,6 +1591,31 @@ def set_bot_enabled(chat_id: int, enabled: bool):
     _cache.invalidate(f"bot_enabled:{chat_id}")
 
 # =========================================================
+# BROADCAST STATE
+# =========================================================
+
+def set_broadcast_state(user_id: int, broadcast_type: str, target_chat_id: int = None):
+    """Store broadcast state: 'all' or 'single' with optional target chat."""
+    data = load(BROADCAST_STATE_FILE)
+    data[str(user_id)] = {
+        "type": broadcast_type,
+        "target": target_chat_id,
+        "timestamp": str(datetime.now())
+    }
+    save(BROADCAST_STATE_FILE, data)
+
+def get_broadcast_state(user_id: int) -> dict | None:
+    """Get current broadcast state for user."""
+    data = load(BROADCAST_STATE_FILE)
+    return data.get(str(user_id))
+
+def clear_broadcast_state(user_id: int):
+    """Clear broadcast state for user."""
+    data = load(BROADCAST_STATE_FILE)
+    data.pop(str(user_id), None)
+    save(BROADCAST_STATE_FILE, data)
+
+# =========================================================
 # WELCOME / GOODBYE / RULES / LOCKS
 # =========================================================
 
@@ -2304,7 +2333,8 @@ def role_help_text(uid: int) -> str:
             "`/hallowconnections yes|no` - Allow PM connection to this group\n"
             "`/hconnect <chat_id>` - Connect PM to a group\n"
             "`/hconnections` - List & switch connected groups\n"
-            "`/hdisconnect [chat_id|all]` - Disconnect from a group\n\n"
+            "`/hdisconnect [chat_id|all]` - Disconnect from a group\n"
+            "`/hbroadcast` - Broadcast message to connected groups\n\n"
             "🎮 **Games:**\n"
             "`/ttt [user_id]` - Start Tic-Tac-Toe\n"
             "`/tttleaderboard` - Show top players\n"
@@ -2394,9 +2424,10 @@ def moderation_help_markup(section: str = "home") -> dict:
         (("🚫 Ban", "cb:help_ban"), ("🔇 Mute", "cb:help_mute"), ("⚠ Warn", "cb:help_warn")),
         (("👢 Kick", "cb:help_kick"), ("🛡 Protect", "cb:help_protect"), ("📋 Notes", "cb:help_notes")),
         (("🔍 Filters", "cb:help_filters"), ("🔒 Blocklist", "cb:help_blocklist"), ("🔗 Connections", "cb:help_connections")),
-        (("🔐 Authorization", "cb:help_auth"), ("📊 Stats", "cb:help_stats"), ("🎮 Games", "cb:help_games")),
-        (("🎉 Welcome", "cb:help_welcome"), ("📜 Rules", "cb:help_rules"), ("🚨 Report", "cb:help_report")),
-        (("🔒 Lock", "cb:help_lock"), ("🔓 Lock Types", "cb:help_locktypes"), ("🤖 Bot Toggle", "cb:help_bot")),
+        (("📢 Broadcast", "cb:help_broadcast"), ("🔐 Authorization", "cb:help_auth"), ("📊 Stats", "cb:help_stats")),
+        (("🎮 Games", "cb:help_games"), ("🎉 Welcome", "cb:help_welcome"), ("📜 Rules", "cb:help_rules")),
+        (("🚨 Report", "cb:help_report"), ("🔒 Lock", "cb:help_lock"), ("🔓 Lock Types", "cb:help_locktypes")),
+        (("🤖 Bot Toggle", "cb:help_bot"),),
     )
     if section == "home":
         return build_markup(*base_rows)
@@ -2617,12 +2648,35 @@ def moderation_help_text(section: str, uid: int) -> str:
             "`/hconnect <chat_id>` - Connect PM to manage a group\n"
             "`/hconnections` - View all connected groups and switch\n"
             "`/hdisconnect [chat_id|all]` - Disconnect from a group\n"
-            "`/hallowconnections yes|no` - Allow/block PM connections\n\n"
+            "`/hallowconnections yes|no` - Allow/block PM connections\n"
+            "`/hbroadcast` - Broadcast message to connected groups\n\n"
             "**Usage**\n"
             "• Connect PMs to manage multiple groups from one bot instance.\n"
             "• Each connection has isolated storage (notes, filters, warns, etc.).\n"
             "• Example: `/hconnect -1001234567890`\n"
             "• Get chat_id using `/hr` in the target group.\n"
+        )
+    if section == "broadcast":
+        return (
+            f"👮 **{role} Help Center**\n\n"
+            "📢 **Broadcast Messages**\n\n"
+            "`/hbroadcast` - Broadcast a message to connected groups\n\n"
+            "**Features**\n"
+            "• Option 1: Broadcast to all connected groups\n"
+            "• Option 2: Broadcast to a specific group\n"
+            "• Your moderator info is automatically added to the message\n"
+            "• Messages sent with moderator credit\n\n"
+            "**How to Use**\n"
+            "1. Run `/hbroadcast` in bot DM\n"
+            "2. Choose:\n"
+            "   📢 Broadcast to All Groups\n"
+            "   📤 Broadcast to Specific Group\n"
+            "3. Reply with your message\n"
+            "4. Message is sent with your moderator badge\n\n"
+            "**Example**\n"
+            "• Important announcement for all groups\n"
+            "• Event notifications\n"
+            "• Policy updates\n"
         )
     if section == "blocklist":
         return (
@@ -3127,6 +3181,50 @@ async def handle_message(bot: Client, msg: dict):
 
         # ── Non-command messages: filters + #note triggers ────────────────
         if not text.startswith("/"):
+            # Handle broadcast messages in private chat
+            if is_private and text and uid != _bot_id:
+                broadcast_state = get_broadcast_state(uid)
+                if broadcast_state:
+                    broadcast_type = broadcast_state.get("type")
+                    if broadcast_type == "all":
+                        chats = get_connected_chats(uid)
+                        if not chats:
+                            await tg_send(chat_id, "❌ You are not connected to any groups.")
+                        else:
+                            success_count = 0
+                            failed_count = 0
+                            for target_cid in chats:
+                                try:
+                                    mod_info = get_mod_info(uid) or {"badge": "🆘 Moderator", "mod_id": str(uid)}
+                                    badge = mod_info.get("badge", "🆘 Moderator")
+                                    mod_name = mod_info.get("mod_id", str(uid))
+                                    broadcast_msg = f"{text}\n\n*— Broadcast by* {badge} `{mod_name}`"
+                                    await tg_send(target_cid, broadcast_msg)
+                                    success_count += 1
+                                except Exception as e:
+                                    failed_count += 1
+                                    log_msg(f"Failed to broadcast to {target_cid}: {e}", "WARNING")
+                            clear_broadcast_state(uid)
+                            result_msg = f"✅ Broadcast sent to {success_count} group(s)"
+                            if failed_count > 0:
+                                result_msg += f" ({failed_count} failed)"
+                            await tg_send(chat_id, result_msg)
+                    elif broadcast_type == "single":
+                        target_cid = broadcast_state.get("target")
+                        if target_cid:
+                            try:
+                                mod_info = get_mod_info(uid) or {"badge": "🆘 Moderator", "mod_id": str(uid)}
+                                badge = mod_info.get("badge", "🆘 Moderator")
+                                mod_name = mod_info.get("mod_id", str(uid))
+                                broadcast_msg = f"{text}\n\n*— Broadcast by* {badge} `{mod_name}`"
+                                await tg_send(target_cid, broadcast_msg)
+                                clear_broadcast_state(uid)
+                                await tg_send(chat_id, "✅ Message broadcasted to the group.")
+                            except Exception as e:
+                                await tg_send(chat_id, f"❌ Failed to send broadcast: {str(e)}")
+                                clear_broadcast_state(uid)
+                    return
+            
             if not is_private and text:
                 # 1) #notename trigger
                 hashtags = re.findall(r'#(\w+)', text)
@@ -3358,6 +3456,32 @@ async def handle_message(bot: Client, msg: dict):
             await tg_send(
                 chat_id,
                 "\n".join(lines) + "\n\n⭐ = currently active group",
+                reply_to=msg_id,
+                markup=markup,
+            )
+            return
+
+        # ── /broadcast ─────────────────────────────────────────────────────
+        if raw_cmd == "hbroadcast":
+            if not is_authorized_actor():
+                return await reply_text("❌ Moderator access required.")
+            if not is_private:
+                return await reply_text("Use /hbroadcast in bot DM.")
+            chats = get_connected_chats(uid)
+            if not chats:
+                return await reply_text(
+                    "You are not connected to any group.\n"
+                    "Use `/hconnect <chat_id>` to connect."
+                )
+            rows = [
+                [("📢 Broadcast to All Groups", "cb:broadcast_all")],
+                [("📤 Broadcast to Specific Group", "cb:broadcast_select")]
+            ]
+            markup = build_markup(*rows)
+            await tg_send(
+                chat_id,
+                "📢 **Broadcast Message**\n\n"
+                "Choose where to send your message:",
                 reply_to=msg_id,
                 markup=markup,
             )
@@ -5014,6 +5138,83 @@ async def handle_callback(bot: Client, cb: dict):
                 await tg_answer_cb(cb_id, f"✅ Switched to: {chat_obj.title}", alert=False)
             except Exception:
                 await tg_answer_cb(cb_id, f"✅ Active group set to {new_active}.", alert=False)
+            return
+
+        # broadcast_all / broadcast_select
+        if data == "broadcast_all":
+            set_broadcast_state(uid, "all")
+            await tg_answer_cb(cb_id, "📢 Replying with your message will broadcast it to all connected groups.")
+            await tg_send(
+                chat_id,
+                "📤 **Reply with your message to broadcast to all groups**\n\n"
+                "Your message will be sent to all connected groups with moderator credit.",
+            )
+            return
+
+        if data == "broadcast_select":
+            chats = get_connected_chats(uid)
+            if not chats:
+                return await tg_answer_cb(cb_id, "❌ No connected groups.", alert=True)
+            
+            lines = ["📤 **Select a Group to Broadcast**\n"]
+            rows  = []
+            for cid in chats:
+                title = None
+                try:
+                    chat_obj = await bot.get_chat(cid)
+                    title = getattr(chat_obj, "title", None)
+                    if title:
+                        cache_chat_title(cid, title)
+                except Exception:
+                    title = get_cached_chat_title(cid)
+                display_id   = f"`{cid}`"
+                if title:
+                    lines.append(f"• *{_escape_markdown(title)}* ({display_id})")
+                    display_label = title[:20]
+                else:
+                    lines.append(f"• {display_id}")
+                    display_label = str(cid)
+                rows.append([(f"📤 {display_label[:18]}", f"cb:broadcast_to_{cid}")])
+            
+            markup = build_markup(*rows)
+            await tg_answer_cb(cb_id, "Select a group below.")
+            await tg_send(
+                chat_id,
+                "\n".join(lines),
+                markup=markup,
+            )
+            return
+
+        if data.startswith("broadcast_to_"):
+            try:
+                target_chat = int(data.split("_", 2)[2])
+            except (ValueError, IndexError):
+                return await tg_answer_cb(cb_id, "❌ Invalid chat ID.", alert=True)
+            
+            chats = get_connected_chats(uid)
+            if target_chat not in chats:
+                return await tg_answer_cb(cb_id, "❌ You are not connected to that group.", alert=True)
+            
+            set_broadcast_state(uid, "single", target_chat)
+            await tg_answer_cb(cb_id, "✅ Ready! Reply with your message.")
+            try:
+                chat_obj = await bot.get_chat(target_chat)
+                title = getattr(chat_obj, "title", None)
+                if title:
+                    await tg_send(
+                        chat_id,
+                        f"📤 **Reply with your message to broadcast to:**\n*{_escape_markdown(title)}*",
+                    )
+                else:
+                    await tg_send(
+                        chat_id,
+                        f"📤 **Reply with your message to broadcast to group** `{target_chat}`",
+                    )
+            except Exception:
+                await tg_send(
+                    chat_id,
+                    f"📤 **Reply with your message to broadcast to group** `{target_chat}`",
+                )
             return
 
         # getnote_<chat_id>_<name>
