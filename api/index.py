@@ -3216,6 +3216,7 @@ async def diagnostics_endpoint():
 @app.post("/api/webhook")
 async def webhook(request: Request):
     """Optimized webhook handler with deduplication and async processing."""
+    global _webhook_dedup
     try:
         update = await request.json()
         if not isinstance(update, dict):
@@ -3249,7 +3250,6 @@ async def webhook(request: Request):
     except Exception as e:
         log_msg(f"webhook error: {e}\n{traceback.format_exc()}", "ERROR")
     return JSONResponse({"ok": True}, status_code=200)
-
 # =========================================================
 # MESSAGE HANDLER
 # =========================================================
