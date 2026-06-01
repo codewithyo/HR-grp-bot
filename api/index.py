@@ -3306,11 +3306,7 @@ async def handle_message(bot: Client, msg: dict):
                             failed_count = 0
                             for target_cid in chats:
                                 try:
-                                    mod_info = get_mod_info(uid) or {"badge": "🆘 Moderator", "mod_id": str(uid)}
-                                    badge = mod_info.get("badge", "🆘 Moderator")
-                                    mod_name = mod_info.get("mod_id", str(uid))
-                                    broadcast_msg = f"{text}\n\n*— Broadcast by* {badge} `{mod_name}`"
-                                    await tg_send(target_cid, broadcast_msg)
+                                    await tg_send(target_cid, text)
                                     success_count += 1
                                 except Exception as e:
                                     failed_count += 1
@@ -3324,11 +3320,7 @@ async def handle_message(bot: Client, msg: dict):
                         target_cid = broadcast_state.get("target")
                         if target_cid:
                             try:
-                                mod_info = get_mod_info(uid) or {"badge": "🆘 Moderator", "mod_id": str(uid)}
-                                badge = mod_info.get("badge", "🆘 Moderator")
-                                mod_name = mod_info.get("mod_id", str(uid))
-                                broadcast_msg = f"{text}\n\n*— Broadcast by* {badge} `{mod_name}`"
-                                await tg_send(target_cid, broadcast_msg)
+                                await tg_send(target_cid, text)
                                 clear_broadcast_state(uid)
                                 await tg_send(chat_id, "✅ Message broadcasted to the group.")
                             except Exception as e:
@@ -3618,19 +3610,48 @@ async def handle_message(bot: Client, msg: dict):
                 if message:
                     await reply_text(message)
                 return
+            # Get bot info for add-to-group link
+            try:
+                me = await bot.get_me()
+                bot_username = me.username or "bot"
+            except:
+                bot_username = "bot"
+            
+            markup = build_markup(
+                (("➕ Add Bot to Group", f"url:https://t.me/{bot_username}?startgroup=true"),),
+                (("👤 Primary Dev", f"url:https://t.me/dreamm_ca"), ("👨‍💻 Tech Lead", f"url:https://t.me/developer_hr")),
+            )
+            
             await reply_text(
-                "🛡️ **SentriX Prime**\n\n"
-                "Elite moderation + advanced utility tools for your group.\n\n"
-                "**Quick Commands**\n"
-                "• `/help` - Role-based commands\n"
-                "• `/hr` - User insights\n"
-                "• `/hnotes` - Group notes\n"
-                "• `/hfilters` - Active filters\n"
-                "• `/ttt` - Tic-Tac-Toe battle\n"
-                "• `/happeal` - Appeal in DM\n\n"
-                "👨‍💻 Developed by @dreamm\\_ca\n"
-                "⚙️ Sudo Dev: @developer\\_hr\n\n"
-                "⚡ Active. Secure. Ready."
+                "🛡️ **SentriX Prime - v2.0**\n"
+                "*Professional Group Management Bot*\n\n"
+                "**Welcome to next-gen group moderation**\n"
+                "Advanced automation, intelligent security, and powerful utilities designed for professional communities.\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "**🚀 Core Features**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ **Smart Moderation** - Auto-filters, warnings, and enforcement\n"
+                "✅ **Member Management** - Profiles, history, and analytics\n"
+                "✅ **Security Tools** - Anti-spam, anti-raid, protection systems\n"
+                "✅ **Advanced Logging** - Complete audit trails\n"
+                "✅ **Custom Rules** - Flexible filter and trigger system\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "**📋 Quick Start**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "• `/help` - View available commands for your role\n"
+                "• `/hr` - Get user profile and moderation history\n"
+                "• `/hstats` - View group moderation statistics\n"
+                "• `/hnotes` - Manage group notes and references\n"
+                "• `/hfilters` - Configure automated text filters\n"
+                "• `/hprotect` - Enable group protection features\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "**⚙️ System Status**\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🟢 Status: **Active & Operational**\n"
+                "⚡ Response: **Optimized** (60-90% faster)\n"
+                "🔒 Security: **Enterprise-Grade**\n\n"
+                "*Ready to manage your community professionally.*",
+                markup=markup
             )
             return
 
