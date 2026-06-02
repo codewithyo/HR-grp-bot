@@ -143,7 +143,7 @@ MODERATION_COMMANDS = {
     # broadcast command
     "hbroadcast",
 }
-ACTION_LOG_AUTO_DELETE = 60  # seconds
+ACTION_LOG_AUTO_DELETE = 600  # seconds
 
 # FIX-K: Commands whose replies should NOT be auto-deleted (users need to read them)
 _NO_AUTODELETE_CMDS = {
