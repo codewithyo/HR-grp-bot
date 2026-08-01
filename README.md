@@ -198,6 +198,19 @@ Fallback Files (Recovery)
 
 ---
 
+## 📚 Quick Command Summary
+
+Use the bot for moderation, note management, filters, multi-group control, broadcasts, and games.
+
+- Moderation: /hban, /hkick, /hmute, /hunban, /hunmute, /hwarn, /hdel
+- Notes: /hsave, /hget, /hclear, /hnotes
+- Filters: /hfilter, /hfilters, /hstop
+- Connections: /hconnect, /hconnections, /hdisconnect, /hallowconnections, /hbroadcast
+- Owner tools: /hauth, /hgrant, /hrevoke, /hfreeze, /hunfreeze, /hbadge, /hwarnconfig
+- Games: /ttt, /tttleaderboard, /tttmystats, /tttend
+
+---
+
 ## 📖 Comprehensive Command Reference
 
 ### 📋 Command Usage Pattern
@@ -329,6 +342,25 @@ Returns real-time metrics:
 - Webhook deduplication stats
 - Performance indicators
 - Timestamp for trending
+
+---
+
+
+## 🧭 How It Works
+
+1. Add the bot to your group and promote it to admin.
+2. Use the built-in moderation and management commands from the group or bot DM.
+3. Connect multiple groups through PM management to run operations from one place.
+4. Broadcast updates, manage notes and filters, and keep your community protected with audit-friendly tools.
+
+---
+
+## 🌟 Why Choose SentriX Prime
+
+- Built for community admins, moderators, and owners
+- Supports moderation, notes, filters, protection, and broadcasts
+- Works in groups and private DM management mode
+- Includes games and appeal handling for community engagement
 
 ---
 
