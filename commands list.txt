@@ -31,7 +31,8 @@ Moderation
 - /hunfreeze <user_id> - Unfreeze a moderator (Owner)
 - /hbadge <user_id> <badge> - Set a moderator badge (Owner)
 - /hwarnconfig - Configure warning actions (Owner)
-- /hban /hkick /hmute /hunban /hunmute - Moderate users
+- /hban /ban /tban /hkick /kick /kickme /hmute /mute /tmute /hunban /unban /hunmute /unmute - Moderate users
+- /promote /demote /adminlist /admincache /anonadmin /adminerror /hauth /hgrant /hrevoke /hfreeze /hunfreeze /hprotect /hunprotect - Manage admins and protection
 - /hwarn /warns /resetwarns - Manage warnings
 - /hdel /hprotect /hunprotect /hcase /happeal - Handle moderation actions
 

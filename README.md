@@ -202,7 +202,8 @@ Fallback Files (Recovery)
 
 Use the bot for moderation, note management, filters, multi-group control, broadcasts, and games.
 
-- Moderation: /hban, /hkick, /hmute, /hunban, /hunmute, /hwarn, /hdel
+- Moderation: /hban, /ban, /tban, /hkick, /kick, /kickme, /hmute, /mute, /tmute, /hunban, /unban, /hunmute, /unmute, /hwarn, /hdel
+- Admin tools: /promote, /demote, /adminlist, /admincache, /anonadmin, /adminerror, /hauth, /hgrant, /hrevoke, /hfreeze, /hunfreeze, /hprotect, /hunprotect
 - Notes: /hsave, /hget, /hclear, /hnotes
 - Filters: /hfilter, /hfilters, /hstop
 - Connections: /hconnect, /hconnections, /hdisconnect, /hallowconnections, /hbroadcast
@@ -242,11 +243,12 @@ Most commands support **two usage modes**:
 
 | Emoji | Command | Description | Duration | Example |
 |-------|---------|-------------|----------|---------|
-| 🚫 | `/hban` | Ban user | `[duration]` | `/hban @user 7d spam` |
-| ✅ | `/hunban` | Unban user | — | `/hunban @user` |
-| 👢 | `/hkick` | Kick user | — | `/hkick @user spam` |
-| 🔇 | `/hmute` | Mute user | `[duration]` | `/hmute @user 2h` |
-| 🔊 | `/hunmute` | Unmute user | — | `/hunmute @user` |
+| 🚫 | `/hban` / `/ban` / `/tban` | Ban or temporarily ban user | `[duration]` | `/ban @user 7d spam` |
+| ✅ | `/hunban` / `/unban` | Unban user | — | `/unban @user` |
+| 👢 | `/hkick` / `/kick` | Kick user | — | `/kick @user spam` |
+| 🙋 | `/kickme` | Kick yourself from the group | — | `/kickme` |
+| 🔇 | `/hmute` / `/mute` / `/tmute` | Mute or temporarily mute user | `[duration]` | `/tmute @user 2h` |
+| 🔊 | `/hunmute` / `/unmute` | Unmute user | — | `/unmute @user` |
 | ⚠️ | `/hwarn` | Issue warning | — | `/hwarn @user off-topic` |
 | ♻️ | `/hresetwarns` | Reset all warnings | — | `/hresetwarns @user` |
 | 📌 | `/pin` | Pin message | — | `/pin` (reply) |

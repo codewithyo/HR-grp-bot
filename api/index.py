@@ -126,6 +126,20 @@ BOT_COMMANDS = [
     {"command": "hr",                 "description": "🆔 Get profile or group information"},
     {"command": "hstats",             "description": "📊 Show moderation stats"},
     {"command": "hmodinfo",           "description": "👮 View moderator information"},
+    {"command": "promote",            "description": "⬆️ Promote a user to admin"},
+    {"command": "demote",             "description": "⬇️ Demote an admin"},
+    {"command": "adminlist",          "description": "👮 List chat admins"},
+    {"command": "admincache",         "description": "🗂️ Refresh the admin cache"},
+    {"command": "anonadmin",          "description": "🎭 Toggle anonymous admin access"},
+    {"command": "adminerror",         "description": "⚠️ Toggle admin-command error replies"},
+    {"command": "ban",                "description": "🚫 Ban a user"},
+    {"command": "tban",               "description": "⏱️ Temporarily ban a user"},
+    {"command": "unban",              "description": "🔓 Unban a user"},
+    {"command": "mute",               "description": "🔇 Mute a user"},
+    {"command": "tmute",              "description": "⏱️ Temporarily mute a user"},
+    {"command": "unmute",             "description": "🔊 Unmute a user"},
+    {"command": "kick",               "description": "👢 Kick a user"},
+    {"command": "kickme",             "description": "🙋 Kick yourself from the group"},
     {"command": "notes",              "description": "📋 List saved notes"},
     {"command": "save",               "description": "💾 Save a note"},
     {"command": "get",                "description": "📖 Get a saved note"},
@@ -166,8 +180,9 @@ BOT_COMMANDS = [
 VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
 
 MODERATION_COMMANDS = {
-    "hban", "hkick", "hmute",
-    "hunban", "hunmute", "hwarn",
+    "hban", "ban", "tban", "hkick", "kick", "hmute", "mute", "tmute",
+    "hunban", "unban", "hunmute", "unmute", "hwarn",
+    "promote", "demote", "adminlist", "admincache", "anonadmin", "adminerror",
     "hresetwarns", "hdel", "hpin", "hunpin",
     "hsave", "hget", "hclear", "hnotes",
     "hfilter", "hstop", "hfilters",
@@ -2139,10 +2154,10 @@ def parse_duration_token(token: str) -> int | None:
         return None
     token = token.strip().lower()
     num, unit = token[:-1], token[-1]
-    if not num.isdigit() or unit not in "smhd":
+    if not num.isdigit() or unit not in "smhdw":
         return None
     v = int(num)
-    return v * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit] if v > 0 else None
+    return v * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[unit] if v > 0 else None
 
 def parse_duration_and_reason(args, start, default="No Reason"):
     if len(args) <= start:
@@ -2290,6 +2305,42 @@ async def build_admin_list_text(bot: Client, chat_id: int) -> str:
         lines.append("No administrators found.")
     return "\n".join(lines)
 
+async def promote_admin(bot: Client, chat_id: int, user_id: int, is_anonymous: bool = False) -> tuple[bool, str]:
+    try:
+        await bot.promote_chat_member(
+            chat_id,
+            user_id,
+            can_change_info=True,
+            can_delete_messages=True,
+            can_restrict_members=True,
+            can_invite_users=True,
+            can_pin_messages=True,
+            can_manage_video_chats=True,
+            can_manage_chat=True,
+            is_anonymous=is_anonymous,
+        )
+        return True, "✅ User promoted to admin."
+    except Exception as exc:
+        return False, f"❌ Failed to promote: {exc}"
+
+async def demote_admin(bot: Client, chat_id: int, user_id: int) -> tuple[bool, str]:
+    try:
+        await bot.promote_chat_member(
+            chat_id,
+            user_id,
+            can_change_info=False,
+            can_delete_messages=False,
+            can_restrict_members=False,
+            can_invite_users=False,
+            can_pin_messages=False,
+            can_manage_video_chats=False,
+            can_manage_chat=False,
+            is_anonymous=False,
+        )
+        return True, "✅ User demoted to regular member."
+    except Exception as exc:
+        return False, f"❌ Failed to demote: {exc}"
+
 async def scan_zombies(bot: Client, chat_id: int, bot_id: int) -> tuple[int, int, list[str]]:
     kicked_deleted = 0
     kicked_bots    = 0
@@ -2406,11 +2457,12 @@ def role_help_text(uid: int) -> str:
             "`/hlock [duration]` - Lock the chat\n"
             "`/hunlock` - Unlock the chat\n\n"
             "📋 **Moderation Commands:**\n"
-            "`/hban [user_id/@user] [duration] [reason]` - Ban user\n"
-            "`/hkick <user_id/@user> [reason]` - Kick user from group\n"
-            "`/hmute [user_id/@user] [duration] [reason]` - Mute user\n"
-            "`/hunban [user_id/@user] [reason]` - Unban a user\n"
-            "`/hunmute [user_id/@user] [reason]` - Unmute a user\n"
+            "`/hban` / `/ban` / `/tban` - Ban or temporarily ban a user\n"
+            "`/hkick` / `/kick` - Kick a user from the group\n"
+            "`/kickme` - Kick yourself from the group\n"
+            "`/hmute` / `/mute` / `/tmute` - Mute or temporarily mute a user\n"
+            "`/hunban` / `/unban` - Unban a user\n"
+            "`/hunmute` / `/unmute` - Unmute a user\n"
             "`/hstats` - Show moderation stats\n"
             "`/hmod list` - List authorized moderators\n"
             "`/hwarn [user_id/@user] [reason]` - Warn user\n"
@@ -2437,11 +2489,12 @@ def role_help_text(uid: int) -> str:
             "║  👮 MODERATOR COMMAND REFERENCE       ║\n"
             "╚════════════════════════════════════════╝\n\n"
             "🚫 **Moderation Commands:**\n"
-            "`/hban [user_id/@user] [duration] [reason]` - Ban user\n"
-            "`/hkick <user_id/@user> [reason]` - Kick user from group\n"
-            "`/hmute [user_id/@user] [duration] [reason]` - Mute user\n"
-            "`/hunban [user_id/@user] [reason]` - Unban a user\n"
-            "`/hunmute [user_id/@user] [reason]` - Unmute a user\n"
+            "`/hban` / `/ban` / `/tban` - Ban or temporarily ban a user\n"
+            "`/hkick` / `/kick` - Kick a user from the group\n"
+            "`/kickme` - Kick yourself from the group\n"
+            "`/hmute` / `/mute` / `/tmute` - Mute or temporarily mute a user\n"
+            "`/hunban` / `/unban` - Unban a user\n"
+            "`/hunmute` / `/unmute` - Unmute a user\n"
             "`/hstats` - Show moderation stats\n"
             "`/hwarn [user_id/@user] [reason]` - Warn user\n"
             "`/hdel` - Delete replied message\n\n"
@@ -3442,10 +3495,15 @@ async def handle_message(bot: Client, msg: dict):
             "resetwarns": "hresetwarns",
             "pin": "hpin",
             "unpin": "hunpin",
-            "adminlist": "hadminlist",
             "zombies": "hzombies",
             "protect": "hprotect",
             "unprotect": "hunprotect",
+            "promote": "hpromote",
+            "demote": "hdemote",
+            "adminlist": "hadminlist",
+            "admincache": "hadmincache",
+            "anonadmin": "hanonadmin",
+            "adminerror": "hadminerror",
             "case": "hcase",
             "appeal": "happeal",
             "auth": "hauth",
@@ -4838,12 +4896,13 @@ async def handle_message(bot: Client, msg: dict):
         # MODERATION COMMANDS
         # ══════════════════════════════════════════════════════════════════
 
-        if raw_cmd == "hban":
+        if raw_cmd in ("hban", "ban", "tban"):
             if not await check_mod("ban"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hban <user_id/@user> [duration] [reason]")
+                cmd_name = "tban" if raw_cmd == "tban" else "ban"
+                return await reply_text(f"{terr}\nUsage: /{cmd_name} <user_id/@user> [duration] [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot ban yourself.")
             if tid == _bot_id:
@@ -4856,7 +4915,15 @@ async def handle_message(bot: Client, msg: dict):
                 if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
                     return await reply_text("❌ Cannot ban an admin or the group owner.")
             rs = 0 if reply else 1
-            dur, reason = parse_duration_and_reason(args, rs)
+            if raw_cmd == "tban":
+                if len(args) <= rs:
+                    return await reply_text("❌ Usage: /tban <user_id/@user> <duration> [reason]\nExamples: 4m, 3h, 6d, 5w")
+                dur = parse_duration_token(args[rs])
+                if dur is None:
+                    return await reply_text("❌ Invalid duration. Examples: 4m, 3h, 6d, 5w")
+                reason = extract_reason(args, rs + 1, "No Reason")
+            else:
+                dur, reason = parse_duration_and_reason(args, rs)
             if is_protected(tid, action_chat_id):
                 return await reply_text("🛡 That user is protected.")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
@@ -4875,12 +4942,12 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "BAN", target, reason, case_id, actor_mod_info())
             return
 
-        if raw_cmd == "hkick":
+        if raw_cmd in ("hkick", "kick"):
             if not await check_mod("kick"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hkick <user_id/@user> [reason]")
+                return await reply_text(f"{terr}\nUsage: /kick <user_id/@user> [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot kick yourself.")
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
@@ -4905,16 +4972,25 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "KICK", target, reason, case_id, actor_mod_info())
             return
 
-        if raw_cmd == "hmute":
+        if raw_cmd in ("hmute", "mute", "tmute"):
             if not await check_mod("mute"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hmute <user_id/@user> [duration] [reason]")
+                cmd_name = "tmute" if raw_cmd == "tmute" else "mute"
+                return await reply_text(f"{terr}\nUsage: /{cmd_name} <user_id/@user> [duration] [reason]")
             if not is_anon_admin and tid == uid:
                 return await reply_text("❌ You cannot mute yourself.")
             rs = 0 if reply else 1
-            dur, reason = parse_duration_and_reason(args, rs)
+            if raw_cmd == "tmute":
+                if len(args) <= rs:
+                    return await reply_text("❌ Usage: /tmute <user_id/@user> <duration> [reason]\nExamples: 4m, 3h, 6d, 5w")
+                dur = parse_duration_token(args[rs])
+                if dur is None:
+                    return await reply_text("❌ Invalid duration. Examples: 4m, 3h, 6d, 5w")
+                reason = extract_reason(args, rs + 1, "No Reason")
+            else:
+                dur, reason = parse_duration_and_reason(args, rs)
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
             if gm_err:
                 if gm_err == "UserNotParticipant":
@@ -4943,12 +5019,12 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "MUTE", target, reason, case_id, actor_mod_info())
             return
 
-        if raw_cmd == "hunban":
+        if raw_cmd in ("hunban", "unban"):
             if not await check_mod("unban"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hunban <user_id/@user> [reason]")
+                return await reply_text(f"{terr}\nUsage: /unban <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
             if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
@@ -4961,12 +5037,12 @@ async def handle_message(bot: Client, msg: dict):
             await send_action_log(chat_id, msg_id, "UNBAN", target, reason, case_id, actor_mod_info())
             return
 
-        if raw_cmd == "hunmute":
+        if raw_cmd in ("hunmute", "unmute"):
             if not await check_mod("unmute"):
                 return
             target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
             if not tid:
-                return await reply_text(f"{terr}\nUsage: /hunmute <user_id/@user> [reason]")
+                return await reply_text(f"{terr}\nUsage: /unmute <user_id/@user> [reason]")
             rs = 0 if reply else 1
             reason = extract_reason(args, rs, "No reason given")
             member, gm_err = await get_chat_member_safe(bot, action_chat_id, tid)
@@ -4985,6 +5061,22 @@ async def handle_message(bot: Client, msg: dict):
             cancel_temp_action("mute", action_chat_id, tid)
             case_id = create_case("UNMUTE", uid, tid, reason)
             await send_action_log(chat_id, msg_id, "UNMUTE", target, reason, case_id, actor_mod_info())
+            return
+
+        if raw_cmd == "kickme":
+            if is_private:
+                return await reply_text("❌ Use /kickme in a group.")
+            if await anti_nuke(chat_id, msg_id, uid, is_anon=is_anon_admin):
+                return
+            member, gm_err = await get_chat_member_safe(bot, action_chat_id, uid)
+            if gm_err:
+                return await reply_text("❌ You are not in this chat.")
+            if member.status in (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR):
+                return await reply_text("❌ You cannot kick yourself as an admin or owner.")
+            ok, err = await api_kick(action_chat_id, uid)
+            if not ok:
+                return await reply_text(f"❌ Kick failed: {err}")
+            await reply_text("👋 You kicked yourself out of the group.")
             return
 
         if raw_cmd == "hpin":
@@ -5010,10 +5102,82 @@ async def handle_message(bot: Client, msg: dict):
             await reply_text("📍 Pinned message removed.")
             return
 
+        if raw_cmd == "hpromote":
+            if not is_authorized_actor():
+                return await reply_text("❌ Moderator access required.")
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /promote <reply/username/mention/userid>")
+            if not is_owner_actor() and tid == uid:
+                return await reply_text("❌ You cannot promote yourself.")
+            ok, msg = await promote_admin(bot, action_chat_id, tid)
+            await reply_text(msg)
+            if ok:
+                case_id = create_case("PROMOTE", uid, tid, "Promoted to admin")
+                await send_action_log(chat_id, msg_id, "PROMOTE", target, "Promoted to admin", case_id, actor_mod_info())
+            return
+
+        if raw_cmd == "hdemote":
+            if not is_authorized_actor():
+                return await reply_text("❌ Moderator access required.")
+            target, tid, terr = await resolve_target_ext(bot, reply, args, 0)
+            if not tid:
+                return await reply_text(f"{terr}\nUsage: /demote <reply/username/mention/userid>")
+            if not is_owner_actor() and tid == uid:
+                return await reply_text("❌ You cannot demote yourself.")
+            ok, msg = await demote_admin(bot, action_chat_id, tid)
+            await reply_text(msg)
+            if ok:
+                case_id = create_case("DEMOTE", uid, tid, "Demoted from admin")
+                await send_action_log(chat_id, msg_id, "DEMOTE", target, "Demoted from admin", case_id, actor_mod_info())
+            return
+
         if raw_cmd == "hadminlist":
             if not is_authorized_actor():
                 return await reply_text("❌ Moderator access required.")
             await reply_text(await build_admin_list_text(bot, action_chat_id))
+            return
+
+        if raw_cmd == "hadmincache":
+            if not is_authorized_actor():
+                return await reply_text("❌ Moderator access required.")
+            try:
+                await bot.get_chat_members(action_chat_id, filter=enums.ChatMembersFilter.ADMINISTRATORS)
+                await reply_text("✅ Admin cache refreshed.")
+            except Exception as exc:
+                await reply_text(f"❌ Failed to refresh admin cache: {exc}")
+            return
+
+        if raw_cmd == "hanonadmin":
+            if not is_owner_actor():
+                return await reply_text("❌ Owner only.")
+            if not args:
+                return await reply_text("Usage: /anonadmin <yes/no/on/off>")
+            value = args[0].lower()
+            if value in ("on", "yes", "true"):
+                os.environ["ANON_ADMIN_MODE"] = "1"
+                await reply_text("✅ Anonymous admin mode enabled.")
+            elif value in ("off", "no", "false"):
+                os.environ["ANON_ADMIN_MODE"] = "0"
+                await reply_text("✅ Anonymous admin mode disabled.")
+            else:
+                await reply_text("❌ Usage: /anonadmin <yes/no/on/off>")
+            return
+
+        if raw_cmd == "hadminerror":
+            if not is_owner_actor():
+                return await reply_text("❌ Owner only.")
+            if not args:
+                return await reply_text("Usage: /adminerror <yes/no/on/off>")
+            value = args[0].lower()
+            if value in ("on", "yes", "true"):
+                os.environ["ADMIN_ERROR_MODE"] = "1"
+                await reply_text("✅ Admin error replies enabled.")
+            elif value in ("off", "no", "false"):
+                os.environ["ADMIN_ERROR_MODE"] = "0"
+                await reply_text("✅ Admin error replies disabled.")
+            else:
+                await reply_text("❌ Usage: /adminerror <yes/no/on/off>")
             return
 
         if raw_cmd == "hzombies":
