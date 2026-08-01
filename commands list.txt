@@ -1,56 +1,42 @@
-    {"command": "start",          "description": "🚀 Start the bot & view welcome message"},
-    {"command": "help",           "description": "📖 Show inline help categories"},
-    {"command": "hr",             "description": "🆔 Get user ID & profile information"},
-    {"command": "hmodinfo",       "description": "👮 View moderator information"},
-    {"command": "notes",          "description": "📋 List all saved notes in this group"},
-    {"command": "save",           "description": "💾 Save a note: /save <name> <text>"},
-    {"command": "get",            "description": "📖 Get a note: /get <name>"},
-    {"command": "clear",          "description": "🗑️ Delete a note: /clear <name>"},
-    {"command": "filters",        "description": "🔍 List all active filters in this group"},
-    {"command": "filter",         "description": "➕ Add a filter: /filter <keyword> <response>"},
-    {"command": "stop",           "description": "➖ Remove a filter: /stop <keyword>"},
-    {"command": "connections",    "description": "🔗 View & switch your connected groups"},
-    {"command": "connect",        "description": "🔗 Connect PM to a group"},
-    {"command": "disconnect",     "description": "❌ Disconnect from a group"},
-    {"command": "allowconnections","description": "🔗 Allow or block PM connections for this group"},
-    {"command": "hauth",          "description": "🔐 Authorize a moderator (Owner)"},
-    {"command": "hgrant",         "description": "✅ Grant permission to moderator (Owner)"},
-    {"command": "hrevoke",        "description": "❌ Revoke permission from moderator (Owner)"},
-    {"command": "hfreeze",        "description": "🧊 Freeze a moderator account (Owner)"},
-    {"command": "hunfreeze",      "description": "🔥 Unfreeze a moderator account (Owner)"},
-    {"command": "hbadge",         "description": "🏷️ Set custom badge for a moderator (Owner)"},
-    {"command": "hwarnconfig",    "description": "⚙️ Configure warn threshold/action (Owner)"},
-    {"command": "hban",           "description": "🚫 Ban a user from group"},
-    {"command": "hkick",          "description": "👢 Kick a user from group"},
-    {"command": "hmute",          "description": "🔇 Mute a user in group"},
-    {"command": "hunban",         "description": "🔓 Unban a user from group"},
-    {"command": "hunmute",        "description": "🔊 Unmute a user in group"},
-    {"command": "hstats",         "description": "📊 Show group moderation stats"},
-    {"command": "hmod",           "description": "👮 List authorized moderators"},
-    {"command": "pin",            "description": "📌 Pin replied message"},
-    {"command": "unpin",          "description": "📍 Unpin current message"},
-    {"command": "adminlist",      "description": "👮 Show all group admins"},
-    {"command": "zombies",        "description": "🧟 Scan and kick deleted/bot accounts"},
-    {"command": "hwarn",          "description": "⚠️ Issue warning to user"},
-    {"command": "warns",          "description": "⚠️ Show user's warnings"},
-    {"command": "resetwarns",     "description": "♻️ Reset a user's warnings (mods)"},
-    {"command": "hdel",           "description": "🗑️ Delete a message"},
-    {"command": "hprotect",       "description": "🛡️ Protect user from moderation"},
-    {"command": "hunprotect",     "description": "🔓 Remove user protection (Owner)"},
-    {"command": "hcase",          "description": "📋 View moderation case details"},
-    {"command": "happeal",        "description": "📢 Appeal a moderation case (DM only)"},
+Supported bot commands
 
+General
+- /start - Start the bot and view the welcome message
+- /help - Show the help screen for your role
+- /hr - Get profile or group information
+- /hstats - Show moderation statistics
+- /hmodinfo - View moderator information
 
+Notes and filters
+- /notes - List saved notes
+- /save <name> <text> - Save a note
+- /get <name> - Retrieve a note
+- /clear <name> - Delete a note
+- /filters - List active filters
+- /filter <keyword> <response> - Add a filter
+- /stop <keyword> - Remove a filter
 
+Connections and broadcast
+- /connections - Manage connected groups
+- /connect <chat_id> - Connect PM to a group
+- /disconnect [chat_id|all] - Disconnect from a group
+- /allowconnections yes|no - Allow or block PM connections
+- /hbroadcast - Use in bot DM to broadcast a message to all connected groups or to one specific connected group; the bot will ask you to reply with the message
 
+Moderation
+- /hauth <user_id> - Authorize a moderator (Owner)
+- /hgrant <user_id> - Grant permissions (Owner)
+- /hrevoke <perm|all> <user_id> - Revoke permissions (Owner)
+- /hfreeze <user_id> - Freeze a moderator (Owner)
+- /hunfreeze <user_id> - Unfreeze a moderator (Owner)
+- /hbadge <user_id> <badge> - Set a moderator badge (Owner)
+- /hwarnconfig - Configure warning actions (Owner)
+- /hban /hkick /hmute /hunban /hunmute - Moderate users
+- /hwarn /warns /resetwarns - Manage warnings
+- /hdel /hprotect /hunprotect /hcase /happeal - Handle moderation actions
 
-
-
-
-
-
-
-
-
-
-    add a abroadcast commands work in like ask for send in bot or if using bot broadcast message to specific group in which bot is admin using group chat id 
+Games
+- /ttt - Start a Tic-Tac-Toe match
+- /tttleaderboard - View the leaderboard
+- /tttmystats - View your game stats
+- /tttend - Forfeit the active game

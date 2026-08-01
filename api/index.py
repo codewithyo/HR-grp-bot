@@ -121,10 +121,47 @@ class DataCache:
 # =========================================================
 
 BOT_COMMANDS = [
-    {"command": "start",          "description": "🚀 Start the bot & view welcome message"},
-    {"command": "help",           "description": "📖 Display available commands for your role"},
-    {"command": "hr",             "description": "🆔 Get user ID & profile information"},
-    {"command": "hstats",         "description": "📊 Show group moderation stats"},
+    {"command": "start",              "description": "🚀 Start the bot & view welcome message"},
+    {"command": "help",               "description": "📖 Show help for your role"},
+    {"command": "hr",                 "description": "🆔 Get profile or group information"},
+    {"command": "hstats",             "description": "📊 Show moderation stats"},
+    {"command": "hmodinfo",           "description": "👮 View moderator information"},
+    {"command": "notes",              "description": "📋 List saved notes"},
+    {"command": "save",               "description": "💾 Save a note"},
+    {"command": "get",                "description": "📖 Get a saved note"},
+    {"command": "clear",              "description": "🗑️ Delete a note"},
+    {"command": "filters",            "description": "🔍 List active filters"},
+    {"command": "filter",             "description": "➕ Add an auto-reply filter"},
+    {"command": "stop",               "description": "➖ Remove a filter"},
+    {"command": "connections",        "description": "🔗 Manage connected groups"},
+    {"command": "connect",            "description": "🔗 Connect PM to a group"},
+    {"command": "disconnect",         "description": "❌ Disconnect from a group"},
+    {"command": "allowconnections",   "description": "🔗 Allow or block PM connections"},
+    {"command": "hbroadcast",         "description": "📢 Broadcast a message to groups"},
+    {"command": "hauth",              "description": "🔐 Authorize a moderator (Owner)"},
+    {"command": "hgrant",             "description": "✅ Grant permissions (Owner)"},
+    {"command": "hrevoke",            "description": "❌ Revoke permissions (Owner)"},
+    {"command": "hfreeze",            "description": "🧊 Freeze a moderator (Owner)"},
+    {"command": "hunfreeze",          "description": "🔥 Unfreeze a moderator (Owner)"},
+    {"command": "hbadge",             "description": "🏷️ Set a moderator badge (Owner)"},
+    {"command": "hwarnconfig",        "description": "⚙️ Configure warning actions (Owner)"},
+    {"command": "hban",               "description": "🚫 Ban a user"},
+    {"command": "hkick",              "description": "👢 Kick a user"},
+    {"command": "hmute",              "description": "🔇 Mute a user"},
+    {"command": "hunban",             "description": "🔓 Unban a user"},
+    {"command": "hunmute",            "description": "🔊 Unmute a user"},
+    {"command": "hwarn",              "description": "⚠️ Warn a user"},
+    {"command": "warns",              "description": "⚠️ Show user warnings"},
+    {"command": "resetwarns",         "description": "♻️ Reset user warnings"},
+    {"command": "hdel",               "description": "🗑️ Delete a message"},
+    {"command": "hprotect",           "description": "🛡️ Protect a user"},
+    {"command": "hunprotect",         "description": "🔓 Remove protection"},
+    {"command": "hcase",              "description": "📋 View case details"},
+    {"command": "happeal",            "description": "📢 Appeal a moderation case"},
+    {"command": "ttt",                "description": "🎮 Play Tic-Tac-Toe"},
+    {"command": "tttleaderboard",     "description": "📊 View Tic-Tac-Toe leaderboard"},
+    {"command": "tttmystats",         "description": "📈 View your Tic-Tac-Toe stats"},
+    {"command": "tttend",             "description": "🏳️ Forfeit the current game"},
 ]
 VALID_PERMISSIONS = {"ban", "unban", "mute", "unmute", "kick", "warn", "delete", "pin"}
 
@@ -2385,7 +2422,7 @@ def role_help_text(uid: int) -> str:
             "`/hconnect <chat_id>` - Connect PM to a group\n"
             "`/hconnections` - List & switch connected groups\n"
             "`/hdisconnect [chat_id|all]` - Disconnect from a group\n"
-            "`/hbroadcast` - Broadcast message to connected groups\n\n"
+            "`/hbroadcast` - Broadcast from bot DM to connected groups\n\n"
             "🎮 **Games:**\n"
             "`/ttt [user_id]` - Start Tic-Tac-Toe\n"
             "`/tttleaderboard` - Show top players\n"
@@ -2425,7 +2462,8 @@ def role_help_text(uid: int) -> str:
             "🔗 **Connections:**\n"
             "`/hconnect <chat_id>` - Connect PM to a group\n"
             "`/hconnections` - List & switch connected groups\n"
-            "`/hdisconnect [chat_id|all]` - Disconnect\n\n"
+            "`/hdisconnect [chat_id|all]` - Disconnect\n"
+            "`/hbroadcast` - Send a message to all or one connected group from bot DM\n\n"
             "🎮 **Games:**\n"
             "`/ttt [user_id]` - Start Tic-Tac-Toe\n"
             "`/tttleaderboard` - Show top players\n\n"
@@ -2711,10 +2749,11 @@ def moderation_help_text(section: str, uid: int) -> str:
         return (
             f"👮 **{role} Help Center**\n\n"
             "📢 **Broadcast Messages**\n\n"
-            "`/hbroadcast` - Broadcast a message to connected groups\n\n"
+            "`/hbroadcast` - Start a broadcast from bot DM\n\n"
             "**Features**\n"
             "• Option 1: Broadcast to all connected groups\n"
-            "• Option 2: Broadcast to a specific group\n"
+            "• Option 2: Broadcast to one specific connected group\n"
+            "• The bot will ask you to reply with the message to send\n"
             "• Your moderator info is automatically added to the message\n"
             "• Messages sent with moderator credit\n\n"
             "**How to Use**\n"
@@ -2722,8 +2761,8 @@ def moderation_help_text(section: str, uid: int) -> str:
             "2. Choose:\n"
             "   📢 Broadcast to All Groups\n"
             "   📤 Broadcast to Specific Group\n"
-            "3. Reply with your message\n"
-            "4. Message is sent with your moderator badge\n\n"
+            "3. Reply with the message you want to send\n"
+            "4. The message is forwarded to the selected group(s)\n\n"
             "**Example**\n"
             "• Important announcement for all groups\n"
             "• Event notifications\n"
