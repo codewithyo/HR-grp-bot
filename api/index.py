@@ -3421,6 +3421,50 @@ async def handle_message(bot: Client, msg: dict):
         # ── Parse command ─────────────────────────────────────────────────
         parts   = text.split(None, 1)
         raw_cmd = parts[0].split("@")[0].lstrip("/").lower()
+        command_aliases = {
+            "id": "hr",
+            "notes": "hnotes",
+            "save": "hsave",
+            "get": "hget",
+            "clear": "hclear",
+            "filters": "hfilters",
+            "filter": "hfilter",
+            "stop": "hstop",
+            "connections": "hconnections",
+            "connect": "hconnect",
+            "disconnect": "hdisconnect",
+            "allowconnections": "hallowconnections",
+            "broadcast": "hbroadcast",
+            "mod": "hmod",
+            "stats": "hstats",
+            "modinfo": "hmodinfo",
+            "warns": "hwarns",
+            "resetwarns": "hresetwarns",
+            "pin": "hpin",
+            "unpin": "hunpin",
+            "adminlist": "hadminlist",
+            "zombies": "hzombies",
+            "protect": "hprotect",
+            "unprotect": "hunprotect",
+            "case": "hcase",
+            "appeal": "happeal",
+            "auth": "hauth",
+            "unauth": "hunauth",
+            "grant": "hgrant",
+            "revoke": "hrevoke",
+            "freeze": "hfreeze",
+            "unfreeze": "hunfreeze",
+            "badge": "hbadge",
+            "warnconfig": "hwarnconfig",
+            "ban": "hban",
+            "kick": "hkick",
+            "mute": "hmute",
+            "unban": "hunban",
+            "unmute": "hunmute",
+            "warn": "hwarn",
+            "del": "hdel",
+        }
+        raw_cmd = command_aliases.get(raw_cmd, raw_cmd)
         args    = parts[1].split() if len(parts) > 1 else []
 
         actor_label = f"anon_admin:{chat_id}" if is_anon_admin else str(uid)

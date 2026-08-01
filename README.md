@@ -219,10 +219,11 @@ Most commands support **two usage modes**:
 |---------|-------------|-------|
 | `/start` | Bot welcome & features | `/start` |
 | `/help` | Interactive command menu | `/help` |
-| `/hr` or `/id` | User profile & stats | `/id @user` or `/id me` |
+| `/hr` | View profile or group information | `/hr @user` or `/hr me` |
 | `/hstats` | Group moderation stats | `/hstats` |
-| `/warns` | View warnings (cross-chat totals) | `/warns @user` |
-| `/happeal` | Appeal moderation action | `/happeal <case_id> <reason>` |
+| `/hmodinfo` | View moderator information | `/hmodinfo` |
+| `/warns` | View warnings | `/warns @user` |
+| `/happeal` | Appeal a moderation action | `/happeal <case_id> <reason>` |
 
 ### 🚫 Moderation Commands (Moderators)
 
@@ -249,35 +250,37 @@ Most commands support **two usage modes**:
 | 🔓 | `/hunprotect` | Remove protection | `/hunprotect @user` |
 | 👥 | `/hauth` | Authorize moderator | `/hauth 123456789` |
 | 🚫👥 | `/hunauth` | Remove authorization | `/hunauth 123456789` |
-| 🔧 | `/hgrant` | Grant permission | `/hgrant ban 123456789` |
+| 🔧 | `/hgrant` | Grant permission | `/hgrant 123456789` |
 | 🛠️ | `/hrevoke` | Revoke permission | `/hrevoke ban 123456789` |
 | ❄️ | `/hfreeze` | Freeze moderator | `/hfreeze 123456789` |
 | 🔥 | `/hunfreeze` | Unfreeze moderator | `/hunfreeze 123456789` |
 | 🏷️ | `/hbadge` | Set moderator badge | `/hbadge 123456789 🟢 Mod` |
+| ⚙️ | `/hwarnconfig` | Configure warn threshold/action | `/hwarnconfig threshold 3` |
 | 💾 | `/hsave` | Save group note | `/hsave rules Welcome!` |
-| 📖 | `/get` | Get group note | `/get rules` or `#rules` |
-| 🗑️ | `/hclear` | Delete group note | `/hclear rules` |
+| 📖 | `/hget` | Get a group note | `/hget rules` or `#rules` |
+| 🗑️ | `/hclear` | Delete a group note | `/hclear rules` |
 
 ### 🔍 Filter & Blocklist Commands
 
 | Emoji | Command | Description | Example |
 |-------|---------|-------------|---------|
-| ➕ | `/filter` | Add auto-reply filter | `/filter spam Ban warned` |
-| 🔍 | `/filters` | List all filters | `/filters` |
-| ⛔ | `/stop` | Remove filter | `/stop spam` |
-| 🔒 | `/addblocklist` | Add blocked keyword | `/addblocklist bad-word` |
-| ❌ | `/deleteblocklist` | Remove blocklist | `/deleteblocklist bad-word` |
-| 📋 | `/blocklists` | List blocklist | `/blocklists` |
-| ⚙️ | `/blocklistmode` | Set blocklist action | `/blocklistmode ban` |
+| ➕ | `/hfilter` | Add an auto-reply filter | `/hfilter spam Ban warned` |
+| 🔍 | `/hfilters` | List all filters | `/hfilters` |
+| ⛔ | `/hstop` | Remove a filter | `/hstop spam` |
+| 🔒 | `/haddblocklist` | Add a blocked keyword | `/haddblocklist bad-word` |
+| ❌ | `/hdeleteblocklist` | Remove a blocklist keyword | `/hdeleteblocklist bad-word` |
+| 📋 | `/hblocklists` | List blocked keywords | `/hblocklists` |
+| ⚙️ | `/hblocklistmode` | Set the blocklist action | `/hblocklistmode ban` |
 
-### 🔗 Connection & Management
+### 🔗 Connection & Broadcast Commands
 
 | Emoji | Command | Description | Usage |
 |-------|---------|-------------|-------|
-| 🔗 | `/connect` | Connect group to PM | `/connect <chat_id>` |
-| 🔁 | `/connections` | View connected groups | `/connections` |
-| 🔌 | `/disconnect` | Disconnect group | `/disconnect` or `/disconnect all` |
-| 🔐 | `/allowconnections` | Control connections | `/allowconnections yes\|no` |
+| 🔗 | `/hconnect` | Connect a group to PM management | `/hconnect <chat_id>` |
+| 🔁 | `/hconnections` | View and switch connected groups | `/hconnections` |
+| 🔌 | `/hdisconnect` | Disconnect a group | `/hdisconnect` or `/hdisconnect all` |
+| 🔐 | `/hallowconnections` | Control connection permissions | `/hallowconnections yes|no` |
+| 📢 | `/hbroadcast` | Broadcast a message from bot DM to connected groups | `/hbroadcast` |
 
 ### 🎮 Game Commands
 
